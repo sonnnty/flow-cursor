@@ -27,10 +27,12 @@ pub mod net;
 pub mod settings;
 
 pub use clip::{ClipContent, ClipKind, ClipboardMsg};
-pub use settings::{AgentSettings, ClipboardSettings, EdgeSettings, HubSettings, PathPolicy};
+pub use settings::{
+    AgentSettings, ClipboardSettings, CursorPark, CursorSupport, EdgeSettings, HubSettings, PathPolicy,
+};
 
 /// Bumped whenever any message in this crate changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// ALPN for agent ↔ hub connections.
 pub const ALPN_HUB: &[u8] = b"flowcursor-hub/1";
 /// ALPN for agent ↔ agent (P2P) connections.
@@ -183,10 +185,14 @@ impl OsKind {
 
 /// What a node can do (depends on the backend that is running).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Capabilities {
     pub capture: bool,
     pub inject: bool,
     pub clipboard: bool,
+    /// What it can do with its own cursor while controlling another
+    /// machine ([`CursorPark`]).
+    pub cursor: CursorSupport,
 }
 
 /// Everything an agent needs to know about another node.

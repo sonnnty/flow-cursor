@@ -367,7 +367,7 @@ impl Backend for X11Backend {
         "x11"
     }
     fn caps(&self) -> Capabilities {
-        Capabilities { capture: true, inject: true, clipboard: self.clip.is_some() }
+        Capabilities { capture: true, inject: true, clipboard: self.clip.is_some(), ..Default::default() }
     }
     fn monitors(&self) -> Vec<Monitor> {
         self.shared.lock().expect("poisoned").monitors.clone()

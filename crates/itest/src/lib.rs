@@ -218,7 +218,7 @@ impl RawNode {
             p2p_port: 0,
             p2p_addrs: vec![],
             monitors: monitor(1920, 1080),
-            caps: Capabilities { capture: true, inject: true, clipboard: true },
+            caps: Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() },
         };
         write_frame(&mut ctl, &ToHub::Hello(hello)).await.unwrap();
         let id = match read_frame::<_, FromHub>(&mut ctl_r, MAX_CONTROL_FRAME).await.unwrap() {

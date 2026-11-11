@@ -136,7 +136,7 @@ impl Backend for SimBackend {
         "sim"
     }
     fn caps(&self) -> Capabilities {
-        Capabilities { capture: true, inject: true, clipboard: true }
+        Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() }
     }
     fn monitors(&self) -> Vec<Monitor> {
         self.state.lock().unwrap().monitors.clone()

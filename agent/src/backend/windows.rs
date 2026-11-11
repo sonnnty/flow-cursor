@@ -468,7 +468,7 @@ impl Backend for WindowsBackend {
         "windows"
     }
     fn caps(&self) -> Capabilities {
-        Capabilities { capture: true, inject: true, clipboard: true }
+        Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() }
     }
     fn monitors(&self) -> Vec<Monitor> {
         self.shared.monitors.lock().map(|m| m.clone()).unwrap_or_default()

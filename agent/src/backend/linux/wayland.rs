@@ -134,8 +134,12 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
     if inj.is_none() && cap.is_none() {
         return Err(anyhow!("neither the RemoteDesktop nor the InputCapture portal works in this session"));
     }
-    let caps =
-        Capabilities { capture: cap.is_some(), inject: inj.is_some(), clipboard: portal_clip || x11clip.is_some() };
+    let caps = Capabilities {
+        capture: cap.is_some(),
+        inject: inj.is_some(),
+        clipboard: portal_clip || x11clip.is_some(),
+        ..Default::default()
+    };
     info!(?caps, "Wayland portal backend ready");
     Ok((Arc::new(WaylandBackend { monitors, caps, inj, cap, x11clip, portal_clip }), rx))
 }

@@ -33,7 +33,7 @@ async fn unknown_agent_without_token_rejected_by_hub() {
         p2p_port: 0,
         p2p_addrs: vec![],
         monitors: monitor(1920, 1080),
-        caps: flow_proto::Capabilities { capture: true, inject: true, clipboard: true },
+        caps: flow_proto::Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() },
     };
     write_frame(&mut send, &ToHub::Hello(hello)).await.unwrap();
 
@@ -72,7 +72,7 @@ async fn hub_rejects_protocol_version_mismatch() {
         p2p_port: 0,
         p2p_addrs: vec![],
         monitors: monitor(1920, 1080),
-        caps: flow_proto::Capabilities { capture: true, inject: true, clipboard: true },
+        caps: flow_proto::Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() },
     };
     write_frame(&mut send, &ToHub::Hello(hello)).await.unwrap();
 

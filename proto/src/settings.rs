@@ -55,6 +55,67 @@ impl Default for EdgeSettings {
     }
 }
 
+/// Where this machine's own cursor goes while its mouse and keyboard drive
+/// another machine. When control comes back the cursor always enters at
+/// the edge, at the position mapped from where it left the other machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorPark {
+    /// Stays at the edge where it left (the behaviour before this setting).
+    #[default]
+    Edge,
+    /// Jumps to the centre of the monitor it left from.
+    Center,
+    /// As `Center`, and hidden until control comes back.
+    CenterHide,
+}
+
+impl CursorPark {
+    pub const ALL: [CursorPark; 3] = [CursorPark::Edge, CursorPark::Center, CursorPark::CenterHide];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CursorPark::Edge => "edge",
+            CursorPark::Center => "center",
+            CursorPark::CenterHide => "center_hide",
+        }
+    }
+
+    pub fn moves(self) -> bool {
+        self != CursorPark::Edge
+    }
+
+    pub fn hides(self) -> bool {
+        self == CursorPark::CenterHide
+    }
+
+    /// The closest behaviour a backend with `support` can deliver (what a
+    /// machine actually does with this setting): hiding needs both moving
+    /// and hiding, otherwise centre without hiding, otherwise the edge.
+    pub fn nearest(self, support: CursorSupport) -> CursorPark {
+        match self {
+            CursorPark::CenterHide if support.center && support.hide => CursorPark::CenterHide,
+            CursorPark::CenterHide | CursorPark::Center if support.center => CursorPark::Center,
+            _ => CursorPark::Edge,
+        }
+    }
+}
+
+/// What a backend can do with the local cursor while capturing (reported
+/// by the agent in its capabilities; the dashboard shows the limits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CursorSupport {
+    /// Move the cursor while this machine drives another one.
+    pub center: bool,
+    /// Hide the cursor while this machine drives another one.
+    pub hide: bool,
+}
+
+impl CursorSupport {
+    pub const FULL: CursorSupport = CursorSupport { center: true, hide: true };
+}
+
 /// Global settings (per-node settings such as name, enable and mouse speed
 /// travel in `PeerInfo`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +139,8 @@ pub struct HubSettings {
     /// this machine's screen (`flow-keymap` names, e.g. `"Ctrl"`,
     /// `"LeftCtrl+LeftAlt"`, `"ScrollLock"`); empty = cross freely.
     pub crossing_key: String,
+    /// Where the local cursor goes while this machine controls another.
+    pub cursor_park: CursorPark,
 }
 
 pub const DEFAULT_EMERGENCY_HOTKEY: &str = "Ctrl+Alt+Shift+Escape";
@@ -93,12 +156,14 @@ impl Default for HubSettings {
             log_level: "info".to_string(),
             allowed_networks: Vec::new(),
             crossing_key: String::new(),
+            cursor_park: CursorPark::Edge,
         }
     }
 }
 
 /// What an agent receives: the hub's global settings with this node's own
-/// overrides (`allowed_networks`, `crossing_key`) already applied.
+/// overrides (`allowed_networks`, `crossing_key`, `cursor_park`) already
+/// applied.
 pub type AgentSettings = HubSettings;
 
 #[cfg(test)]
@@ -116,7 +181,34 @@ mod tests {
         // Settings stored by an older hub keep today's behaviour.
         assert!(s.allowed_networks.is_empty());
         assert!(s.crossing_key.is_empty());
+        assert_eq!(s.cursor_park, CursorPark::Edge);
         let bin = crate::encode(&s);
         assert_eq!(crate::decode::<HubSettings>(&bin).unwrap(), s);
+    }
+
+    #[test]
+    fn cursor_park_json_names() {
+        for p in CursorPark::ALL {
+            assert_eq!(serde_json::to_string(&p).unwrap(), format!("\"{}\"", p.as_str()));
+        }
+        let s: HubSettings = serde_json::from_str(r#"{"cursor_park": "center_hide"}"#).unwrap();
+        assert_eq!(s.cursor_park, CursorPark::CenterHide);
+        assert!(serde_json::from_str::<CursorPark>(r#""middle""#).is_err());
+    }
+
+    #[test]
+    fn nearest_supported_behaviour() {
+        use CursorPark::*;
+        let none = CursorSupport::default();
+        let move_only = CursorSupport { center: true, hide: false };
+        let hide_only = CursorSupport { center: false, hide: true };
+        for p in CursorPark::ALL {
+            assert_eq!(p.nearest(CursorSupport::FULL), p, "full support keeps every choice");
+            assert_eq!(p.nearest(none), Edge, "nothing possible (GNOME): stays at the edge");
+            assert_eq!(p.nearest(hide_only), Edge, "hiding at the edge is not an option");
+        }
+        assert_eq!(CenterHide.nearest(move_only), Center);
+        assert_eq!(Center.nearest(move_only), Center);
+        assert!(CenterHide.hides() && CenterHide.moves() && Center.moves() && !Center.hides() && !Edge.moves());
     }
 }
