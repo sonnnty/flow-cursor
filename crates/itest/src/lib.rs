@@ -154,6 +154,7 @@ pub async fn http(
 /// reach the hub's routing code.
 pub struct RawNode {
     pub id: NodeId,
+    pub identity: Identity,
     pub conn: quinn::Connection,
     pub endpoint: quinn::Endpoint,
     /// Keeps the control stream open.
@@ -162,8 +163,8 @@ pub struct RawNode {
 
 impl RawNode {
     pub async fn join(hub: &HubHandle, token: &str, hostname: &str) -> RawNode {
-        let id = Identity::generate(hostname).unwrap();
-        let cc = client_config(&id, ALPN_HUB, ServerPin::Exact(hub.fingerprint()), TransportOpts::HUB).unwrap();
+        let identity = Identity::generate(hostname).unwrap();
+        let cc = client_config(&identity, ALPN_HUB, ServerPin::Exact(hub.fingerprint()), TransportOpts::HUB).unwrap();
         let endpoint = flow_net::endpoint::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
         let conn = endpoint.connect_with(cc, hub.quic_addr, SNI).unwrap().await.unwrap();
         let (mut ctl, mut ctl_r) = conn.open_bi().await.unwrap();
@@ -188,7 +189,7 @@ impl RawNode {
         tokio::spawn(async move {
             while let Ok(Some(_)) = read_frame::<_, FromHub>(&mut ctl_r, MAX_CONTROL_FRAME).await {}
         });
-        RawNode { id, conn, endpoint, _ctl: ctl }
+        RawNode { id, identity, conn, endpoint, _ctl: ctl }
     }
 
     /// Opens a relay stream; frames the hub delivers on it arrive on the
