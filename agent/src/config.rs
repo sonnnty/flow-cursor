@@ -30,6 +30,9 @@ pub struct AgentConfig {
     pub log_level: Option<String>,
     /// Where identity and state live (default: platform data dir).
     pub state_dir: Option<PathBuf>,
+    /// Write logs to this file instead of stderr (Windows autostart
+    /// defaults to `<state_dir>/agent.log`).
+    pub log_file: Option<PathBuf>,
 }
 
 impl AgentConfig {

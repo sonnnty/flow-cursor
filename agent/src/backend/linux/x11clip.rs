@@ -197,8 +197,7 @@ impl Worker {
         match self.fetch.take() {
             Some(Fetch::Targets { .. }) => {
                 let (_, raw) = self.read_prop()?;
-                let targets: Vec<Atom> =
-                    raw.as_chunks::<4>().0.iter().map(|c| u32::from_ne_bytes(*c)).collect();
+                let targets: Vec<Atom> = raw.as_chunks::<4>().0.iter().map(|c| u32::from_ne_bytes(*c)).collect();
                 let want = if targets.contains(&self.atoms.png) {
                     Some(self.atoms.png)
                 } else {

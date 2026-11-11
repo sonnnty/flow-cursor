@@ -1,3 +1,8 @@
+// Release builds on Windows use the GUI subsystem so that autostart does not
+// open a console window; CLI output still works from a terminal because we
+// attach to the parent console.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use flow_agent::backend::{self, BackendOptions};
@@ -47,10 +52,18 @@ enum Cmd {
     },
 }
 
-fn init_logging(level: &str) -> flow_agent::LogHook {
+fn init_logging(level: &str, file: Option<&std::path::Path>) -> flow_agent::LogHook {
     let initial = std::env::var("RUST_LOG").unwrap_or_else(|_| level.to_string());
     let (filter, handle) = reload::Layer::new(EnvFilter::try_new(&initial).unwrap_or_else(|_| EnvFilter::new("info")));
-    tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).init();
+    let file_layer = file.and_then(|p| {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(p).ok()?;
+        Some(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)))
+    });
+    let stdout_layer = file.is_none().then(tracing_subscriber::fmt::layer);
+    tracing_subscriber::registry().with(filter).with(stdout_layer).with(file_layer).init();
     let env_set = std::env::var("RUST_LOG").is_ok();
     Arc::new(move |lvl: &str| {
         if env_set {
@@ -68,6 +81,10 @@ fn init_logging(level: &str) -> flow_agent::LogHook {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(windows)]
+    let has_console = flow_agent::backend::windows::attach_parent_console() || cfg!(debug_assertions);
+    #[cfg(not(windows))]
+    let has_console = true;
     let cli = Cli::parse();
     let cfg_path = cli.config.clone().unwrap_or_else(default_config_path);
     let mut cfg = AgentConfig::load(&cfg_path)?;
@@ -115,7 +132,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Monitors { backend: b } => {
-            let _log = init_logging("warn");
+            let _log = init_logging("warn", None);
             let kind = backend::parse_kind(b.as_deref().or(cfg.backend.as_deref()))?;
             let (be, _rx) = backend::create(kind, &BackendOptions { state_dir: cfg.state_dir() }).await?;
             for m in be.monitors() {
@@ -132,7 +149,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Run { backend: b } => {
-            let hook = init_logging(cfg.log_level.as_deref().unwrap_or("info"));
+            // Without a console (Windows autostart) log to a file by default.
+            let log_file = cfg.log_file.clone().or_else(|| (!has_console).then(|| cfg.state_dir().join("agent.log")));
+            let hook = init_logging(cfg.log_level.as_deref().unwrap_or("info"), log_file.as_deref());
             if let Some(l) = &cfg.log_level {
                 hook(l);
             }

@@ -9,6 +9,7 @@ use flow_proto::{Button, Capabilities, ClipContent, Monitor};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+pub mod dib;
 pub mod sim;
 
 #[cfg(target_os = "linux")]
