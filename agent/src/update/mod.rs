@@ -167,6 +167,9 @@ struct Updater {
     progress: (u64, u64),
     failed: Option<FailedUpdate>,
     tray_build: Option<String>,
+    /// `installer.check()` for the current offer (the Windows check writes
+    /// a probe file: not on every tick).
+    supported: Option<Result<(), String>>,
     /// Install done, restart requested: nothing else happens.
     finished: bool,
     phase: UpdatePhase,
@@ -222,6 +225,7 @@ pub fn spawn(
         progress: (0, 0),
         failed: persisted.failed,
         tray_build: persisted.tray_build,
+        supported: None,
         finished: false,
         phase: UpdatePhase::Current,
         status_tx,
@@ -279,6 +283,7 @@ impl Updater {
                     }
                 }
                 self.offer = Some(o);
+                self.supported = None;
             }
             UpdateEvent::Msg(UpdateFromHub::UpdateNow) => {
                 info!("update requested from the dashboard");
@@ -381,7 +386,8 @@ impl Updater {
             return UpdatePhase::Current;
         };
         let target = rel.id.clone();
-        if let Err(reason) = self.installer.check() {
+        let installer = self.installer.clone();
+        if let Err(reason) = self.supported.get_or_insert_with(|| installer.check()).clone() {
             self.manual = false;
             return UpdatePhase::Unsupported { reason };
         }
