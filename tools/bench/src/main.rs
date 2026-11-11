@@ -143,6 +143,7 @@ async fn main() -> Result<()> {
         admin_token: None,
         mdns: false,
         name: "bench".into(),
+        agent_builds: None,
     })
     .await?;
     let token = hub.join_token();

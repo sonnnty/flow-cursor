@@ -14,8 +14,10 @@
 use crate::config::AgentConfig;
 use crate::core::{AgentObserver, AgentStatus};
 use crate::logbuf::LogBuffer;
-use flow_ipc::{encode_line, parse_request, Command, PeerRef, PeerStatus, Reply, RequestError, Snapshot};
+use crate::update::UpdateStatus;
+use flow_ipc::{encode_line, parse_request, Command, PeerRef, PeerStatus, Reply, RequestError, Snapshot, UpdateInfo};
 use flow_net::token::JoinToken;
+use flow_proto::update::UpdatePhase;
 use flow_proto::NodeId;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,6 +37,8 @@ pub enum Control {
         hub: Option<String>,
     },
     Shutdown,
+    /// An update was installed: restart into it.
+    Update(crate::update::RestartRequest),
 }
 
 /// Static facts about this agent process for the snapshot.
@@ -170,6 +174,37 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
         can_clipboard: caps.clipboard,
         problems,
         warnings,
+        update: update_info(&ctx.agent.updater.status()),
+    }
+}
+
+/// The updater's state as the tray shows it.
+pub fn update_info(u: &UpdateStatus) -> UpdateInfo {
+    let target = match &u.phase {
+        UpdatePhase::Available { target }
+        | UpdatePhase::Downloading { target, .. }
+        | UpdatePhase::Ready { target }
+        | UpdatePhase::Installing { target } => Some(target.full()),
+        UpdatePhase::Current | UpdatePhase::Unsupported { .. } => None,
+    };
+    let progress = match &u.phase {
+        UpdatePhase::Downloading { done, total, .. } if *total > 0 => Some((done * 100 / total).min(100) as u8),
+        _ => None,
+    };
+    UpdateInfo {
+        policy: u.policy.map(|p| p.as_str().to_string()).unwrap_or_default(),
+        state: u.phase.name().to_string(),
+        can_update_now: matches!(u.phase, UpdatePhase::Available { .. }),
+        available: target,
+        progress,
+        detail: match &u.phase {
+            UpdatePhase::Unsupported { reason } => Some(reason.clone()),
+            _ => None,
+        },
+        failed: u.failed.as_ref().map(|f| format!("{}: {}", f.target, f.reason)),
+        failed_rolled_back: u.failed.as_ref().is_some_and(|f| f.rolled_back),
+        update_only: u.update_only.clone(),
+        tray_build: u.tray_build.clone(),
     }
 }
 
@@ -250,6 +285,21 @@ where
             Command::Resume => {
                 ctx.agent.set_paused(false);
                 Reply::Ok { message: "sharing resumed".into() }
+            }
+            Command::UpdateNow => {
+                let u = ctx.agent.updater.status();
+                if matches!(u.phase, UpdatePhase::Available { .. } | UpdatePhase::Ready { .. }) {
+                    info!("update requested over IPC");
+                    ctx.agent.updater.update_now();
+                    Reply::Ok { message: "updating as soon as this machine is idle".into() }
+                } else {
+                    let why = match &u.phase {
+                        UpdatePhase::Unsupported { reason } => reason.clone(),
+                        UpdatePhase::Current => "already running the hub's build".into(),
+                        p => format!("an update is already {}", p.name()),
+                    };
+                    Reply::Error { message: format!("nothing to update: {why}") }
+                }
             }
             Command::Restart => {
                 info!("restart requested over IPC");

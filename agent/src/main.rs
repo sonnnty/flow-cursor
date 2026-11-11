@@ -61,9 +61,19 @@ enum Cmd {
     /// Stop the running agent (installers, upgrades). Exits 0 also when
     /// none is running.
     Stop,
+    /// Install the build the hub carries now (as soon as this machine is
+    /// idle), whatever the update policy; also retries a failed update.
+    Update,
     /// Forget stored xdg-desktop-portal permissions (Linux): the next start
     /// asks again.
     ForgetPortal,
+    /// Internal: watch a just-installed version and roll it back if it does
+    /// not reach the hub (started by the agent after an update).
+    #[command(hide = true)]
+    UpdateGuard {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Print the monitors the backend detects.
     Monitors {
         #[arg(long)]
@@ -154,10 +164,23 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        cmd @ (Cmd::Pause | Cmd::Resume | Cmd::Restart) => {
+        Cmd::UpdateGuard { state_dir } => {
+            let log = flow_agent::update::state::update_dir(&state_dir).join("guard.log");
+            let _log = init_logging("info", Some(&log));
+            info!("update guard {} started", flow_version::FULL);
+            let end = flow_agent::update::guard::run(
+                &state_dir,
+                &flow_agent::update::guard::GuardOptions::default(),
+                &flow_agent::update::guard::ProcessRestarter,
+            )?;
+            info!(?end, "update guard done");
+            Ok(())
+        }
+        cmd @ (Cmd::Pause | Cmd::Resume | Cmd::Restart | Cmd::Update) => {
             let cmd = match cmd {
                 Cmd::Pause => Command::Pause,
                 Cmd::Resume => Command::Resume,
+                Cmd::Update => Command::UpdateNow,
                 _ => Command::Restart,
             };
             match ipc_request(&cmd).context("no running agent answers on the local IPC endpoint")? {
@@ -242,9 +265,16 @@ async fn main() -> Result<()> {
             }
             let kind = backend::parse_kind(b.as_deref().or(cfg.backend.as_deref()))?;
             info!(?kind, config = %cfg_path.display(), "starting flow-agent {}", flow_version::FULL);
+            // A version on trial after an update: count the start, make sure
+            // the rollback guard watches.
+            let current = flow_proto::BuildId::current();
+            let launcher: flow_agent::update::GuardLauncher = Arc::new(flow_agent::update::guard::launch_process);
+            let backend_name = format!("{kind:?}").to_lowercase();
+            flow_agent::update::on_start(&cfg.state_dir(), &current, &backend_name, &launcher);
             let (be, rx) = backend::create(kind, &BackendOptions { state_dir: cfg.state_dir() })
                 .await
                 .context("starting the input backend")?;
+            flow_agent::update::on_backend_ready(&cfg.state_dir(), &current);
             if be.monitors().is_empty() {
                 bail!("the backend reported no monitors");
             }
@@ -254,8 +284,9 @@ async fn main() -> Result<()> {
                 bind_retry: if restarted { RESTART_GRACE } else { Duration::ZERO },
                 ..Default::default()
             };
-            let agent = flow_agent::start_with(cfg.clone(), be, rx, opts).await?;
+            let mut agent = flow_agent::start_with(cfg.clone(), be, rx, opts).await?;
             info!(p2p = %agent.p2p_addr, fingerprint = %agent.fingerprint, "agent running");
+            let mut restarts = agent.restarts.take().expect("restart channel");
 
             let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
             let ctx = IpcContext {
@@ -273,6 +304,7 @@ async fn main() -> Result<()> {
             let control = tokio::select! {
                 _ = wait_for_shutdown() => None,
                 c = ctl_rx.recv() => c,
+                Some(r) = restarts.recv() => Some(Control::Update(r)),
             };
             info!(?control, "stopping");
             let paused = agent.status().paused;
@@ -283,6 +315,7 @@ async fn main() -> Result<()> {
             match control {
                 None | Some(Control::Shutdown) => Ok(()),
                 Some(Control::Restart) => restart_process(paused),
+                Some(Control::Update(r)) => restart_after_update(r, paused),
                 Some(Control::Join { token, hub }) => {
                     if let Err(e) = store_join(&cfg_path, &mut cfg, &token, hub) {
                         warn!("storing the join token: {e:#}");
@@ -343,16 +376,29 @@ fn restart_process(paused: bool) -> Result<()> {
     }
 }
 
+/// Starts the version an update just installed. The usual restart path
+/// (re-exec in place, same pid under systemd; Windows: a detached new
+/// process), so stored portal permissions are reused as on any restart.
+/// Only a changed systemd unit needs systemd itself to restart the service.
+fn restart_after_update(r: flow_agent::update::RestartRequest, paused: bool) -> Result<()> {
+    use flow_agent::update::state::ServiceKind;
+    if r.service == ServiceKind::Systemd && r.unit_changed {
+        info!("the systemd unit changed: restarting the service through systemd");
+        let run = |args: &[&str]| std::process::Command::new("systemctl").arg("--user").args(args).status();
+        let reload = run(&["daemon-reload"]);
+        let restart = run(&["restart", "--no-block", "flow-agent.service"]);
+        if reload.is_ok_and(|s| s.success()) && restart.is_ok_and(|s| s.success()) {
+            return Ok(());
+        }
+        warn!("systemctl failed; restarting in place with the old unit");
+    }
+    restart_process(paused)
+}
+
 /// The running executable. On Linux an upgrade may have replaced it: the
 /// kernel then reports `<path> (deleted)` and the new file is at `<path>`.
 fn current_exe() -> Result<std::path::PathBuf> {
-    let exe = std::env::current_exe().context("locating flow-agent")?;
-    if !exe.exists() {
-        if let Some(p) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
-            return Ok(p.into());
-        }
-    }
-    Ok(exe)
+    flow_agent::update::current_exe().context("locating flow-agent")
 }
 
 /// One request to the running agent of this user.
@@ -394,6 +440,25 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
     }
     for p in &s.problems {
         println!("problem:          {p}");
+    }
+    let u = &s.update;
+    let mut line = format!("{} (policy {})", u.state, if u.policy.is_empty() { "-" } else { &u.policy });
+    if let Some(a) = &u.available {
+        line.push_str(&format!(", hub has {a}"));
+    }
+    if let Some(p) = u.progress {
+        line.push_str(&format!(", {p}%"));
+    }
+    println!("update:           {line}");
+    if let Some(d) = &u.detail {
+        println!("update detail:    {d}");
+    }
+    if let Some(r) = &u.update_only {
+        println!("update only:      {r}");
+    }
+    if let Some(f) = &u.failed {
+        let rb = if u.failed_rolled_back { " (previous version restored)" } else { "" };
+        println!("update failed:    {f}{rb}");
     }
 }
 

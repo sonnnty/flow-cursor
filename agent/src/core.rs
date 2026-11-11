@@ -15,6 +15,7 @@ use crate::edge::EdgeGate;
 use crate::hub::{HubChannels, HubClient, HubEvent, HubRelay, Links};
 use crate::netcheck::{AddrSource, SystemAddrs, NET_CHECK_INTERVAL};
 use crate::park::{self, Park};
+use crate::update::{RestartRequest, UpdateOptions, UpdaterHandle};
 use anyhow::{Context, Result};
 use flow_keymap::{parse_combo, Combo};
 use flow_layout::{clamp_to_screens, LayoutExt, Move, Side};
@@ -72,11 +73,22 @@ pub struct AgentStatus {
     /// Where the local cursor was moved (and whether it was hidden) while
     /// this machine controls another one; None = left at the edge.
     pub cursor_parked: Option<Park>,
+    /// Keys or buttons are held: pressed here while capturing, forwarded
+    /// to another machine, or injected here by a controlling machine.
+    pub keys_held: bool,
+    /// Last input event handled (local or from a controlling machine).
+    pub last_input: Option<Instant>,
+    /// Connected to a hub of another protocol, only to update (its reason).
+    pub update_only: Option<String>,
 }
 
 pub struct AgentHandle {
     pub p2p_addr: SocketAddr,
     pub fingerprint: Fingerprint,
+    pub updater: UpdaterHandle,
+    /// Restart requests after an installed update (the binary owns the
+    /// process and carries them out; tests watch them).
+    pub restarts: Option<mpsc::UnboundedReceiver<RestartRequest>>,
     status: watch::Receiver<AgentStatus>,
     links: Links,
     backend: Arc<dyn Backend>,
@@ -137,6 +149,7 @@ impl AgentHandle {
     /// A cloneable view of the running agent for the local IPC server.
     pub fn observer(&self) -> AgentObserver {
         AgentObserver {
+            updater: self.updater.clone(),
             status: self.status.clone(),
             links: self.links.clone(),
             backend: self.backend.clone(),
@@ -166,6 +179,7 @@ impl AgentHandle {
 /// [`AgentHandle::observer`]); stays valid but stale after shutdown.
 #[derive(Clone)]
 pub struct AgentObserver {
+    pub updater: UpdaterHandle,
     status: watch::Receiver<AgentStatus>,
     links: Links,
     backend: Arc<dyn Backend>,
@@ -211,6 +225,9 @@ pub struct StartOptions {
     /// Keep trying to bind the P2P port this long when it is in use (a
     /// restarted agent on Windows starts before the old process is gone).
     pub bind_retry: Duration,
+    pub update: UpdateOptions,
+    /// Protocol announced to the hub (tests simulate other generations).
+    pub protocol: u32,
 }
 
 impl Default for StartOptions {
@@ -221,6 +238,8 @@ impl Default for StartOptions {
             net_check_interval: NET_CHECK_INTERVAL,
             paused: false,
             bind_retry: Duration::ZERO,
+            update: UpdateOptions::default(),
+            protocol: flow_proto::PROTOCOL_VERSION,
         }
     }
 }
@@ -249,7 +268,7 @@ pub async fn start_with(
     events: EventRx,
     opts: StartOptions,
 ) -> Result<AgentHandle> {
-    let StartOptions { log_hook, addrs, net_check_interval, paused, bind_retry } = opts;
+    let StartOptions { log_hook, addrs, net_check_interval, paused, bind_retry, update, protocol } = opts;
     let state_dir = cfg.state_dir();
     std::fs::create_dir_all(&state_dir).with_context(|| format!("creating {}", state_dir.display()))?;
     let host = hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "agent".into());
@@ -281,6 +300,9 @@ pub async fn start_with(
     let (to_hub_tx, to_hub_rx) = mpsc::unbounded_channel();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (upd_ev_tx, upd_ev_rx) = mpsc::unbounded_channel();
+    let (upd_out_tx, upd_out_rx) = mpsc::unbounded_channel();
+    let (restart_tx, restart_rx) = mpsc::unbounded_channel();
     let (status_tx, status) = watch::channel(AgentStatus {
         node_id: state.lock().expect("poisoned").node_id.map(NodeId),
         ..Default::default()
@@ -301,8 +323,15 @@ pub async fn start_with(
         backend: backend.clone(),
         events: hub_ev_tx,
         p2p_port: p2p_addr.port(),
+        updates: upd_ev_tx,
+        build: update.current.clone(),
+        platform: update.platform.clone(),
+        protocol,
     };
-    tasks.push(tokio::spawn(client.run(HubChannels { to_hub: to_hub_rx, clip: clip_rx })));
+    tasks.push(tokio::spawn(client.run(HubChannels { to_hub: to_hub_rx, clip: clip_rx, update_out: upd_out_rx })));
+    let (updater, upd_task) =
+        crate::update::spawn(state_dir.clone(), update, upd_ev_rx, status.clone(), upd_out_tx, restart_tx);
+    tasks.push(upd_task);
 
     // A previous run may have died while the cursor was hidden.
     backend.restore_cursor();
@@ -344,6 +373,7 @@ pub async fn start_with(
         paused,
         local_addrs: Vec::new(),
         parked: None,
+        last_input: None,
     };
     core.apply_settings(AgentSettings::default());
     if paused {
@@ -356,6 +386,8 @@ pub async fn start_with(
     Ok(AgentHandle {
         p2p_addr,
         fingerprint: identity.fingerprint,
+        updater,
+        restarts: Some(restart_rx),
         status,
         links,
         backend,
@@ -449,6 +481,7 @@ struct Core {
     /// What was done with the local cursor when control left this machine
     /// (undone by `end_capture` when it comes back).
     parked: Option<Park>,
+    last_input: Option<Instant>,
 }
 
 impl Core {
@@ -509,6 +542,11 @@ impl Core {
             s.local_addrs = self.local_addrs.clone();
             s.holding_edge = matches!(self.mode, Mode::Hold(_));
             s.cursor_parked = self.parked;
+            s.keys_held = !self.pressed.is_empty()
+                || !self.sent_keys.is_empty()
+                || !self.sent_buttons.is_empty()
+                || !self.injected_down.is_empty();
+            s.last_input = self.last_input;
         });
     }
 
@@ -522,6 +560,7 @@ impl Core {
                 self.me = Some(w.node_id);
                 self.status.send_modify(|s| {
                     s.connected = true;
+                    s.update_only = None;
                     s.revoked = false;
                     s.rejected = None;
                     s.hub_error = None;
@@ -539,7 +578,26 @@ impl Core {
                 self.report_paths();
             }
             HubEvent::Disconnected => {
-                self.status.send_modify(|s| s.connected = false);
+                self.status.send_modify(|s| {
+                    s.connected = false;
+                    s.update_only = None;
+                });
+            }
+            HubEvent::UpdateOnly(reason) => {
+                // No input routing until this agent runs the hub's build:
+                // forget machines and layout (P2P refuses everyone).
+                self.end_hold(None);
+                self.leave_remote(None);
+                self.layout = Layout::default();
+                self.refresh_edges();
+                self.set_peers(Vec::new());
+                self.receiver.release_everything();
+                self.status.send_modify(|s| {
+                    s.connected = false;
+                    s.hub_error = None;
+                    s.rejected = None;
+                    s.update_only = Some(reason);
+                });
             }
             HubEvent::Layout(l) => {
                 self.layout = l;
@@ -803,6 +861,9 @@ impl Core {
     // ------------------------------------------------------------------
 
     fn on_local(&mut self, ev: LocalEvent) {
+        if !matches!(ev, LocalEvent::Clipboard(_) | LocalEvent::MonitorsChanged(_)) {
+            self.last_input = Some(Instant::now());
+        }
         match ev {
             LocalEvent::EdgeHit { side, x, y } => self.on_edge(side, x, y),
             LocalEvent::Motion { dx, dy } => match self.mode {
@@ -1121,6 +1182,7 @@ impl Core {
     // ------------------------------------------------------------------
 
     fn on_action(&mut self, from: NodeId, a: Action) {
+        self.last_input = Some(Instant::now());
         // Away: nothing is injected except releases of what was injected
         // before (from going away, or from sources that have not heard about
         // it yet), so the local OS never sees a release without a press.
