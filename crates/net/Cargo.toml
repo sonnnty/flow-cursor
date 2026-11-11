@@ -1,0 +1,26 @@
+[package]
+name = "flow-net"
+description = "FlowCursor networking: identities, pinned QUIC endpoints, framing, P2P/relay link manager, mDNS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flow-proto.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+sha2.workspace = true
+rand.workspace = true
+data-encoding.workspace = true
+subtle.workspace = true
+mdns-sd.workspace = true
+socket2 = "0.5"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
