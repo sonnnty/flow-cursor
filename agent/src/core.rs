@@ -910,7 +910,10 @@ impl Core {
                 debug!(?side, x, y, "at the edge without the crossing key: holding the pointer there");
                 self.mode = Mode::Hold(EdgeHold::new(side, x as f64, y as f64, Instant::now()));
             }
-            EdgeOutcome::NeedKey | EdgeOutcome::Wait | EdgeOutcome::Refused => self.backend.end_capture(None),
+            o @ (EdgeOutcome::NeedKey | EdgeOutcome::Wait | EdgeOutcome::Refused) => {
+                debug!(?side, x, y, outcome = ?o, "edge hit without crossing");
+                self.backend.end_capture(None)
+            }
         }
     }
 
