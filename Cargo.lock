@@ -598,6 +598,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-ipc"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "flow-itest"
 version = "0.1.0"
 dependencies = [
