@@ -149,8 +149,11 @@ pub struct Snapshot {
     pub can_capture: bool,
     pub can_inject: bool,
     pub can_clipboard: bool,
-    /// Human-readable problems (missing permissions, …).
+    /// Human-readable problems that break sharing (missing permissions,
+    /// …): the tray shows the error icon.
     pub problems: Vec<String>,
+    /// Lesser limitations (no clipboard access): listed, no error icon.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

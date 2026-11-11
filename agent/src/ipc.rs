@@ -122,10 +122,11 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
     if !caps.inject {
         problems.push("This machine cannot inject input: other machines cannot control it.".into());
     }
-    if !caps.clipboard {
-        problems.push("No clipboard access: clipboard sharing is off on this machine.".into());
-    }
     problems.extend(crate::problems::list());
+    let mut warnings = Vec::new();
+    if !caps.clipboard {
+        warnings.push("No clipboard access: clipboard sharing is off on this machine.".into());
+    }
 
     let hub_address = cfg.hub.clone().filter(|h| !h.trim().is_empty());
     let dashboard_url = hub_address.as_deref().or(state.hub_addr.as_deref()).and_then(dashboard_url);
@@ -167,6 +168,7 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
         can_inject: caps.inject,
         can_clipboard: caps.clipboard,
         problems,
+        warnings,
     }
 }
 

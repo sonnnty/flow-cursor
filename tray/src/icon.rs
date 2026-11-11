@@ -162,10 +162,9 @@ impl Canvas {
                 let i = ((py * self.size + px) * 4) as usize;
                 let dst_a = self.px[i + 3] as f32 / 255.0;
                 let out_a = a + dst_a * (1.0 - a);
-                for k in 0..3 {
+                for (k, &c) in color.iter().enumerate() {
                     let d = self.px[i + k] as f32 / 255.0;
-                    let c = color[k] as f32 / 255.0;
-                    let v = (c * a + d * dst_a * (1.0 - a)) / out_a;
+                    let v = (c as f32 / 255.0 * a + d * dst_a * (1.0 - a)) / out_a;
                     self.px[i + k] = (v * 255.0).round() as u8;
                 }
                 self.px[i + 3] = (out_a * 255.0).round() as u8;
