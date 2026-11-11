@@ -108,6 +108,32 @@ mod tests {
         assert_eq!(parse_combo("win+l").unwrap().parts[1], vec![kb(0x0F)]);
         assert_eq!(parse_combo(""), Err(ComboError::Empty));
         assert!(matches!(parse_combo("Ctrl+Bogus"), Err(ComboError::UnknownKey(_))));
+        assert_eq!(parse_combo("+++").unwrap_err(), ComboError::Empty);
+
+        // Aliases resolution
+        assert_eq!(usage_from_name("esc"), Some(keys::ESCAPE));
+        assert_eq!(usage_from_name("return"), Some(keys::ENTER));
+        assert_eq!(usage_from_name("del"), Some(kb(0x4C)));
+        assert_eq!(usage_from_name("ins"), Some(kb(0x49)));
+        assert_eq!(usage_from_name("pgup"), Some(kb(0x4B)));
+        assert_eq!(usage_from_name("pgdn"), Some(kb(0x4E)));
+        assert_eq!(usage_from_name("pgdown"), Some(kb(0x4E)));
+        assert_eq!(usage_from_name("prtsc"), Some(kb(0x46)));
+        assert_eq!(usage_from_name("print"), Some(kb(0x46)));
+        assert_eq!(usage_from_name("scrlk"), Some(kb(0x47)));
+        assert_eq!(usage_from_name("unknown_key_xyz"), None);
+
+        // Generic modifier aliases in combo
+        let combo_cmd = parse_combo("cmd+shift+a").unwrap();
+        assert!(combo_cmd.contains(keys::LEFT_META));
+        assert!(combo_cmd.contains(keys::RIGHT_META));
+        assert!(combo_cmd.contains(keys::LEFT_SHIFT));
+        assert!(combo_cmd.contains(keys::RIGHT_SHIFT));
+        assert!(combo_cmd.contains(keys::A));
+
+        // ComboError formatting
+        assert_eq!(format!("{}", ComboError::Empty), "empty key combo");
+        assert!(format!("{}", ComboError::UnknownKey("abc".into())).contains("abc"));
     }
 
     #[test]

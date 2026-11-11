@@ -146,6 +146,116 @@ mod tests {
     }
 
     #[test]
+    fn scancode_to_hid_to_evdev_chain() {
+        // scancode → HID → evdev → HID → scancode is the identity for keys
+        // present in both tables (this is the Windows → Linux path).
+        for e in table::TABLE.iter().filter(|e| e.evdev != 0 && e.win != 0 && e.canonical_evdev && e.canonical_win) {
+            let h = scancode_to_hid(e.win).unwrap();
+            let ev = hid_to_evdev(h).unwrap();
+            let h2 = evdev_to_hid(ev).unwrap();
+            assert_eq!(hid_to_scancode(h2), Some(e.win));
+        }
+    }
+
+    #[test]
+    fn extended_scancodes_and_navigation() {
+        let nav_keys = [
+            (kb(0x49), 110, 0xE052), // Insert
+            (kb(0x4A), 102, 0xE047), // Home
+            (kb(0x4B), 104, 0xE049), // PageUp
+            (kb(0x4C), 111, 0xE053), // Delete
+            (kb(0x4D), 107, 0xE04F), // End
+            (kb(0x4E), 109, 0xE051), // PageDown
+            (kb(0x4F), 106, 0xE04D), // Right
+            (kb(0x50), 105, 0xE04B), // Left
+            (kb(0x51), 108, 0xE050), // Down
+            (kb(0x52), 103, 0xE048), // Up
+        ];
+        for (usage, evdev, scancode) in nav_keys {
+            assert_eq!(evdev_to_hid(evdev), Some(usage));
+            assert_eq!(hid_to_evdev(usage), Some(evdev));
+            assert_eq!(scancode_to_hid(scancode), Some(usage));
+            assert_eq!(hid_to_scancode(usage), Some(scancode));
+            // Hook representation: base + extended=true must yield the scancode.
+            assert_eq!(win_scancode(scancode as u32 & 0xFF, true), scancode);
+            // With extended=false it must NOT match the extended scancode.
+            assert_ne!(win_scancode(scancode as u32 & 0xFF, false), scancode);
+        }
+    }
+
+    #[test]
+    fn all_modifiers_roundtrip() {
+        let mods = [
+            (keys::LEFT_CTRL, 29, 0x001D),
+            (keys::LEFT_SHIFT, 42, 0x002A),
+            (keys::LEFT_ALT, 56, 0x0038),
+            (keys::LEFT_META, 125, 0xE05B),
+            (keys::RIGHT_CTRL, 97, 0xE01D),
+            (keys::RIGHT_SHIFT, 54, 0x0036),
+            (keys::RIGHT_ALT, 100, 0xE038),
+            (keys::RIGHT_META, 126, 0xE05C),
+        ];
+        for (usage, evdev, scancode) in mods {
+            assert!(is_modifier(usage));
+            assert_eq!(evdev_to_hid(evdev), Some(usage));
+            assert_eq!(hid_to_evdev(usage), Some(evdev));
+            assert_eq!(scancode_to_hid(scancode), Some(usage));
+            assert_eq!(hid_to_scancode(usage), Some(scancode));
+        }
+    }
+
+    #[test]
+    fn media_keys_roundtrip() {
+        let media = [
+            (usage(PAGE_CONSUMER, 0xCD), 164, 0xE022),  // PlayPause
+            (usage(PAGE_CONSUMER, 0xB5), 163, 0xE019),  // NextTrack
+            (usage(PAGE_CONSUMER, 0xB6), 165, 0xE010),  // PrevTrack
+            (usage(PAGE_CONSUMER, 0xB7), 166, 0xE024),  // Stop
+            (usage(PAGE_CONSUMER, 0x223), 172, 0xE032), // BrowserHome
+            (usage(PAGE_CONSUMER, 0x224), 158, 0xE06A), // BrowserBack
+            (usage(PAGE_CONSUMER, 0x225), 159, 0xE069), // BrowserForward
+            (usage(PAGE_CONSUMER, 0x221), 217, 0xE065), // BrowserSearch
+            (usage(PAGE_CONSUMER, 0x18A), 155, 0xE06C), // Mail
+            (usage(PAGE_CONSUMER, 0x192), 140, 0xE021), // Calculator
+        ];
+        for (usage, evdev, scancode) in media {
+            assert_eq!(evdev_to_hid(evdev), Some(usage));
+            assert_eq!(hid_to_evdev(usage), Some(evdev));
+            assert_eq!(scancode_to_hid(scancode), Some(usage));
+            assert_eq!(hid_to_scancode(usage), Some(scancode));
+        }
+    }
+
+    #[test]
+    fn aliases_map_to_canonical() {
+        // NonUsHash (0x07, 0x32) shares evdev 43 and win 0x002B with Backslash (0x07, 0x31).
+        let non_us_hash = kb(0x32);
+        let backslash = kb(0x31);
+        assert_eq!(hid_to_evdev(non_us_hash), Some(43));
+        assert_eq!(hid_to_scancode(non_us_hash), Some(0x002B));
+        // Reverse lookup must return the canonical usage (Backslash).
+        assert_eq!(evdev_to_hid(43), Some(backslash));
+        assert_eq!(scancode_to_hid(0x002B), Some(backslash));
+    }
+
+    #[test]
+    fn edge_case_and_invalid_codes() {
+        // Unmapped codes
+        assert_eq!(evdev_to_hid(0), None);
+        assert_eq!(evdev_to_hid(0xFFFF), None);
+        assert_eq!(scancode_to_hid(0), None);
+        assert_eq!(scancode_to_hid(0xFFFF), None);
+        assert_eq!(hid_to_evdev(0), None);
+        assert_eq!(hid_to_scancode(0), None);
+        assert_eq!(hid_to_evdev(0xFFFF_FFFF), None);
+        assert_eq!(hid_to_scancode(0xFFFF_FFFF), None);
+
+        // win_scancode bit masking
+        assert_eq!(win_scancode(0x11E, false), 0x001E);
+        assert_eq!(win_scancode(0x11E, true), 0xE01E);
+    }
+
+    #[test]
     fn no_duplicate_canonical_codes() {
         let mut hid = HashSet::new();
         let mut ev = HashSet::new();
