@@ -196,6 +196,9 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Token FC1-XXXX-YYYY -Hub
 
 `http://<server>:7880` (ป้องกันด้วย dashboard token, ส่งเป็น `Authorization: Bearer`)
 
+* หน้าเว็บออกแบบให้พอดีหน้าจอเดียว ไม่ต้องเลื่อนหน้า (ทดสอบที่ 1920×900 และ 1366×650): Overview แบ่งซ้าย/ขวา
+  ผัง layout อยู่ซ้ายและขยายตามพื้นที่ที่เหลือ ส่วนขวาคือ join token, เครื่อง, path; ถ้ารายการยาวเกินจะเลื่อนภายในกล่องของมันเอง
+  บนจอแคบ (< 900px, มือถือ) กล่องจะเรียงต่อกันและเลื่อนทั้งหน้าได้ ไอคอนแท็บ (`/favicon.svg`, `/favicon-32.png`, `/apple-touch-icon.png`) เปิดได้โดยไม่ต้องใช้ token
 * **Overview**: join token (copy / regenerate), ลากจัดตำแหน่งเครื่อง (ขอบจะ snap ติดกัน) แล้วกด *Save layout*,
   ตารางเครื่อง (สถานะ **online / away / offline** พร้อมเหตุผล — ที่อยู่ IP ของเครื่องนั้นและเครือข่ายที่อนุญาต,
   OS, จอ, กำลังคุมเครื่องไหน, **mouse speed ต่อเครื่อง**, เปิด/ปิด, **Remove = revoke credential**),
