@@ -270,3 +270,27 @@ async fn empty_admin_token_falls_back_to_the_persisted_one() {
     assert_eq!(http(addr, "GET", "/api/state", None, None).await.0, 401);
     hub.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_page_and_icons_need_no_token() {
+    init_logs();
+    let hub = start_hub().await;
+    let web = hub.http_addr.expect("dashboard enabled");
+
+    let (code, page) = http(web, "GET", "/", None, None).await;
+    assert_eq!(code, 200);
+    for icon in ["/favicon.svg", "/favicon-32.png", "/apple-touch-icon.png"] {
+        assert!(page.contains(&format!("href=\"{icon}\"")), "page does not link {icon}");
+        let (code, body) = http(web, "GET", icon, None, None).await;
+        assert_eq!(code, 200, "{icon} must not be behind the dashboard token");
+        assert!(!body.is_empty());
+    }
+    let (code, svg) = http(web, "GET", "/favicon.svg", None, None).await;
+    assert!(code == 200 && svg.contains("<svg"));
+    let (code, png) = http(web, "GET", "/favicon.ico", None, None).await;
+    assert!(code == 200 && png.contains("PNG"), "favicon.ico serves the PNG");
+    // The API stays protected.
+    let (code, _) = http(web, "GET", "/api/state", None, None).await;
+    assert_eq!(code, 401);
+    hub.shutdown().await;
+}

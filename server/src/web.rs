@@ -18,6 +18,9 @@ use subtle::ConstantTimeEq;
 use tracing::info;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
+const FAVICON_SVG: &str = include_str!("../static/favicon.svg");
+const FAVICON_PNG: &[u8] = include_bytes!("../static/favicon-32.png");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../static/apple-touch-icon.png");
 
 pub fn router(hub: Arc<Hub>) -> Router {
     let api = Router::new()
@@ -27,7 +30,33 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/nodes/{id}", axum::routing::patch(patch_node).delete(delete_node))
         .route("/join-token/regenerate", post(regenerate_token))
         .layer(middleware::from_fn_with_state(hub.clone(), auth));
-    Router::new().route("/", get(index)).nest("/api", api).with_state(hub).layer(middleware::from_fn(security_headers))
+    // The icons are outside /api on purpose: browsers fetch them without the
+    // dashboard token, and the login page shows them too.
+    Router::new()
+        .route("/", get(index))
+        .route("/favicon.svg", get(favicon_svg))
+        .route("/favicon-32.png", get(favicon_png))
+        .route("/favicon.ico", get(favicon_png))
+        .route("/apple-touch-icon.png", get(apple_touch_icon))
+        .nest("/api", api)
+        .with_state(hub)
+        .layer(middleware::from_fn(security_headers))
+}
+
+/// Icons never change within a release, so they may be cached (unlike the
+/// page and the API, which security_headers marks no-store).
+const ICON_CACHE: &str = "public, max-age=86400";
+
+async fn favicon_svg() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, ICON_CACHE)], FAVICON_SVG)
+}
+
+async fn favicon_png() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, ICON_CACHE)], FAVICON_PNG)
+}
+
+async fn apple_touch_icon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, ICON_CACHE)], APPLE_TOUCH_ICON)
 }
 
 async fn index() -> Html<&'static str> {
@@ -39,7 +68,9 @@ async fn security_headers(req: Request, next: Next) -> Response {
     let h = res.headers_mut();
     h.insert(header::X_FRAME_OPTIONS, "DENY".parse().expect("static"));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().expect("static"));
-    h.insert(header::CACHE_CONTROL, "no-store".parse().expect("static"));
+    if !h.contains_key(header::CACHE_CONTROL) {
+        h.insert(header::CACHE_CONTROL, "no-store".parse().expect("static"));
+    }
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:"
