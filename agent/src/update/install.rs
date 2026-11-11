@@ -133,13 +133,15 @@ fn old_name(dest: &Path) -> PathBuf {
     dest.with_file_name(format!("{name}.old-{:08x}", rand::random::<u32>()))
 }
 
-/// Deletes `*.old-*` files a Windows update left next to `exe` (they are
-/// in use until the old processes are gone).
+/// Deletes `flow-agent*.old-*` / `flow-tray*.old-*` files a Windows update
+/// left next to `exe` (in use until the old processes are gone) and
+/// half-written `*.flowcursor-new` files. Nothing else is touched.
 pub fn remove_leftovers(exe_dir: &Path) {
     let Ok(rd) = std::fs::read_dir(exe_dir) else { return };
     for e in rd.flatten() {
         let n = e.file_name().to_string_lossy().to_string();
-        if n.contains(".old-") || n.ends_with(".flowcursor-new") {
+        let ours = n.starts_with("flow-agent") || n.starts_with("flow-tray");
+        if ours && (n.contains(".old-") || n.ends_with(".flowcursor-new")) {
             let _ = std::fs::remove_file(e.path());
         }
     }

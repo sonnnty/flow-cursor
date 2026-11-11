@@ -43,6 +43,15 @@ pub async fn start_hub() -> HubHandle {
 }
 
 pub async fn start_hub_in(data_dir: PathBuf) -> HubHandle {
+    start_hub_cfg(data_dir, None).await
+}
+
+/// A hub that offers the agent builds in `builds` (see [`agent_builds`]).
+pub async fn start_hub_with_builds(builds: PathBuf) -> HubHandle {
+    start_hub_cfg(temp_dir("hub"), Some(builds)).await
+}
+
+async fn start_hub_cfg(data_dir: PathBuf, agent_builds: Option<PathBuf>) -> HubHandle {
     flow_server::start(HubConfig {
         data_dir,
         quic_addr: "127.0.0.1:0".parse().unwrap(),
@@ -50,10 +59,23 @@ pub async fn start_hub_in(data_dir: PathBuf) -> HubHandle {
         admin_token: Some(ADMIN.into()),
         mdns: false,
         name: "itest".into(),
-        agent_builds: None,
+        agent_builds,
     })
     .await
     .expect("hub starts")
+}
+
+/// A directory of agent builds like the hub image has: `files` for
+/// linux-x86_64, and the manifest for build `id`.
+pub fn agent_builds(id: &BuildId, files: &[(&str, &[u8])]) -> PathBuf {
+    let d = temp_dir("builds");
+    let p = d.join("linux-x86_64");
+    std::fs::create_dir_all(&p).unwrap();
+    for (name, data) in files {
+        std::fs::write(p.join(name), data).unwrap();
+    }
+    flow_server::updates::write_manifest(&d, id, "").unwrap();
+    d
 }
 
 pub fn monitor(w: i32, h: i32) -> Vec<Monitor> {
@@ -88,6 +110,10 @@ pub struct AgentSpec {
     /// Adjusts the simulated backend before the agent starts (e.g. cursor
     /// support, which the agent reports in its Hello).
     pub prepare: Option<fn(&SimControl)>,
+    /// Build, installer and timings of the updater.
+    pub update: Option<flow_agent::update::UpdateOptions>,
+    /// Protocol announced to the hub (default: this one).
+    pub protocol: Option<u32>,
 }
 
 impl AgentSpec {
@@ -100,6 +126,8 @@ impl AgentSpec {
             state_dir: None,
             addrs: vec![ip("10.10.15.10")],
             prepare: None,
+            update: None,
+            protocol: None,
         }
     }
 }
@@ -120,7 +148,13 @@ pub async fn start_agent(hub: &HubHandle, spec: AgentSpec) -> TestAgent {
         f(&sim);
     }
     let net = StaticAddrs::new(spec.addrs);
-    let opts = StartOptions { addrs: Arc::new(net.clone()), net_check_interval: NET_CHECK, ..Default::default() };
+    let mut opts = StartOptions { addrs: Arc::new(net.clone()), net_check_interval: NET_CHECK, ..Default::default() };
+    if let Some(u) = spec.update {
+        opts.update = u;
+    }
+    if let Some(p) = spec.protocol {
+        opts.protocol = p;
+    }
     let agent = flow_agent::start_with(cfg, backend, rx, opts).await.expect("agent starts");
     TestAgent { agent, sim, state_dir, net }
 }

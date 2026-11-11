@@ -986,9 +986,11 @@ impl Core {
         }
         let Some(me) = self.me else { return EdgeOutcome::Refused };
         let Some((to, ex, ey)) = self.layout.crossing_local(me, x as f64, y as f64, side) else {
+            debug!(?side, x, y, "edge crossing refused: no machine behind this edge in the layout");
             return EdgeOutcome::Refused;
         };
         if !self.reachable(to) {
+            debug!(%to, peer = ?self.peers.get(&to), "edge crossing refused: target not online/enabled/able to inject");
             return EdgeOutcome::Refused;
         }
         let usable = self.links.lock().expect("poisoned").get(&to).is_some_and(|l| l.status().path != PathKind::Down);
