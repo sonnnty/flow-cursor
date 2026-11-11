@@ -1,0 +1,13 @@
+[package]
+name = "flow-tray"
+description = "FlowCursor tray icon and status window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flow-tray"
+path = "src/main.rs"
+
+[dependencies]
+png.workspace = true

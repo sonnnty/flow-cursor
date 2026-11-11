@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["proto", "crates/keymap", "crates/layout", "crates/net", "crates/ipc", "crates/itest", "server", "agent", "tools/bench"]
+members = ["proto", "crates/keymap", "crates/layout", "crates/net", "crates/ipc", "crates/itest", "server", "agent", "tray", "tools/bench"]
 
 [workspace.package]
 version = "0.1.0"

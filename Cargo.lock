@@ -692,6 +692,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-tray"
+version = "0.1.0"
+dependencies = [
+ "png",
+]
+
+[[package]]
 name = "flume"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- FlowCursor app icon: a cursor arrow crossing between two screens.
+     Same geometry as tray/src/icon.rs (unit square scaled to 256). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <g fill="#263238">
+    <rect x="5.1" y="66.6" width="115.2" height="107.5" rx="15.4"/>
+    <rect x="135.7" y="66.6" width="115.2" height="107.5" rx="15.4"/>
+    <rect x="52.5" y="174" width="20.5" height="25.6"/>
+    <rect x="183" y="174" width="20.5" height="25.6"/>
+    <rect x="29.4" y="194.6" width="66.6" height="15.4" rx="5"/>
+    <rect x="160" y="194.6" width="66.6" height="15.4" rx="5"/>
+  </g>
+  <g fill="#3b8ed0">
+    <rect x="17.9" y="79.4" width="89.6" height="81.9" rx="7.7"/>
+    <rect x="148.5" y="79.4" width="89.6" height="81.9" rx="7.7"/>
+  </g>
+  <path d="M97.3 51.2 L97.3 174.1 L128 146.4 L148 192.5 L168 183.3 L148 138.8 L186.4 138.8 Z"
+        fill="#ffffff" stroke="#1a2024" stroke-width="9" stroke-linejoin="round"/>
+</svg>
