@@ -1,0 +1,25 @@
+# FlowCursor hub on the home server.
+#   cd deploy && FLOW_ADMIN_TOKEN=change-me docker compose up -d --build
+# Host networking is required: agents talk QUIC over UDP 7878 and find the
+# hub with mDNS (multicast does not cross Docker's bridge network).
+services:
+  flow-server:
+    image: flow-cursor-server:flowcursor-mvp
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # Dashboard password. If empty, a random token is generated, stored
+      # in the volume and printed in `docker compose logs`.
+      FLOW_ADMIN_TOKEN: ${FLOW_ADMIN_TOKEN:-}
+      FLOW_QUIC_ADDR: 0.0.0.0:7878
+      FLOW_HTTP_ADDR: 0.0.0.0:7880
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Hub identity (certificate + key), nodes, layout, settings, tokens.
+      - flowcursor-data:/data
+
+volumes:
+  flowcursor-data:

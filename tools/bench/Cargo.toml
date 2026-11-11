@@ -1,0 +1,24 @@
+[package]
+name = "flow-bench"
+description = "FlowCursor latency bench: end-to-end input latency over P2P vs relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flow-bench"
+path = "src/main.rs"
+
+[dependencies]
+flow-proto.workspace = true
+flow-net.workspace = true
+flow-server.workspace = true
+flow-agent.workspace = true
+flow-keymap.workspace = true
+flow-layout.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+tracing-subscriber.workspace = true

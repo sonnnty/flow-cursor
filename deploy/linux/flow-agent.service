@@ -1,0 +1,21 @@
+# FlowCursor agent — systemd *user* service.
+# Installed by install.sh (~/.config/systemd/user) or the .deb
+# (/usr/lib/systemd/user). Enable with:
+#   systemctl --user enable --now flow-agent
+[Unit]
+Description=FlowCursor agent (share mouse, keyboard and clipboard)
+Documentation=https://github.com/ (see README.md)
+# Needs the graphical session (WAYLAND_DISPLAY / DISPLAY, session D-Bus for
+# the xdg-desktop-portal dialogs).
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/flow-agent run
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
