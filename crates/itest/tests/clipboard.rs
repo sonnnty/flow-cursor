@@ -19,6 +19,8 @@ async fn clipboard_multinode_sync_and_echo_suppression() {
     for x in [&a, &b, &c] {
         assert!(x.agent.wait(T, |s| s.connected && s.online_peers.len() == 2).await);
     }
+    // Allow clipboard bidirectional streams to establish on the hub
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     // 1. A copies text -> B and C receive it, A does not receive duplicate/echo
     let msg1 = ClipContent::Text("multinode test from A".into());
