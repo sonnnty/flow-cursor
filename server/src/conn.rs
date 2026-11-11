@@ -1,16 +1,19 @@
 //! One agent connection: authentication/enrolment, control stream, relay
 //! stream, clipboard stream and relay datagrams.
 
-use crate::state::{unix_now, ClipMeta, NodeRecord, Online, PairStat};
+use crate::state::{unix_now, AgentMeta, ClipMeta, LegacyAgent, NodeRecord, Online, PairStat, UpdateOnly};
 use crate::Hub;
 use anyhow::{anyhow, bail, Result};
-use flow_net::frame::{read_frame, write_frame};
+use flow_net::frame::{read_frame, read_raw, write_frame};
 use flow_net::quinn::{self, Connection};
 use flow_net::tls::peer_fingerprint;
 use flow_net::token::JoinToken;
+use flow_proto::hello::{Hello, HelloPeek, LegacyReject};
+use flow_proto::update::{UpdateFromHub, UpdateToHub};
 use flow_proto::{
-    ClipboardMsg, Fingerprint, FromHub, Hello, NodeId, RelayDatagramDown, RelayDatagramUp, RelayDown, RelayUp,
-    StreamKind, ToHub, Welcome, MAX_CLIPBOARD_FRAME, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
+    Accepted, BuildId, ClipboardMsg, Fingerprint, FromHub, HelloFrame, HelloReply, NodeId, OsKind, Register,
+    RelayDatagramDown, RelayDatagramUp, RelayDown, RelayUp, SessionMode, StreamKind, ToHub, Welcome,
+    FIRST_UPDATABLE_PROTOCOL, MAX_CLIPBOARD_FRAME, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,44 +34,133 @@ pub async fn handle_incoming(hub: Arc<Hub>, incoming: quinn::Incoming) {
     }
 }
 
+/// The OS of a platform key (`linux-x86_64` → Linux).
+fn os_of(platform: &str) -> OsKind {
+    match platform.split('-').next() {
+        Some("linux") => OsKind::Linux,
+        Some("windows") => OsKind::Windows,
+        _ => OsKind::Other,
+    }
+}
+
 async fn handle_conn(hub: Arc<Hub>, conn: Connection) -> Result<()> {
     let remote = conn.remote_address();
     let fp = peer_fingerprint(&conn).ok_or_else(|| anyhow!("no client certificate"))?;
     let (mut send, mut recv) =
         tokio::time::timeout(Duration::from_secs(10), conn.accept_bi()).await.map_err(|_| anyhow!("no hello"))??;
-    let hello = match read_frame::<_, ToHub>(&mut recv, MAX_CONTROL_FRAME).await? {
-        Some(ToHub::Hello(h)) => h,
-        _ => bail!("first message was not Hello"),
+    let raw = read_raw(&mut recv, MAX_CONTROL_FRAME).await?.ok_or_else(|| anyhow!("no hello"))?;
+    let peek = HelloPeek::read(&raw).ok_or_else(|| anyhow!("first message was not a hello"))?;
+    if peek.protocol_version < FIRST_UPDATABLE_PROTOCOL {
+        legacy_agent(&hub, &conn, &fp, &peek, &mut send).await;
+        return Ok(());
+    }
+    let HelloFrame::Hello(hello) = flow_proto::decode::<HelloFrame>(&raw)?;
+    // Same protocol: the session part decodes. Any other protocol (older or
+    // newer) only gets to update itself to this hub's build.
+    let register = if hello.protocol_version == PROTOCOL_VERSION {
+        match flow_proto::decode::<Register>(&hello.session) {
+            Ok(r) => Some(r),
+            Err(e) => bail!("malformed hello from an agent of this protocol: {e}"),
+        }
+    } else {
+        None
     };
 
-    let node = match authenticate(&hub, &fp, &hello) {
+    let node = match authenticate(&hub, &fp, &hello, register.as_ref()) {
         Ok(id) => id,
         Err(reason) => {
             warn!(%remote, "rejecting agent: {reason}");
             // Slow down token guessing.
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let _ = write_frame(&mut send, &FromHub::Reject { reason: reason.clone() }).await;
+            let _ = write_frame(&mut send, &HelloReply::Rejected { reason: reason.clone() }).await;
             let _ = send.finish();
             tokio::time::sleep(Duration::from_millis(200)).await;
             conn.close(1u32.into(), reason.as_bytes());
             return Ok(());
         }
     };
+    let meta = AgentMeta {
+        build: hello.agent.clone(),
+        platform: hello.platform.clone(),
+        protocol: hello.protocol_version,
+        report: None,
+    };
+    match register {
+        Some(reg) => full_session(hub, conn, node, meta, reg, send, recv).await,
+        None => update_only_session(hub, conn, node, meta, send, recv).await,
+    }
+}
 
+/// An agent from before the update handshake: tell it (in its own reject
+/// format) that it has to be updated by hand once, and show it in the
+/// dashboard.
+async fn legacy_agent(hub: &Hub, conn: &Connection, fp: &Fingerprint, peek: &HelloPeek, send: &mut quinn::SendStream) {
+    let reason = format!(
+        "this hub runs FlowCursor {} (protocol {PROTOCOL_VERSION}); this agent ({}, protocol {}) is too old to update \
+         itself: install FlowCursor {} on this machine by hand once, later versions update themselves from the hub",
+        flow_version::FULL,
+        peek.agent_version,
+        peek.protocol_version,
+        flow_version::VERSION,
+    );
+    {
+        let mut st = hub.lock();
+        if let Some(id) = st.p.node_by_fp(fp).map(|n| n.id) {
+            st.legacy.insert(
+                id,
+                LegacyAgent { version: peek.agent_version.clone(), protocol: peek.protocol_version, at: unix_now() },
+            );
+        }
+    }
+    warn!(remote = %conn.remote_address(), agent = %peek.agent_version, protocol = peek.protocol_version,
+        "agent too old to update itself; it must be updated by hand");
+    let _ = write_frame(send, &LegacyReject::Reject { reason: reason.clone() }).await;
+    let _ = send.finish();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    conn.close(1u32.into(), reason.as_bytes());
+}
+
+fn accepted(hub: &Hub, node: NodeId, mode: SessionMode) -> HelloReply {
+    let name = hub.lock().p.nodes.get(&node.0).map(|n| n.name.clone()).unwrap_or_default();
+    HelloReply::Accepted(Accepted {
+        node_id: node,
+        name,
+        hub: BuildId::current(),
+        hub_protocol: PROTOCOL_VERSION,
+        mode,
+    })
+}
+
+async fn full_session(
+    hub: Arc<Hub>,
+    conn: Connection,
+    node: NodeId,
+    meta: AgentMeta,
+    reg: Register,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Result<()> {
+    let remote = conn.remote_address();
+    write_frame(&mut send, &accepted(&hub, node, SessionMode::Full)).await?;
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<FromHub>();
     let conn_id;
     {
         let mut st = hub.lock();
         conn_id = st.next_conn_id;
         st.next_conn_id += 1;
-        let p2p_addrs = if hello.p2p_addrs.is_empty() {
-            vec![std::net::SocketAddr::new(remote.ip(), hello.p2p_port)]
+        let p2p_addrs = if reg.p2p_addrs.is_empty() {
+            vec![std::net::SocketAddr::new(remote.ip(), reg.p2p_port)]
         } else {
-            hello.p2p_addrs.clone()
+            reg.p2p_addrs
         };
         if let Some(old) = st.online.remove(&node) {
             old.conn.close(2u32.into(), b"replaced by a new connection");
         }
+        if let Some(old) = st.updating.remove(&node) {
+            old.conn.close(2u32.into(), b"replaced by a new connection");
+        }
+        st.legacy.remove(&node);
+        let build = meta.build.clone();
         st.online.insert(
             node,
             Online {
@@ -79,7 +171,7 @@ async fn handle_conn(hub: Arc<Hub>, conn: Connection) -> Result<()> {
                 clip: None,
                 remote,
                 p2p_addrs,
-                agent_version: hello.agent_version.clone(),
+                meta,
                 since: unix_now(),
                 away: false,
                 local_addrs: Vec::new(),
@@ -96,9 +188,10 @@ async fn handle_conn(hub: Arc<Hub>, conn: Connection) -> Result<()> {
             focus: st.focus_entries(),
         };
         let _ = ctl_tx.send(FromHub::Welcome(Box::new(welcome)));
+        let _ = ctl_tx.send(FromHub::Update(UpdateFromHub::Offer(st.offer_for(node))));
         st.broadcast_peers();
         st.broadcast_layout();
-        info!(%node, name = %rec.name, %remote, "agent connected");
+        info!(%node, name = %rec.name, %remote, agent = %build, "agent connected");
     }
 
     // Control writer.
@@ -165,6 +258,120 @@ async fn handle_conn(hub: Arc<Hub>, conn: Connection) -> Result<()> {
     result
 }
 
+/// An agent of another protocol: it gets the update offer and may fetch
+/// files, nothing else. Frames it sends that this hub cannot decode (a
+/// later protocol's additions) are skipped.
+async fn update_only_session(
+    hub: Arc<Hub>,
+    conn: Connection,
+    node: NodeId,
+    meta: AgentMeta,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Result<()> {
+    let remote = conn.remote_address();
+    let reason = format!(
+        "agent {} speaks protocol {}, this hub ({}) protocol {PROTOCOL_VERSION}: it has to update to the hub's build \
+         before it can share input",
+        meta.build,
+        meta.protocol,
+        flow_version::FULL
+    );
+    write_frame(&mut send, &accepted(&hub, node, SessionMode::UpdateOnly { reason: reason.clone() })).await?;
+    let (tx, mut rx) = mpsc::unbounded_channel::<UpdateFromHub>();
+    let conn_id;
+    {
+        let mut st = hub.lock();
+        conn_id = st.next_conn_id;
+        st.next_conn_id += 1;
+        if let Some(old) = st.online.remove(&node) {
+            old.conn.close(2u32.into(), b"replaced by a new connection");
+            st.focus.remove(&node);
+            st.release_focus_on(node);
+            st.broadcast_peers();
+            st.broadcast_focus();
+        }
+        if let Some(old) = st.updating.remove(&node) {
+            old.conn.close(2u32.into(), b"replaced by a new connection");
+        }
+        st.legacy.remove(&node);
+        info!(%node, %remote, agent = %meta.build, protocol = meta.protocol, "agent connected in update-only mode");
+        st.updating.insert(
+            node,
+            UpdateOnly { conn_id, conn: conn.clone(), tx: tx.clone(), remote, meta, since: unix_now(), reason },
+        );
+        let _ = tx.send(UpdateFromHub::Offer(st.offer_for(node)));
+    }
+    let writer = tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            if write_frame(&mut send, &m).await.is_err() {
+                break;
+            }
+        }
+    });
+    let streams = {
+        let hub = hub.clone();
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            while let Ok((s, mut r)) = conn.accept_bi().await {
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    // Only downloads in this mode.
+                    if let Ok(Some(StreamKind::Fetch)) = read_frame::<_, StreamKind>(&mut r, 64).await {
+                        let builds = hub.lock().builds.clone();
+                        if let Err(e) = crate::updates::serve_fetch(builds, node, s, r).await {
+                            debug!(%node, "fetch stream ended: {e:#}");
+                        }
+                    }
+                });
+            }
+        })
+    };
+    let result = async {
+        loop {
+            let Some(raw) = read_raw(&mut recv, MAX_CONTROL_FRAME).await? else { return Ok(()) };
+            match flow_proto::decode::<UpdateToHub>(&raw) {
+                Ok(m) => on_update_msg(&hub, node, m),
+                Err(e) => debug!(%node, "skipping an update frame this hub does not understand: {e}"),
+            }
+        }
+    }
+    .await;
+    writer.abort();
+    streams.abort();
+    {
+        let mut st = hub.lock();
+        if st.updating.get(&node).is_some_and(|u| u.conn_id == conn_id) {
+            st.updating.remove(&node);
+            if let Some(rec) = st.p.nodes.get_mut(&node.0) {
+                rec.last_seen = unix_now();
+            }
+            st.save();
+            info!(%node, "update-only agent disconnected");
+        }
+    }
+    result
+}
+
+/// An update report from `node` (either session kind).
+fn on_update_msg(hub: &Hub, node: NodeId, m: UpdateToHub) {
+    let mut st = hub.lock();
+    let UpdateToHub::Report(r) = m;
+    if let Some(f) = &r.failed {
+        let known = st.agent_meta(node).and_then(|m| m.report.as_ref()).and_then(|r| r.failed.as_ref());
+        if known != Some(f) {
+            warn!(%node, target = %f.target, rolled_back = f.rolled_back, "agent update failed: {}", f.reason);
+        }
+    }
+    let phase = st.agent_meta(node).and_then(|m| m.report.as_ref()).map(|r| r.phase.name());
+    if phase != Some(r.phase.name()) {
+        info!(%node, phase = r.phase.name(), "agent update state");
+    }
+    if let Some(meta) = st.agent_meta_mut(node) {
+        meta.report = Some(r);
+    }
+}
+
 /// Input may be relayed between two enabled nodes that are not away.
 fn relay_allowed(st: &crate::state::HubState, from: NodeId, to: NodeId) -> bool {
     let ok = |id: NodeId| st.p.nodes.get(&id.0).is_some_and(|n| n.enabled) && !st.is_away(id);
@@ -173,23 +380,22 @@ fn relay_allowed(st: &crate::state::HubState, from: NodeId, to: NodeId) -> bool 
 
 /// Known certificate → its node. Unknown certificate → enrol if the join
 /// token is valid.
-fn authenticate(hub: &Hub, fp: &Fingerprint, hello: &Hello) -> Result<NodeId, String> {
-    if hello.protocol_version != PROTOCOL_VERSION {
-        return Err(format!(
-            "protocol version mismatch: agent {} vs hub {}; install the same FlowCursor version on hub and agents",
-            hello.protocol_version, PROTOCOL_VERSION
-        ));
-    }
+fn authenticate(hub: &Hub, fp: &Fingerprint, hello: &Hello, reg: Option<&Register>) -> Result<NodeId, String> {
     let mut st = hub.lock();
     if let Some(rec) = st.p.node_by_fp(fp) {
         let id = rec.id;
         let rec = st.p.nodes.get_mut(&id.0).expect("exists");
         rec.hostname = hello.hostname.clone();
-        rec.os = hello.os;
-        rec.caps = hello.caps;
+        rec.os = os_of(&hello.platform);
+        rec.platform = hello.platform.clone();
+        rec.agent = Some(hello.agent.clone());
         rec.last_seen = unix_now();
-        if !hello.monitors.is_empty() {
-            rec.monitors = hello.monitors.clone();
+        if let Some(reg) = reg {
+            rec.os = reg.os;
+            rec.caps = reg.caps;
+            if !reg.monitors.is_empty() {
+                rec.monitors = reg.monitors.clone();
+            }
         }
         st.save();
         return Ok(id);
@@ -201,9 +407,12 @@ fn authenticate(hub: &Hub, fp: &Fingerprint, hello: &Hello) -> Result<NodeId, St
     {
         return Err("invalid join token".into());
     }
+    // An agent of another protocol may enrol too (it then updates first);
+    // monitors and capabilities arrive with its first full session.
+    let monitors = reg.map(|r| r.monitors.clone()).unwrap_or_default();
     let id = NodeId(st.p.next_id);
     st.p.next_id += 1;
-    let (x, y) = st.p.place_new(&hello.monitors);
+    let (x, y) = st.p.place_new(&monitors);
     let name = st.p.unique_name(&hello.hostname);
     info!(node = %id, %name, fingerprint = %fp, "enrolled new agent");
     st.p.nodes.insert(
@@ -213,18 +422,21 @@ fn authenticate(hub: &Hub, fp: &Fingerprint, hello: &Hello) -> Result<NodeId, St
             name,
             hostname: hello.hostname.clone(),
             fingerprint: fp.to_hex(),
-            os: hello.os,
+            os: reg.map(|r| r.os).unwrap_or_else(|| os_of(&hello.platform)),
             enabled: true,
             mouse_speed: 1.0,
             x,
             y,
-            monitors: hello.monitors.clone(),
-            caps: hello.caps,
+            monitors,
+            caps: reg.map(|r| r.caps).unwrap_or_default(),
             created: unix_now(),
             last_seen: unix_now(),
             allowed_networks: None,
             crossing_key: None,
             cursor_park: None,
+            update_policy: None,
+            agent: Some(hello.agent.clone()),
+            platform: hello.platform.clone(),
         },
     );
     st.save();
@@ -250,7 +462,10 @@ async fn control_loop(hub: &Arc<Hub>, node: NodeId, recv: &mut quinn::RecvStream
             continue;
         }
         match msg {
-            ToHub::Hello(_) => {}
+            ToHub::Update(m) => {
+                drop(st);
+                on_update_msg(hub, node, m);
+            }
             ToHub::Ping { nonce } => st.send_to(node, FromHub::Pong { nonce }),
             ToHub::Pong { .. } => {}
             ToHub::NetStatus { away, addrs } => {
@@ -328,6 +543,10 @@ async fn handle_stream(
     let r = match kind {
         StreamKind::Relay => relay_stream(&hub, node, conn_id, send, recv).await,
         StreamKind::Clipboard => clipboard_stream(&hub, node, conn_id, send, recv).await,
+        StreamKind::Fetch => {
+            let builds = hub.lock().builds.clone();
+            crate::updates::serve_fetch(builds, node, send, recv).await
+        }
     };
     if let Err(e) = r {
         debug!(%node, ?kind, "stream ended: {e:#}");

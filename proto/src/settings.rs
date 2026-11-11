@@ -1,6 +1,7 @@
 //! Settings owned by the hub, persisted in its volume and pushed live to
 //! every agent over the control stream.
 
+use crate::update::UpdatePolicy;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -141,6 +142,9 @@ pub struct HubSettings {
     pub crossing_key: String,
     /// Where the local cursor goes while this machine controls another.
     pub cursor_park: CursorPark,
+    /// What agents do when the hub carries another build of them (agents
+    /// get their effective policy in [`crate::update::Offer`]).
+    pub update_policy: UpdatePolicy,
 }
 
 pub const DEFAULT_EMERGENCY_HOTKEY: &str = "Ctrl+Alt+Shift+Escape";
@@ -157,13 +161,14 @@ impl Default for HubSettings {
             allowed_networks: Vec::new(),
             crossing_key: String::new(),
             cursor_park: CursorPark::Edge,
+            update_policy: UpdatePolicy::Auto,
         }
     }
 }
 
 /// What an agent receives: the hub's global settings with this node's own
-/// overrides (`allowed_networks`, `crossing_key`, `cursor_park`) already
-/// applied.
+/// overrides (`allowed_networks`, `crossing_key`, `cursor_park`,
+/// `update_policy`) already applied.
 pub type AgentSettings = HubSettings;
 
 #[cfg(test)]
@@ -182,6 +187,7 @@ mod tests {
         assert!(s.allowed_networks.is_empty());
         assert!(s.crossing_key.is_empty());
         assert_eq!(s.cursor_park, CursorPark::Edge);
+        assert_eq!(s.update_policy, UpdatePolicy::Auto);
         let bin = crate::encode(&s);
         assert_eq!(crate::decode::<HubSettings>(&bin).unwrap(), s);
     }

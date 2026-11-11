@@ -32,6 +32,16 @@ struct Args {
     /// Print the join token and exit.
     #[arg(long)]
     print_token: bool,
+    /// Directory with the agent builds offered to agents for self-update
+    /// (manifest.json + one directory per platform; built into the image by
+    /// build/build.sh).
+    #[arg(long, env = "FLOW_AGENT_BUILDS", default_value = flow_server::updates::DEFAULT_DIR)]
+    agent_builds: PathBuf,
+    /// Build time: write <DIR>/manifest.json for the files in
+    /// <DIR>/<platform>/ (stamped with this binary's version and build) and
+    /// exit.
+    #[arg(long, value_name = "DIR", hide = true)]
+    write_agent_manifest: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -45,6 +55,13 @@ async fn main() -> Result<()> {
         hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "flowcursor".into())
     });
     let name = format!("FlowCursor hub on {name}");
+    if let Some(dir) = &args.write_agent_manifest {
+        let m = flow_server::updates::write_manifest(dir, &flow_proto::BuildId::current(), flow_version::COMMIT)?;
+        for (p, f) in &m.platforms {
+            println!("{p}: {} files, {} bytes", f.files.len(), f.files.iter().map(|f| f.size).sum::<u64>());
+        }
+        return Ok(());
+    }
     if args.print_token {
         println!("{}", flow_server::join_token_from_dir(&args.data, &name)?);
         return Ok(());
@@ -56,6 +73,7 @@ async fn main() -> Result<()> {
         admin_token: args.admin_token.clone(),
         mdns: !args.no_mdns,
         name,
+        agent_builds: Some(args.agent_builds.clone()),
     };
     let hub = start(cfg).await?;
     {

@@ -1338,6 +1338,7 @@ dependencies = [
  "rustix 1.1.6",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -1387,6 +1388,7 @@ dependencies = [
  "flow-proto",
  "flow-server",
  "rand 0.8.8",
+ "serde",
  "serde_json",
  "tokio",
  "tracing-subscriber",
@@ -1429,6 +1431,7 @@ dependencies = [
 name = "flow-proto"
 version = "0.2.0"
 dependencies = [
+ "flow-version",
  "postcard",
  "serde",
  "serde_json",
@@ -1452,6 +1455,7 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tokio",
  "tracing",

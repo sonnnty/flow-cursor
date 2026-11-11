@@ -1,18 +1,22 @@
 //! FlowCursor wire protocol.
 //!
 //! Every message that crosses the network is defined here and encoded with
-//! [`postcard`] (compact varint serde format). All peers are built from the
-//! same workspace, so instead of protobuf's field-level evolution we use an
-//! explicit [`PROTOCOL_VERSION`] that is checked in the very first message of
-//! every connection; a mismatch produces a clear "upgrade" error.
+//! [`postcard`] (compact varint serde format). A full session needs hub and
+//! agent of the same [`PROTOCOL_VERSION`]; instead of protobuf's field-level
+//! evolution the version is checked in the frozen handshake ([`hello`]),
+//! and an agent of another protocol (≥ 4) gets an update-only session in
+//! which it can fetch the hub's build of itself ([`update`]).
 //!
 //! Streams and datagrams (all inside QUIC/TLS 1.3, never plaintext):
 //!
 //! * agent → hub connection (ALPN [`ALPN_HUB`]), all streams opened by the agent:
-//!   * control stream: [`ToHub`] / [`FromHub`] frames, first frame is [`ToHub::Hello`]
+//!   * control stream: [`hello::HelloFrame`] / [`hello::HelloReply`], then
+//!     [`ToHub`] / [`FromHub`] frames (full session) or bare
+//!     [`update::UpdateToHub`] / [`update::UpdateFromHub`] (update-only)
 //!   * relay stream: [`RelayUp`] / [`RelayDown`] frames (input relayed through the hub)
 //!   * clipboard stream: [`ClipboardMsg`] frames (bulk data, kept apart so it
 //!     never delays key events)
+//!   * download stream: [`update::FetchRequest`] / [`update::FetchReply`] + raw bytes
 //!   * QUIC datagrams: [`RelayDatagramUp`] / [`RelayDatagramDown`] (mouse motion, pings)
 //! * agent → agent connection (ALPN [`ALPN_P2P`]), opened by the sending agent:
 //!   * one bidirectional stream of [`LinkMsg`] frames
@@ -23,16 +27,22 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 pub mod clip;
+pub mod hello;
 pub mod net;
 pub mod settings;
+pub mod update;
 
 pub use clip::{ClipContent, ClipKind, ClipboardMsg};
+pub use hello::{Accepted, BuildId, HelloFrame, HelloReply, SessionMode, FIRST_UPDATABLE_PROTOCOL};
 pub use settings::{
     AgentSettings, ClipboardSettings, CursorPark, CursorSupport, EdgeSettings, HubSettings, PathPolicy,
 };
 
-/// Bumped whenever any message in this crate changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub use update::{UpdateFromHub, UpdatePolicy, UpdateToHub};
+
+/// Bumped whenever a message outside the frozen [`hello`] / [`update`]
+/// modules changes incompatibly (4: frozen handshake and self-update).
+pub const PROTOCOL_VERSION: u32 = 4;
 /// ALPN for agent ↔ hub connections.
 pub const ALPN_HUB: &[u8] = b"flowcursor-hub/1";
 /// ALPN for agent ↔ agent (P2P) connections.
@@ -247,14 +257,10 @@ pub struct FocusEntry {
 // agent ↔ hub control stream
 // ---------------------------------------------------------------------------
 
-/// First message on the control stream.
+/// The protocol-specific part of the agent's hello
+/// ([`hello::Hello::session`], postcard).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Hello {
-    pub protocol_version: u32,
-    pub agent_version: String,
-    /// Required only for the first enrollment of a new agent certificate.
-    pub join_token: Option<String>,
-    pub hostname: String,
+pub struct Register {
     pub os: OsKind,
     pub monitors: Vec<Monitor>,
     pub caps: Capabilities,
@@ -289,7 +295,6 @@ pub struct PathReport {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ToHub {
-    Hello(Hello),
     Ping {
         nonce: u64,
     },
@@ -308,6 +313,7 @@ pub enum ToHub {
         away: bool,
         addrs: Vec<IpAddr>,
     },
+    Update(UpdateToHub),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -331,13 +337,18 @@ pub enum FromHub {
     ReleaseControl,
     /// This node's credentials were revoked; the agent must re-join.
     Revoked,
+    Update(UpdateFromHub),
 }
 
-/// First frame on every additional agent-opened stream to the hub.
+/// First frame on every additional agent-opened stream to the hub. The
+/// order is frozen (update-only sessions of any protocol open `Fetch`):
+/// only append.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamKind {
     Relay,
     Clipboard,
+    /// Download of an update file ([`update::FetchRequest`]).
+    Fetch,
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +534,7 @@ mod tests {
             assert!(decode::<LinkMsg>(bad).is_err());
             assert!(decode::<FromHub>(bad).is_err());
         }
+        assert_eq!(encode(&StreamKind::Fetch), [2], "frozen order");
         // Valid message followed by garbage.
         let mut buf = encode(&ToHub::Ping { nonce: 1 });
         buf.push(0);
