@@ -6,10 +6,14 @@
 //!   whatever window has the focus, without grabbing anything) keep track
 //!   of the crossing combo's keys; changes are reported as `LocalKey` so
 //!   the core can decide at the edge.
-//! * Capture: active pointer + keyboard grabs on the root window, cursor
-//!   hidden with XFixes and parked in the middle of the primary monitor;
-//!   motion comes from raw (accelerated) XI2 deltas, keys/buttons from the
-//!   grab.
+//! * Capture: active pointer + keyboard grabs on the root window; motion
+//!   comes from raw (accelerated) XI2 deltas, keys/buttons from the grab.
+//!   The pointer grab is confined to a 1x1 InputOnly window, so the
+//!   visible cursor stays put while the mouse drives another machine: at
+//!   the edge where it left, or (cursor-park setting) warped to the
+//!   centre of that monitor, optionally hidden with XFixes. XFixes hiding
+//!   is per client and undone by the server when the connection closes,
+//!   so a crashed agent cannot leave the cursor hidden.
 //! * Injection: XTEST fake input (X keycode = evdev code + 8).
 //! * Clipboard: [`super::x11clip`].
 //!
@@ -17,10 +21,11 @@
 
 use super::x11clip::{self, X11Clipboard};
 use crate::backend::{crossing_key_event, Backend, BackendOptions, EventRx, EventTx, LocalEvent};
+use crate::park::Park;
 use anyhow::{Context, Result};
 use flow_layout::{Edge, Side};
 use flow_net::link::Action;
-use flow_proto::{Button, Capabilities, ClipContent, Monitor, Rect};
+use flow_proto::{Button, Capabilities, ClipContent, CursorSupport, Monitor, Rect};
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::mpsc as tmpsc;
 use tracing::{debug, info, warn};
@@ -28,7 +33,9 @@ use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::{self, ConnectionExt as _, EventMask, GrabMode, Window};
+use x11rb::protocol::xproto::{
+    self, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, EventMask, GrabMode, Window, WindowClass,
+};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -36,6 +43,7 @@ use x11rb::CURRENT_TIME;
 
 enum Cmd {
     Begin,
+    Park(Park),
     End(Option<(i32, i32)>),
     Inject(Action),
 }
@@ -90,7 +98,7 @@ pub async fn create(_opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx
     {
         let (conn, shared) = (conn.clone(), shared.clone());
         std::thread::Builder::new().name("x11-commands".into()).spawn(move || {
-            let mut w = Commands { conn, root, shared, wheel: (0, 0), parked: (0, 0) };
+            let mut w = Commands { conn, root, shared, wheel: (0, 0), pin: None, hidden: false };
             while let Ok(c) = cmd_rx.recv() {
                 if let Err(e) = w.handle(c) {
                     warn!("X11 command failed: {e:#}");
@@ -251,7 +259,11 @@ struct Commands {
     root: Window,
     shared: Arc<Mutex<Shared>>,
     wheel: (i32, i32),
-    parked: (i16, i16),
+    /// 1x1 InputOnly window the pointer grab is confined to (created on
+    /// first capture).
+    pin: Option<Window>,
+    /// Our XFixes HideCursor is in effect.
+    hidden: bool,
 }
 
 impl Commands {
@@ -259,45 +271,40 @@ impl Commands {
         let conn = self.conn.clone();
         match c {
             Cmd::Begin => {
-                let mask = EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION;
-                let g = conn
-                    .grab_pointer(
-                        false,
-                        self.root,
-                        mask,
-                        GrabMode::ASYNC,
-                        GrabMode::ASYNC,
-                        x11rb::NONE,
-                        x11rb::NONE,
-                        CURRENT_TIME,
-                    )?
-                    .reply()?;
+                // The cursor stays where it is (at the edge) until a Park.
+                let p = conn.query_pointer(self.root)?.reply()?;
+                self.grab_at(p.root_x as i32, p.root_y as i32)?;
                 let k =
                     conn.grab_keyboard(false, self.root, CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)?.reply()?;
-                if g.status != xproto::GrabStatus::SUCCESS || k.status != xproto::GrabStatus::SUCCESS {
-                    warn!(pointer = ?g.status, keyboard = ?k.status, "X11 grab failed (another app holds a grab?)");
-                }
-                conn.xfixes_hide_cursor(self.root)?;
-                // Park the pointer in the middle of the primary monitor so it
-                // cannot hit a screen edge while hidden.
-                let m = {
-                    let s = self.shared.lock().expect("poisoned");
-                    s.monitors.iter().find(|m| m.primary).or(s.monitors.first()).map(|m| m.rect)
-                };
-                if let Some(r) = m {
-                    self.parked = ((r.x + r.w / 2) as i16, (r.y + r.h / 2) as i16);
-                    conn.warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, self.parked.0, self.parked.1)?;
+                if k.status != xproto::GrabStatus::SUCCESS {
+                    warn!(keyboard = ?k.status, "X11 keyboard grab failed (another app holds a grab?)");
                 }
                 self.shared.lock().expect("poisoned").capturing = true;
+                conn.flush()?;
+            }
+            Cmd::Park(p) => {
+                let (x, y) = p.at;
+                conn.warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)?;
+                // Re-grabbing by the same client replaces the confinement.
+                self.grab_at(x, y)?;
+                if p.hide && !self.hidden {
+                    conn.xfixes_hide_cursor(self.root)?;
+                    self.hidden = true;
+                }
                 conn.flush()?;
             }
             Cmd::End(warp) => {
                 self.shared.lock().expect("poisoned").capturing = false;
                 conn.ungrab_pointer(CURRENT_TIME)?;
                 conn.ungrab_keyboard(CURRENT_TIME)?;
-                // HideCursor calls nest per client; ShowCursor until visible is
-                // not observable, one call matches our one HideCursor.
-                let _ = conn.xfixes_show_cursor(self.root);
+                if let Some(pin) = self.pin {
+                    conn.unmap_window(pin)?;
+                }
+                // HideCursor calls nest per client: one ShowCursor for our
+                // one HideCursor.
+                if std::mem::take(&mut self.hidden) {
+                    let _ = conn.xfixes_show_cursor(self.root);
+                }
                 if let Some((x, y)) = warp {
                     conn.warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)?;
                 }
@@ -307,6 +314,44 @@ impl Commands {
                 self.inject(a)?;
                 conn.flush()?;
             }
+        }
+        Ok(())
+    }
+
+    /// Grabs the pointer confined to the 1x1 pin window at (x, y): the
+    /// cursor cannot move while captured (raw XI2 motion still arrives).
+    /// Without the pin (window creation failed) the grab is unconfined.
+    fn grab_at(&mut self, x: i32, y: i32) -> Result<()> {
+        let conn = self.conn.clone();
+        if self.pin.is_none() {
+            let id = conn.generate_id()?;
+            let aux = CreateWindowAux::new().override_redirect(1);
+            let made =
+                conn.create_window(0, id, self.root, x as i16, y as i16, 1, 1, 0, WindowClass::INPUT_ONLY, 0, &aux);
+            match made.map_err(anyhow::Error::from).and_then(|c| c.check().map_err(anyhow::Error::from)) {
+                Ok(()) => self.pin = Some(id),
+                Err(e) => warn!("X11 pin window: {e:#}; the cursor moves freely (hidden or not) while captured"),
+            }
+        }
+        if let Some(pin) = self.pin {
+            conn.configure_window(pin, &ConfigureWindowAux::new().x(x).y(y))?;
+            conn.map_window(pin)?;
+        }
+        let mask = EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION;
+        let g = conn
+            .grab_pointer(
+                false,
+                self.root,
+                mask,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                self.pin.unwrap_or(x11rb::NONE),
+                x11rb::NONE,
+                CURRENT_TIME,
+            )?
+            .reply()?;
+        if g.status != xproto::GrabStatus::SUCCESS {
+            warn!(pointer = ?g.status, "X11 pointer grab failed (another app holds a grab?)");
         }
         Ok(())
     }
@@ -367,7 +412,7 @@ impl Backend for X11Backend {
         "x11"
     }
     fn caps(&self) -> Capabilities {
-        Capabilities { capture: true, inject: true, clipboard: self.clip.is_some(), ..Default::default() }
+        Capabilities { capture: true, inject: true, clipboard: self.clip.is_some(), cursor: CursorSupport::FULL }
     }
     fn monitors(&self) -> Vec<Monitor> {
         self.shared.lock().expect("poisoned").monitors.clone()
@@ -382,6 +427,9 @@ impl Backend for X11Backend {
         if self.shared.lock().expect("poisoned").capturing || warp.is_some() {
             let _ = self.cmd.send(Cmd::End(warp));
         }
+    }
+    fn park_cursor(&self, park: Park) {
+        let _ = self.cmd.send(Cmd::Park(park));
     }
     fn inject(&self, action: &Action) {
         let _ = self.cmd.send(Cmd::Inject(*action));

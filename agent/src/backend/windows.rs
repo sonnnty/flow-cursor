@@ -14,6 +14,15 @@
 //!   crossing key configured, the mouse hook / raw input path does not even
 //!   report an edge hit unless the combo is held, so a game that clips the
 //!   cursor (`ClipCursor`) and reads raw input is left completely alone.
+//! * Local cursor while driving another machine (cursor-park setting):
+//!   moved with `SetCursorPos`. Hidden with a 64x64, almost fully
+//!   transparent (alpha 1/255) topmost tool window of ours placed under
+//!   the parked cursor, which answers `WM_SETCURSOR` with no cursor. The
+//!   hooks swallow physical motion while capturing, so the cursor stays
+//!   over that window. Nothing system-wide changes (no `SetSystemCursor`):
+//!   when the window is hidden, or the process exits or crashes, the
+//!   window under the cursor sets its own cursor again, so no app or game
+//!   can be left with a hidden or wrong cursor.
 //! * Injection: `SendInput` with **scancodes** (layout independent),
 //!   absolute pointer moves over the virtual desktop.
 //! * Clipboard: separate thread with `AddClipboardFormatListener`; text
@@ -26,13 +35,14 @@
 
 use super::dib;
 use crate::backend::{crossing_key_event, Backend, BackendOptions, EventRx, EventTx, LocalEvent};
+use crate::park::Park;
 use anyhow::{anyhow, Result};
 use flow_layout::{Edge, Side};
 use flow_net::link::Action;
-use flow_proto::{Button, Capabilities, ClipContent, Monitor, Rect};
-use std::cell::RefCell;
+use flow_proto::{Button, Capabilities, ClipContent, CursorSupport, Monitor, Rect};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -56,6 +66,14 @@ const CF_UNICODETEXT: u32 = 13;
 const CF_DIB: u32 = 8;
 const CF_DIBV5: u32 = 17;
 const WM_APP_WAKE: u32 = WM_APP + 1;
+/// To the input window: park the cursor at `unpack(lparam)`, hide it when
+/// `wparam` is 1.
+const WM_APP_PARK: u32 = WM_APP + 2;
+/// To the input window: show the cursor; warp to `unpack(lparam)` when
+/// `wparam` is 1.
+const WM_APP_UNPARK: u32 = WM_APP + 3;
+/// Side of the window that hides the cursor.
+const CLOAK_SIZE: i32 = 64;
 const MOUSE_MOVE_ABSOLUTE: u16 = 1;
 
 /// State shared between the backend handle and the hook thread.
@@ -69,6 +87,10 @@ struct Shared {
     own_clip_seq: AtomicU32,
     /// Combo that must be held for an edge hit to count (None = any hit).
     crossing: Mutex<Option<flow_keymap::Combo>>,
+    /// The input thread's window (cursor park requests go there).
+    input_hwnd: AtomicUsize,
+    /// `park_cursor` ran since the last `end_capture`.
+    parked: AtomicBool,
 }
 
 pub struct WindowsBackend {
@@ -118,6 +140,8 @@ pub async fn create(_opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx
         clip_hwnd: Mutex::new(0),
         own_clip_seq: AtomicU32::new(0),
         crossing: Mutex::new(None),
+        input_hwnd: AtomicUsize::new(0),
+        parked: AtomicBool::new(false),
     });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     {
@@ -195,6 +219,7 @@ fn input_thread(tx: EventTx, shared: Arc<Shared>, ready: std::sync::mpsc::Sender
             let _ = ready.send(Err("CreateWindowExW failed".into()));
             return;
         }
+        shared.input_hwnd.store(hwnd as usize, Ordering::SeqCst);
         let rid = RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: 0x02, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd };
         if RegisterRawInputDevices(&rid, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) == 0 {
             let _ = ready.send(Err("RegisterRawInputDevices failed".into()));
@@ -393,6 +418,15 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_APP_PARK => {
+            let (x, y) = unpack(lparam);
+            park_here(x, y, wparam == 1);
+            0
+        }
+        WM_APP_UNPARK => {
+            unpark_here((wparam == 1).then(|| unpack(lparam)));
+            0
+        }
         WM_DISPLAYCHANGE => {
             let m = enum_monitors();
             with_ctx(|ctx| {
@@ -404,6 +438,119 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// local cursor while capturing (runs on the input thread)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// The window that hides the cursor (created on first use).
+    static CLOAK: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Packs a point into an LPARAM (64-bit Windows only, like the rest of
+/// the agent).
+fn pack(x: i32, y: i32) -> LPARAM {
+    (((x as u32 as u64) << 32) | y as u32 as u64) as LPARAM
+}
+
+fn unpack(l: LPARAM) -> (i32, i32) {
+    let v = l as u64;
+    ((v >> 32) as u32 as i32, v as u32 as i32)
+}
+
+unsafe extern "system" fn cloak_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        // The cursor is over this window: no cursor at all.
+        WM_SETCURSOR => {
+            SetCursor(std::ptr::null_mut());
+            1
+        }
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn cloak_window() -> HWND {
+    let existing = CLOAK.with(|c| c.get());
+    if !existing.is_null() {
+        return existing;
+    }
+    let hinst = GetModuleHandleW(std::ptr::null());
+    let class = wide("FlowCursorCloak");
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(cloak_wndproc),
+        hInstance: hinst,
+        lpszClassName: class.as_ptr(),
+        // No class cursor: WM_SETCURSOR decides.
+        hCursor: std::ptr::null_mut(),
+        ..std::mem::zeroed()
+    };
+    RegisterClassW(&wc);
+    let hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        class.as_ptr(),
+        class.as_ptr(),
+        WS_POPUP,
+        0,
+        0,
+        CLOAK_SIZE,
+        CLOAK_SIZE,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        hinst,
+        std::ptr::null(),
+    );
+    if hwnd.is_null() {
+        warn!("cannot create the window that hides the cursor; it stays visible");
+        return hwnd;
+    }
+    // Alpha 1, not 0: invisible, but still hit-tested, so it receives
+    // WM_SETCURSOR.
+    SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA);
+    CLOAK.with(|c| c.set(hwnd));
+    hwnd
+}
+
+fn park_here(x: i32, y: i32, hide: bool) {
+    unsafe {
+        if hide {
+            let w = cloak_window();
+            if !w.is_null() {
+                let half = CLOAK_SIZE / 2;
+                SetWindowPos(
+                    w,
+                    HWND_TOPMOST,
+                    x - half,
+                    y - half,
+                    CLOAK_SIZE,
+                    CLOAK_SIZE,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+        }
+        // After showing the window, so the move lands on it and it gets
+        // WM_SETCURSOR.
+        SetCursorPos(x, y);
+        if hide {
+            SetCursor(std::ptr::null_mut());
+        }
+    }
+}
+
+fn unpark_here(warp: Option<(i32, i32)>) {
+    unsafe {
+        let w = CLOAK.with(|c| c.get());
+        if !w.is_null() {
+            // The window under the cursor gets WM_SETCURSOR and shows its
+            // own cursor again.
+            ShowWindow(w, SW_HIDE);
+        }
+        if let Some((x, y)) = warp {
+            SetCursorPos(x, y);
+        }
     }
 }
 
@@ -468,7 +615,7 @@ impl Backend for WindowsBackend {
         "windows"
     }
     fn caps(&self) -> Capabilities {
-        Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() }
+        Capabilities { capture: true, inject: true, clipboard: true, cursor: CursorSupport::FULL }
     }
     fn monitors(&self) -> Vec<Monitor> {
         self.shared.monitors.lock().map(|m| m.clone()).unwrap_or_default()
@@ -483,10 +630,30 @@ impl Backend for WindowsBackend {
     }
     fn end_capture(&self, warp: Option<(i32, i32)>) {
         self.shared.capturing.store(false, Ordering::SeqCst);
-        if let Some((x, y)) = warp {
+        let hwnd = self.shared.input_hwnd.load(Ordering::SeqCst);
+        if self.shared.parked.swap(false, Ordering::SeqCst) && hwnd != 0 {
+            // Hide the cloak, then warp, in that order on the input thread.
+            let (w, l) = match warp {
+                Some((x, y)) => (1, pack(x, y)),
+                None => (0, 0),
+            };
+            unsafe {
+                PostMessageW(hwnd as HWND, WM_APP_UNPARK, w, l);
+            }
+        } else if let Some((x, y)) = warp {
             unsafe {
                 SetCursorPos(x, y);
             }
+        }
+    }
+    fn park_cursor(&self, park: Park) {
+        let hwnd = self.shared.input_hwnd.load(Ordering::SeqCst);
+        if hwnd == 0 {
+            return;
+        }
+        self.shared.parked.store(true, Ordering::SeqCst);
+        unsafe {
+            PostMessageW(hwnd as HWND, WM_APP_PARK, park.hide as WPARAM, pack(park.at.0, park.at.1));
         }
     }
     fn inject(&self, action: &Action) {

@@ -12,6 +12,22 @@
 //! barriers recreates the session; barriers therefore cover every layout
 //! edge and edges to offline machines are refused at activation time.
 //!
+//! **Local cursor while capturing** (cursor-park setting): GNOME 46 cannot
+//! do "centre" or "hide", so this backend reports no cursor support and
+//! the cursor stays at the edge. From mutter's gnome-46 source: barriers
+//! are created `META_BARRIER_FLAG_STICKY`, and a hit sets the barrier
+//! manager's `pointer_trap`, which pins the pointer to the hit position
+//! for all motion (absolute EI/RemoteDesktop motion goes through the same
+//! barrier constraint) until the barrier is released, which only
+//! `Release` or closing the session does; activating the capture does not
+//! touch cursor visibility (the event router only flips a flag), and no
+//! portal call moves or hides the pointer while capture stays active. The
+//! cursor is therefore visible, pinned at the edge. What works:
+//! `Release` with `cursor_position` (honoured by mutter after it drops the
+//! barriers, `clutter_seat_warp_pointer`), used to enter at the position
+//! mapped from the other machine on the way back, and otherwise just
+//! inside the edge where the capture started.
+//!
 //! **Injection** – `org.freedesktop.portal.RemoteDesktop` with
 //! `ConnectToEIS` (EI sender context: absolute/relative pointer, buttons,
 //! scroll, keyboard with evdev keycodes). The portal restore token is
@@ -138,7 +154,8 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
         capture: cap.is_some(),
         inject: inj.is_some(),
         clipboard: portal_clip || x11clip.is_some(),
-        ..Default::default()
+        // Neither moving nor hiding the cursor during capture (see above).
+        cursor: Default::default(),
     };
     info!(?caps, "Wayland portal backend ready");
     Ok((Arc::new(WaylandBackend { monitors, caps, inj, cap, x11clip, portal_clip }), rx))
