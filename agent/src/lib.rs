@@ -7,6 +7,7 @@ pub mod core;
 pub mod cross;
 pub mod edge;
 pub mod hub;
+pub mod logbuf;
 pub mod netcheck;
 
 pub use crate::core::{start, start_with, AgentHandle, AgentStatus, LogHook, StartOptions};

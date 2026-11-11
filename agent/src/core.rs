@@ -54,6 +54,13 @@ pub struct AgentStatus {
     /// Not on one of the allowed networks: no crossing, no being
     /// controlled, no clipboard.
     pub away: bool,
+    /// Sharing paused by the user ([`AgentHandle::set_paused`]): the same
+    /// restrictions as `away`, and the hub is told this machine is away.
+    pub paused: bool,
+    /// This machine's name at the hub.
+    pub node_name: Option<String>,
+    /// The other machines known from the hub (all of them, also offline).
+    pub peers: Vec<PeerInfo>,
     /// Interface addresses the away decision was made from.
     pub local_addrs: Vec<IpAddr>,
     /// The pointer is held at an edge waiting for the crossing key
@@ -66,6 +73,9 @@ pub struct AgentHandle {
     pub fingerprint: Fingerprint,
     status: watch::Receiver<AgentStatus>,
     links: Links,
+    backend: Arc<dyn Backend>,
+    state: Arc<Mutex<AgentState>>,
+    cmds: mpsc::UnboundedSender<CoreCmd>,
     endpoint: Endpoint,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -83,6 +93,20 @@ impl AgentHandle {
     pub async fn wait(&self, timeout: Duration, pred: impl Fn(&AgentStatus) -> bool) -> bool {
         let mut w = self.status.clone();
         tokio::time::timeout(timeout, w.wait_for(|s| pred(s))).await.map(|r| r.is_ok()).unwrap_or(false)
+    }
+
+    /// Pauses or resumes sharing (see [`AgentStatus::paused`]).
+    pub fn set_paused(&self, paused: bool) {
+        let _ = self.cmds.send(CoreCmd::SetPaused(paused));
+    }
+
+    /// Enrolment state (hub address that worked, pinned fingerprint…).
+    pub fn agent_state(&self) -> AgentState {
+        self.state.lock().expect("poisoned").clone()
+    }
+
+    pub fn backend(&self) -> &Arc<dyn Backend> {
+        &self.backend
     }
 
     pub fn link_status(&self, peer: NodeId) -> Option<LinkStatus> {
@@ -121,12 +145,26 @@ pub struct StartOptions {
     /// Where the allowed-networks check reads this machine's addresses.
     pub addrs: Arc<dyn AddrSource>,
     pub net_check_interval: Duration,
+    /// Start with sharing paused (kept across a restart requested by the
+    /// tray; a fresh start always shares).
+    pub paused: bool,
 }
 
 impl Default for StartOptions {
     fn default() -> Self {
-        StartOptions { log_hook: None, addrs: Arc::new(SystemAddrs), net_check_interval: NET_CHECK_INTERVAL }
+        StartOptions {
+            log_hook: None,
+            addrs: Arc::new(SystemAddrs),
+            net_check_interval: NET_CHECK_INTERVAL,
+            paused: false,
+        }
     }
+}
+
+/// Requests to the core task.
+#[derive(Debug)]
+enum CoreCmd {
+    SetPaused(bool),
 }
 
 /// Starts the agent with an already created backend.
@@ -147,7 +185,7 @@ pub async fn start_with(
     events: EventRx,
     opts: StartOptions,
 ) -> Result<AgentHandle> {
-    let StartOptions { log_hook, addrs, net_check_interval } = opts;
+    let StartOptions { log_hook, addrs, net_check_interval, paused } = opts;
     let state_dir = cfg.state_dir();
     std::fs::create_dir_all(&state_dir).with_context(|| format!("creating {}", state_dir.display()))?;
     let host = hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "agent".into());
@@ -168,6 +206,7 @@ pub async fn start_with(
     let (hub_ev_tx, hub_ev_rx) = mpsc::unbounded_channel();
     let (to_hub_tx, to_hub_rx) = mpsc::unbounded_channel();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (status_tx, status) = watch::channel(AgentStatus {
         node_id: state.lock().expect("poisoned").node_id.map(NodeId),
         ..Default::default()
@@ -194,7 +233,7 @@ pub async fn start_with(
     let settings = AgentSettings::default();
     let mut core = Core {
         me: None,
-        backend,
+        backend: backend.clone(),
         layout: Layout::default(),
         peers: HashMap::new(),
         combo: parse_combo(&settings.emergency_hotkey).expect("default hotkey parses"),
@@ -225,13 +264,29 @@ pub async fn start_with(
         addr_source: addrs,
         allowed: Vec::new(),
         away: false,
+        net_away: false,
+        paused,
         local_addrs: Vec::new(),
     };
     core.apply_settings(AgentSettings::default());
+    if paused {
+        info!("starting with sharing paused");
+    }
     core.check_net();
-    tasks.push(tokio::spawn(core.run(events, hub_ev_rx, act_rx, net_check_interval)));
+    core.publish();
+    tasks.push(tokio::spawn(core.run(events, hub_ev_rx, act_rx, cmd_rx, net_check_interval)));
 
-    Ok(AgentHandle { p2p_addr, fingerprint: identity.fingerprint, status, links, endpoint, tasks })
+    Ok(AgentHandle {
+        p2p_addr,
+        fingerprint: identity.fingerprint,
+        status,
+        links,
+        backend,
+        state,
+        cmds: cmd_tx,
+        endpoint,
+        tasks,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -306,7 +361,13 @@ struct Core {
     addr_source: Arc<dyn AddrSource>,
     /// Parsed `settings.allowed_networks` (empty = no restriction).
     allowed: Vec<Cidr>,
+    /// Sharing is off: `net_away || paused`. Everything that gates sharing
+    /// looks at this.
     away: bool,
+    /// Not on an allowed network.
+    net_away: bool,
+    /// Paused by the user.
+    paused: bool,
     local_addrs: Vec<IpAddr>,
 }
 
@@ -316,6 +377,7 @@ impl Core {
         mut events: EventRx,
         mut hub: mpsc::UnboundedReceiver<HubEvent>,
         mut actions: mpsc::UnboundedReceiver<(NodeId, Action)>,
+        mut cmds: mpsc::UnboundedReceiver<CoreCmd>,
         net_check_interval: Duration,
     ) {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -327,6 +389,9 @@ impl Core {
                 Some(ev) = events.recv() => self.on_local(ev),
                 Some(ev) = hub.recv() => self.on_hub(ev),
                 Some((from, a)) = actions.recv() => self.on_action(from, a),
+                Some(c) = cmds.recv() => match c {
+                    CoreCmd::SetPaused(p) => self.set_paused(p),
+                },
                 _ = tick.tick() => self.on_tick(),
                 _ = report.tick() => self.report_paths(),
                 _ = net.tick() => self.check_net(),
@@ -354,7 +419,13 @@ impl Core {
             s.settings = Some(self.settings.clone());
             s.layout_nodes = self.layout.nodes.len();
             s.online_peers = online;
-            s.away = self.away;
+            s.away = self.net_away;
+            s.paused = self.paused;
+            s.peers = {
+                let mut v: Vec<PeerInfo> = self.peers.values().cloned().collect();
+                v.sort_by_key(|p| p.id);
+                v
+            };
             s.local_addrs = self.local_addrs.clone();
             s.holding_edge = matches!(self.mode, Mode::Hold(_));
         });
@@ -373,6 +444,7 @@ impl Core {
                     s.revoked = false;
                     s.rejected = None;
                     s.node_id = Some(w.node_id);
+                    s.node_name = Some(w.name.clone());
                 });
                 self.apply_settings(w.settings);
                 self.layout = w.layout;
@@ -488,25 +560,58 @@ impl Core {
         let mut addrs = self.addr_source.addrs();
         addrs.sort();
         addrs.dedup();
-        let away = !on_allowed_network(&self.allowed, &addrs);
-        let changed = away != self.away || addrs != self.local_addrs;
+        let net_away = !on_allowed_network(&self.allowed, &addrs);
+        let mut changed = net_away != self.net_away || addrs != self.local_addrs;
         self.local_addrs = addrs;
-        if away != self.away {
-            self.away = away;
-            if away {
+        if net_away != self.net_away {
+            self.net_away = net_away;
+            if net_away {
                 warn!(addrs = ?self.local_addrs, allowed = ?self.settings.allowed_networks,
                     "not on an allowed network: sharing is paused (away)");
-                self.go_away();
+            } else if self.paused {
+                info!(addrs = ?self.local_addrs, "back on an allowed network (sharing stays paused by the user)");
             } else {
                 info!(addrs = ?self.local_addrs, "back on an allowed network: sharing resumed");
-                self.update_dir();
-                self.refresh_edges();
             }
         }
+        changed |= self.update_away();
         if changed {
             self.send_net_status();
             self.publish();
         }
+    }
+
+    /// Applies `net_away || paused`; true when sharing switched on or off.
+    fn update_away(&mut self) -> bool {
+        let away = self.net_away || self.paused;
+        if away == self.away {
+            return false;
+        }
+        self.away = away;
+        if away {
+            self.go_away();
+        } else {
+            self.update_dir();
+            self.refresh_edges();
+        }
+        true
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        if paused == self.paused {
+            return;
+        }
+        self.paused = paused;
+        if paused {
+            info!("sharing paused by the user");
+        } else if self.net_away {
+            info!("sharing resumed by the user (still away: not on an allowed network)");
+        } else {
+            info!("sharing resumed by the user");
+        }
+        self.update_away();
+        self.send_net_status();
+        self.publish();
     }
 
     fn send_net_status(&self) {
@@ -535,6 +640,10 @@ impl Core {
 
     fn set_peers(&mut self, list: Vec<PeerInfo>) {
         let me = self.me;
+        if let Some(mine) = list.iter().find(|p| Some(p.id) == me) {
+            let name = mine.name.clone();
+            self.status.send_modify(|s| s.node_name = Some(name));
+        }
         let old: HashSet<NodeId> = self.peers.keys().copied().collect();
         self.peers = list.into_iter().filter(|p| Some(p.id) != me).map(|p| (p.id, p)).collect();
         self.peer_crossing =
