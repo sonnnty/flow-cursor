@@ -118,7 +118,9 @@ pub fn bbox(n: &NodeLayout) -> Option<Rect> {
 }
 
 fn clamp_into(r: &Rect, x: f64, y: f64) -> (f64, f64) {
-    (x.clamp(r.x as f64, (r.right() - 1) as f64), y.clamp(r.y as f64, (r.bottom() - 1) as f64))
+    let max_x = (r.right() - 1).max(r.x) as f64;
+    let max_y = (r.bottom() - 1).max(r.y) as f64;
+    (x.clamp(r.x as f64, max_x), y.clamp(r.y as f64, max_y))
 }
 
 fn dist_to_rect(r: &Rect, x: f64, y: f64) -> f64 {
@@ -182,11 +184,17 @@ impl LayoutExt for Layout {
             let eb = perp_extent(&b, side);
             let overlap = ea.intersect(&eb)?;
             let seg_a = if neigh.len() == 1 { ea } else { overlap };
+            if seg_a.len() <= 0.0 {
+                continue;
+            }
             if !seg_a.contains(p) && !(neigh.len() == 1 && p >= seg_a.a && p <= seg_a.b) {
                 continue;
             }
             let back = self.neighbors(*bid, side.opposite());
             let seg_b = if back.len() == 1 { eb } else { overlap };
+            if seg_b.len() <= 0.0 {
+                continue;
+            }
             let f = ((p - seg_a.a) / seg_a.len()).clamp(0.0, 1.0);
             let p2 = (seg_b.a + f * seg_b.len()).min(seg_b.b - 1.0);
             // Entry monitor: the one containing p2 on the facing side.
@@ -361,7 +369,8 @@ fn entry_point(b: &NodeLayout, side: Side, p: f64) -> Option<(f64, f64)> {
                 da.total_cmp(&dc)
             })?;
             let e = perp_extent(&m, side);
-            (m, p.clamp(e.a, e.b - 1.0))
+            let max_p = (e.b - 1.0).max(e.a);
+            (m, p.clamp(e.a, max_p))
         }
     };
     Some(match side {

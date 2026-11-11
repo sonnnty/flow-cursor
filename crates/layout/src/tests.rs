@@ -181,3 +181,147 @@ fn new_nodes_go_to_the_right() {
     l.nodes.push(node(1, 0, 0, vec![mon(0, 0, 1920, 1080)]));
     assert_eq!(l.place_new_node(&[]), (1920, 0));
 }
+
+#[test]
+fn triple_monitor_and_4k_proportional_crossing() {
+    // Node A: Dual monitor (1920x1080 + 2560x1440, bbox 4480x1440).
+    // Node B: Triple monitor (1920x1080 + 3840x2160 + 1920x1080, bbox 7680x2160).
+    // Mon 1 on B is centered vertically (y: 540..1620).
+    let l = Layout {
+        nodes: vec![
+            node(1, 0, 0, vec![mon(0, 0, 1920, 1080), mon(1920, 0, 2560, 1440)]),
+            node(2, 4480, 0, vec![mon(0, 540, 1920, 1080), mon(1920, 0, 3840, 2160), mon(5760, 540, 1920, 1080)]),
+        ],
+    };
+
+    // A and B are adjacent
+    assert_eq!(l.neighbors(A, Side::Right), vec![B]);
+    assert_eq!(l.neighbors(B, Side::Left), vec![A]);
+
+    // Test proportional mapping at 0%, 25%, 50%, 75%, 100% along the height
+    for pct in [0.0f64, 0.25, 0.5, 0.75, 1.0] {
+        let ya = (1440.0 * pct).min(1439.0);
+        let crossing = l.crossing_local(A, 4479.0, ya, Side::Right).expect("A->B crossing");
+        assert_eq!(crossing.0, B);
+        let (xb, yb) = (crossing.1, crossing.2);
+
+        // At yb where Mon 1 on B exists (y in 540..1620), entry is at x=0 (Mon 1).
+        // Where Mon 1 does not exist (y < 540 or y >= 1620), entry snaps to Mon 2 at x=1920.
+        if (540.0..1620.0).contains(&yb) {
+            assert_eq!(xb, 0.0);
+        } else {
+            assert_eq!(xb, 1920.0);
+        }
+
+        // Crossing back from B to A must return to the exact same Y position on A
+        let back = l.crossing_local(B, xb, yb, Side::Left).expect("B->A crossing");
+        assert_eq!(back.0, A);
+        assert_eq!(back.1, 4479.0); // right edge of A's second monitor
+        assert!((back.2 - ya).abs() < 1.0, "roundtrip at {pct}: got {back:?}, expected ya={ya}");
+    }
+}
+
+#[test]
+fn l_shaped_dual_monitors_boundary_and_sliding() {
+    // Node A: Monitor 1 (0, 0, 1920, 1080) and Monitor 2 (1920, 300, 1080, 1920) in portrait
+    // Top of Node A has no neighbor; right of Monitor 2 has Node B
+    let l = Layout {
+        nodes: vec![
+            node(1, 0, 0, vec![mon(0, 0, 1920, 1080), mon(1920, 300, 1080, 1920)]),
+            node(2, 3000, 300, vec![mon(0, 0, 1920, 1080)]),
+        ],
+    };
+
+    // Moving between internal monitors of Node A (at y=500 where they touch):
+    // From Mon 1 rightwards into Mon 2 is inside Node A
+    let mv = l.move_cursor(A, 1918.0, 500.0, 10.0, 0.0);
+    assert_eq!(mv, Move::Inside { x: 1928.0, y: 500.0 });
+
+    // From Mon 2 leftwards into Mon 1 (at y=500 where they touch)
+    let mv = l.move_cursor(A, 1922.0, 500.0, -10.0, 0.0);
+    assert_eq!(mv, Move::Inside { x: 1912.0, y: 500.0 });
+
+    // Moving upwards from Mon 2 into the concave empty space (x=2000, y=305 moving by dy=-20)
+    // There is no monitor and no neighbor above Mon 2 -> slides along the top wall of Mon 2
+    let mv = l.move_cursor(A, 2000.0, 305.0, 0.0, -20.0);
+    assert_eq!(mv, Move::Inside { x: 2000.0, y: 300.0 });
+
+    // Moving leftwards from Mon 1 (where there is no neighbor on the left) slides along wall
+    let mv = l.move_cursor(A, 5.0, 200.0, -20.0, 0.0);
+    assert_eq!(mv, Move::Inside { x: 0.0, y: 200.0 });
+
+    // Crossing from right edge of Mon 2 into Node B
+    let mv = l.move_cursor(A, 2998.0, 1000.0, 10.0, 0.0);
+    match mv {
+        Move::Cross { to, side, .. } => {
+            assert_eq!(to, B);
+            assert_eq!(side, Side::Right);
+        }
+        other => panic!("expected crossing to B, got {other:?}"),
+    }
+
+    // Edges of A leading to B:
+    // Mon 1 free right edge is pos=1920 (y: 0..300).
+    // Shared border (y: 300..1080) between Mon 1 and Mon 2 is skipped.
+    // Mon 2 right edge is pos=3000 (y: 300..2220).
+    let edges = l.edges_of(A);
+    assert_eq!(
+        edges,
+        vec![
+            Edge { side: Side::Right, pos: 1920, start: 0, end: 300, to: B },
+            Edge { side: Side::Right, pos: 3000, start: 300, end: 2220, to: B },
+        ]
+    );
+}
+
+#[test]
+fn vertical_multi_monitor_different_resolutions() {
+    // Node A (top): Two 1920x1080 monitors side by side (total width 3840, height 1080)
+    // Node B (bottom): Ultrawide 3440x1440 at y: 1080, x: 200
+    let l = Layout {
+        nodes: vec![
+            node(1, 0, 0, vec![mon(0, 0, 1920, 1080), mon(1920, 0, 1920, 1080)]),
+            node(2, 200, 1080, vec![mon(0, 0, 3440, 1440)]),
+        ],
+    };
+
+    assert_eq!(l.neighbors(A, Side::Bottom), vec![B]);
+    assert_eq!(l.neighbors(B, Side::Top), vec![A]);
+
+    // Crossing down from left monitor of A (e.g. x = 960)
+    let (to, bx, by) = l.crossing_local(A, 960.0, 1079.0, Side::Bottom).expect("A->B bottom");
+    assert_eq!(to, B);
+    assert_eq!(by, 0.0); // enters at top edge of B
+
+    // Symmetrical return: crossing up from B at bx should return close to 960
+    let (back_to, ax, ay) = l.crossing_local(B, bx, 0.0, Side::Top).expect("B->A top");
+    assert_eq!(back_to, A);
+    assert_eq!(ay, 1079.0);
+    assert!((ax - 960.0).abs() < 1.0, "ax={ax}, expected 960");
+
+    // Crossing down from right monitor of A (e.g. x = 2880)
+    let (to2, bx2, by2) = l.crossing_local(A, 2880.0, 1079.0, Side::Bottom).expect("A->B bottom right");
+    assert_eq!(to2, B);
+    assert_eq!(by2, 0.0);
+    let (back_to2, ax2, _) = l.crossing_local(B, bx2, 0.0, Side::Top).expect("B->A top right");
+    assert_eq!(back_to2, A);
+    assert!((ax2 - 2880.0).abs() < 1.0, "ax2={ax2}, expected 2880");
+}
+
+#[test]
+fn degenerate_and_empty_monitor_geometries() {
+    // 0x0 monitor or negative dimensions should not cause a panic
+    let l = Layout {
+        nodes: vec![
+            node(1, 0, 0, vec![mon(0, 0, 0, 0)]),
+            node(2, 0, 0, vec![mon(0, 0, -100, -100)]),
+            node(3, 100, 0, vec![mon(0, 0, 1920, 1080)]),
+        ],
+    };
+    assert!(l.crossing_local(A, 0.0, 0.0, Side::Right).is_none());
+    assert!(l.crossing_local(B, 0.0, 0.0, Side::Right).is_none());
+    let mv = l.move_cursor(A, 0.0, 0.0, 10.0, 10.0);
+    assert!(matches!(mv, Move::Inside { .. }));
+    let mv2 = l.move_cursor(B, -10.0, -10.0, 5.0, 5.0);
+    assert!(matches!(mv2, Move::Inside { .. }));
+}
