@@ -19,7 +19,17 @@ pub fn usage_from_name(name: &str) -> Option<u32> {
         "pgup" => Some("PageUp"),
         "pgdn" | "pgdown" => Some("PageDown"),
         "prtsc" | "print" => Some("PrintScreen"),
-        "scrlk" => Some("ScrollLock"),
+        "scrlk" | "scroll" => Some("ScrollLock"),
+        "caps" => Some("CapsLock"),
+        // Side-specific modifiers under their usual short and OS names.
+        "lctrl" | "leftcontrol" | "controlleft" => Some("LeftCtrl"),
+        "rctrl" | "rightcontrol" | "controlright" => Some("RightCtrl"),
+        "lshift" | "shiftleft" => Some("LeftShift"),
+        "rshift" | "shiftright" => Some("RightShift"),
+        "lalt" | "altleft" | "leftoption" => Some("LeftAlt"),
+        "ralt" | "altright" | "altgr" | "rightoption" => Some("RightAlt"),
+        "lwin" | "leftwin" | "lsuper" | "leftsuper" | "lmeta" | "metaleft" | "leftcmd" => Some("LeftMeta"),
+        "rwin" | "rightwin" | "rsuper" | "rightsuper" | "rmeta" | "metaright" | "rightcmd" => Some("RightMeta"),
         _ => None,
     };
     let n = alias.unwrap_or(n);
@@ -75,7 +85,7 @@ pub fn parse_combo(s: &str) -> Result<Combo, ComboError> {
             "ctrl" | "control" => vec![keys::LEFT_CTRL, keys::RIGHT_CTRL],
             "shift" => vec![keys::LEFT_SHIFT, keys::RIGHT_SHIFT],
             "alt" => vec![keys::LEFT_ALT, keys::RIGHT_ALT],
-            "super" | "win" | "meta" | "cmd" => vec![keys::LEFT_META, keys::RIGHT_META],
+            "super" | "win" | "windows" | "meta" | "cmd" => vec![keys::LEFT_META, keys::RIGHT_META],
             _ => vec![usage_from_name(name).ok_or_else(|| ComboError::UnknownKey(name.to_string()))?],
         };
         parts.push(alts);
@@ -134,6 +144,34 @@ mod tests {
         // ComboError formatting
         assert_eq!(format!("{}", ComboError::Empty), "empty key combo");
         assert!(format!("{}", ComboError::UnknownKey("abc".into())).contains("abc"));
+    }
+
+    #[test]
+    fn crossing_key_combos() {
+        let held = |c: &Combo, keys: &[u32]| c.is_held(|k| keys.contains(&k));
+        // A modifier alone, either side.
+        let ctrl = parse_combo("Ctrl").unwrap();
+        assert!(held(&ctrl, &[keys::LEFT_CTRL]) && held(&ctrl, &[keys::RIGHT_CTRL]));
+        assert!(!held(&ctrl, &[keys::LEFT_ALT]));
+        // One side only, under several spellings.
+        for name in ["LeftCtrl", "lctrl", "ControlLeft", "leftcontrol"] {
+            let c = parse_combo(name).unwrap();
+            assert!(held(&c, &[keys::LEFT_CTRL]), "{name}");
+            assert!(!held(&c, &[keys::RIGHT_CTRL]), "{name}");
+        }
+        assert_eq!(parse_combo("AltGr").unwrap().parts, vec![vec![keys::RIGHT_ALT]]);
+        assert_eq!(parse_combo("RWin").unwrap().parts, vec![vec![keys::RIGHT_META]]);
+        assert_eq!(parse_combo("Windows").unwrap().parts, vec![vec![keys::LEFT_META, keys::RIGHT_META]]);
+        // Combination: both needed, extra keys do not hurt.
+        let ca = parse_combo("Ctrl+Alt").unwrap();
+        assert!(!held(&ca, &[keys::LEFT_CTRL]));
+        assert!(held(&ca, &[keys::RIGHT_CTRL, keys::LEFT_ALT, keys::LEFT_SHIFT]));
+        // Ordinary keys.
+        assert_eq!(parse_combo("CapsLock").unwrap().parts, vec![vec![keys::CAPS_LOCK]]);
+        assert_eq!(parse_combo("caps").unwrap().parts, vec![vec![keys::CAPS_LOCK]]);
+        assert_eq!(parse_combo("ScrollLock").unwrap().parts, vec![vec![kb(0x47)]]);
+        assert_eq!(parse_combo("F13").unwrap().parts, vec![vec![kb(0x68)]]);
+        assert_eq!(parse_combo("q").unwrap().parts, vec![vec![kb(0x14)]]);
     }
 
     #[test]

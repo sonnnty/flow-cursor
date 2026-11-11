@@ -206,6 +206,8 @@ impl HubState {
                     enabled: n.enabled,
                     mouse_speed: n.mouse_speed,
                     caps: n.caps,
+                    away: false,
+                    crossing_key: String::new(),
                 })
             })
             .collect()

@@ -246,7 +246,7 @@ async fn control_loop(hub: &Arc<Hub>, node: NodeId, recv: &mut quinn::RecvStream
         match msg {
             ToHub::Hello(_) => {}
             ToHub::Ping { nonce } => st.send_to(node, FromHub::Pong { nonce }),
-            ToHub::Pong { .. } => {}
+            ToHub::Pong { .. } | ToHub::NetStatus { .. } => {}
             ToHub::UpdateMonitors(m) => {
                 if let Some(rec) = st.p.nodes.get_mut(&node.0) {
                     if rec.monitors != m {
