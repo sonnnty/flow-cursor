@@ -14,7 +14,7 @@
 mod names;
 mod table;
 
-pub use names::{parse_combo, usage_from_name, usage_name, ComboError};
+pub use names::{parse_combo, usage_from_name, usage_name, Combo, ComboError};
 
 /// HID usage page of keyboard keys.
 pub const PAGE_KEYBOARD: u32 = 0x07;
