@@ -49,6 +49,14 @@ name = "flow-keymap"
 version = "0.1.0"
 
 [[package]]
+name = "flow-layout"
+version = "0.1.0"
+dependencies = [
+ "flow-proto",
+ "serde",
+]
+
+[[package]]
 name = "flow-proto"
 version = "0.1.0"
 dependencies = [

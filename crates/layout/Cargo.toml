@@ -1,0 +1,10 @@
+[package]
+name = "flow-layout"
+description = "Screen layout engine: neighbours, edge crossings with proportional mapping, virtual cursor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flow-proto.workspace = true
+serde.workspace = true
