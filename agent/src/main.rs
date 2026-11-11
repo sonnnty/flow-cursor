@@ -103,15 +103,15 @@ async fn main() -> Result<()> {
             println!("hub fingerprint:  {}", st.hub_fingerprint.as_deref().unwrap_or("(not pinned)"));
             println!("pending join:     {}", st.pending_join_token.is_some());
             println!("revoked:          {}", st.revoked);
-            println!("portal tokens:    {}", st.portal_restore_tokens.len());
+            println!("portal tokens:    {}", dir.join(flow_agent::config::PORTAL_TOKENS_FILE).exists());
             Ok(())
         }
         Cmd::ForgetPortal => {
-            let dir = cfg.state_dir();
-            let mut st = AgentState::load(&dir)?;
-            st.portal_restore_tokens.clear();
-            st.save(&dir)?;
-            println!("Portal permissions forgotten; the next start shows the permission dialogs again.");
+            if flow_agent::config::forget_portal_tokens(&cfg.state_dir())? {
+                println!("Portal permissions forgotten; the next start shows the permission dialogs again.");
+            } else {
+                println!("No stored portal permissions.");
+            }
             Ok(())
         }
         Cmd::Monitors { backend: b } => {

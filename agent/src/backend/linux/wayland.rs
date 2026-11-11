@@ -1,6 +1,845 @@
-use crate::backend::{Backend, BackendOptions, EventRx};
-use std::sync::Arc;
+//! Wayland backend through xdg-desktop-portal + libei (pure Rust: `ashpd`
+//! over `zbus`, `reis` for the EI protocol). Designed for GNOME ≥ 45
+//! (Zorin OS 17/18, Ubuntu 24.04+); also works on other compositors that
+//! implement these portals.
+//!
+//! **Capture** – `org.freedesktop.portal.InputCapture`: we place pointer
+//! barriers on the screen edges that lead to other machines. When the
+//! pointer hits one, the compositor *activates* the capture: the local
+//! pointer stops and all pointer/keyboard events go to our EI receiver
+//! context until we call `Release` (optionally with a cursor position).
+//! GNOME 46 cannot re-enable a disabled capture session, so changing the
+//! barriers recreates the session; barriers therefore cover every layout
+//! edge and edges to offline machines are refused at activation time.
+//!
+//! **Injection** – `org.freedesktop.portal.RemoteDesktop` with
+//! `ConnectToEIS` (EI sender context: absolute/relative pointer, buttons,
+//! scroll, keyboard with evdev keycodes). The portal restore token is
+//! stored (`portal-tokens.json`) so the permission dialog appears only
+//! once. Without EIS (older portals) the D-Bus `Notify*` methods are used.
+//!
+//! **Clipboard** – the portal Clipboard interface on the RemoteDesktop
+//! session (xdg-desktop-portal ≥ 1.17, GNOME ≥ 45). If unavailable, the X11
+//! CLIPBOARD selection through XWayland is used (mutter syncs it with the
+//! Wayland clipboard), which needs XWayland to be running.
 
-pub async fn create(_opts: &BackendOptions) -> anyhow::Result<(Arc<dyn Backend>, EventRx)> {
-    anyhow::bail!("not implemented yet")
+use super::x11clip::{self, X11Clipboard};
+use super::{button_to_evdev, evdev_to_button, PNG_MIME, TEXT_MIMES};
+use crate::backend::{Backend, BackendOptions, EventRx, EventTx, LocalEvent};
+use crate::config::{load_portal_token, save_portal_token};
+use anyhow::{anyhow, Context, Result};
+use ashpd::desktop::clipboard::{Clipboard, SetSelectionOptions};
+use ashpd::desktop::input_capture::{
+    Barrier, BarrierID, BarrierPosition, Capabilities as IcCaps, CreateSessionOptions as IcCreate, InputCapture,
+    ReleaseOptions, Zones,
+};
+use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop, SelectDevicesOptions};
+use ashpd::desktop::{PersistMode, Session};
+use flow_layout::{Edge, Side};
+use flow_net::link::Action;
+use flow_proto::{Capabilities, ClipContent, Monitor, Rect};
+use futures_util::StreamExt;
+use reis::ei;
+use reis::event::{DeviceCapability, EiEvent};
+use std::collections::HashMap;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+const RD_TOKEN: &str = "remote_desktop";
+
+enum InjCmd {
+    Inject(Action),
+    SetClipboard(ClipContent),
+}
+
+enum CapCmd {
+    SetEdges(Vec<Edge>),
+    Release(Option<(i32, i32)>),
+}
+
+pub struct WaylandBackend {
+    monitors: Arc<Mutex<Vec<Monitor>>>,
+    caps: Capabilities,
+    inj: Option<mpsc::UnboundedSender<InjCmd>>,
+    cap: Option<mpsc::UnboundedSender<CapCmd>>,
+    x11clip: Option<X11Clipboard>,
+    portal_clip: bool,
+}
+
+pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let monitors = Arc::new(Mutex::new(Vec::new()));
+
+    let (inj, portal_clip) = match start_injector(opts.state_dir.clone(), tx.clone()).await {
+        Ok((s, clip)) => (Some(s), clip),
+        Err(e) => {
+            warn!("RemoteDesktop portal unavailable, this machine cannot be controlled: {e:#}");
+            (None, false)
+        }
+    };
+    let cap = match start_capture(tx.clone(), monitors.clone()).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(
+                "InputCapture portal unavailable ({e:#}); this machine can be controlled but cannot control others. \
+                 InputCapture needs GNOME ≥ 45 / xdg-desktop-portal ≥ 1.18; on older systems use the Xorg session \
+                 (backend = \"x11\")."
+            );
+            None
+        }
+    };
+    let x11clip = if portal_clip {
+        None
+    } else if std::env::var_os("DISPLAY").is_some() {
+        match x11clip::spawn(tx.clone()) {
+            Ok(c) => {
+                info!("clipboard: portal clipboard unavailable, using the X11 selection via XWayland");
+                Some(c)
+            }
+            Err(e) => {
+                warn!("no clipboard access (portal clipboard missing and XWayland not reachable): {e:#}");
+                None
+            }
+        }
+    } else {
+        warn!("no clipboard access: portal clipboard missing and DISPLAY not set");
+        None
+    };
+    if monitors.lock().expect("poisoned").is_empty() {
+        // No InputCapture zones: ask XWayland, else assume one 1920x1080 screen.
+        let m = x11_monitors().unwrap_or_else(|_| {
+            vec![Monitor { name: "default".into(), rect: Rect::new(0, 0, 1920, 1080), primary: true }]
+        });
+        *monitors.lock().expect("poisoned") = m;
+    }
+    if inj.is_none() && cap.is_none() {
+        return Err(anyhow!("neither the RemoteDesktop nor the InputCapture portal works in this session"));
+    }
+    let caps =
+        Capabilities { capture: cap.is_some(), inject: inj.is_some(), clipboard: portal_clip || x11clip.is_some() };
+    info!(?caps, "Wayland portal backend ready");
+    Ok((Arc::new(WaylandBackend { monitors, caps, inj, cap, x11clip, portal_clip }), rx))
+}
+
+fn x11_monitors() -> Result<Vec<Monitor>> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::randr::ConnectionExt;
+    let (conn, screen) = x11rb::connect(None)?;
+    let root = conn.setup().roots[screen].root;
+    let r = conn.randr_get_monitors(root, true)?.reply()?;
+    Ok(r.monitors
+        .iter()
+        .enumerate()
+        .map(|(i, m)| Monitor {
+            name: format!("xwayland-{i}"),
+            rect: Rect::new(m.x as i32, m.y as i32, m.width as i32, m.height as i32),
+            primary: m.primary,
+        })
+        .collect())
+}
+
+impl Backend for WaylandBackend {
+    fn name(&self) -> &'static str {
+        "wayland"
+    }
+    fn caps(&self) -> Capabilities {
+        self.caps
+    }
+    fn monitors(&self) -> Vec<Monitor> {
+        self.monitors.lock().expect("poisoned").clone()
+    }
+    fn set_edges(&self, edges: Vec<Edge>) {
+        if let Some(c) = &self.cap {
+            let _ = c.send(CapCmd::SetEdges(edges));
+        }
+    }
+    fn begin_capture(&self) {
+        // Capture is started by the compositor when a barrier is hit.
+    }
+    fn end_capture(&self, warp: Option<(i32, i32)>) {
+        if let Some(c) = &self.cap {
+            let _ = c.send(CapCmd::Release(warp));
+        }
+    }
+    fn inject(&self, action: &Action) {
+        if let Some(i) = &self.inj {
+            let _ = i.send(InjCmd::Inject(*action));
+        }
+    }
+    fn set_clipboard(&self, content: &ClipContent) {
+        if self.portal_clip {
+            if let Some(i) = &self.inj {
+                let _ = i.send(InjCmd::SetClipboard(content.clone()));
+            }
+        } else if let Some(c) = &self.x11clip {
+            c.set(content);
+        }
+    }
+}
+
+fn now_us() -> u64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    t.tv_sec as u64 * 1_000_000 + t.tv_nsec as u64 / 1000
+}
+
+// ---------------------------------------------------------------------------
+// injection: RemoteDesktop (+ clipboard on the same session)
+// ---------------------------------------------------------------------------
+
+/// Runs a future that is not `Send` (reis event streams hold callbacks) on
+/// its own thread with a current-thread runtime. `setup` reports its
+/// result through the returned receiver before the long-running part.
+fn spawn_portal_thread<T, F, Fut>(name: &str, f: F) -> tokio::sync::oneshot::Receiver<Result<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(tokio::sync::oneshot::Sender<Result<T>>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(Err(e.into()));
+                return;
+            }
+        };
+        rt.block_on(f(tx));
+    });
+    if let Err(e) = spawned {
+        warn!("cannot spawn {name} thread: {e}");
+    }
+    rx
+}
+
+async fn start_injector(state_dir: PathBuf, tx: EventTx) -> Result<(mpsc::UnboundedSender<InjCmd>, bool)> {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let ready = spawn_portal_thread("portal-inject", move |ready| async move {
+        match setup_injector(&state_dir).await {
+            Ok((rd, session, clipboard, eis)) => {
+                let _ = ready.send(Ok(clipboard.is_some()));
+                match eis {
+                    Some((ctx, conn, events)) => {
+                        run_ei_sender(ctx, conn, events, cmd_rx, rd, session, clipboard, tx).await
+                    }
+                    None => run_dbus_injector(rd, session, cmd_rx, clipboard, tx).await,
+                }
+            }
+            Err(e) => {
+                let _ = ready.send(Err(e));
+            }
+        }
+    });
+    let clip_on = ready.await.map_err(|_| anyhow!("portal thread died"))??;
+    Ok((cmd_tx, clip_on))
+}
+
+type EiParts = (ei::Context, reis::event::Connection, reis::tokio::EiConvertEventStream);
+
+async fn setup_injector(
+    state_dir: &std::path::Path,
+) -> Result<(RemoteDesktop, Session<RemoteDesktop>, Option<Clipboard>, Option<EiParts>)> {
+    let rd = RemoteDesktop::new().await.context("RemoteDesktop portal")?;
+    let session = rd.create_session(Default::default()).await.context("creating RemoteDesktop session")?;
+    let token = load_portal_token(state_dir, RD_TOKEN);
+    rd.select_devices(
+        &session,
+        SelectDevicesOptions::default()
+            .set_devices(DeviceType::KEYBOARD | DeviceType::POINTER)
+            .set_persist_mode(PersistMode::ExplicitlyRevoked)
+            .set_restore_token(token.as_deref()),
+    )
+    .await
+    .context("selecting devices")?;
+    // The clipboard must be requested before Start.
+    let clipboard = match Clipboard::new().await {
+        Ok(c) => match c.request(&session, Default::default()).await {
+            Ok(()) => Some(c),
+            Err(e) => {
+                debug!("portal clipboard not available: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            debug!("portal clipboard not available: {e}");
+            None
+        }
+    };
+    info!("asking for remote control permission (a GNOME dialog appears the first time)");
+    let resp =
+        rd.start(&session, None, Default::default()).await?.response().context("RemoteDesktop permission denied")?;
+    if let Some(t) = resp.restore_token() {
+        if let Err(e) = save_portal_token(state_dir, RD_TOKEN, t) {
+            warn!("could not store the portal restore token: {e:#}");
+        }
+    }
+    let clipboard = if clipboard.is_some() && resp.is_clipboard_enabled() {
+        info!("clipboard via the portal Clipboard interface");
+        clipboard
+    } else {
+        None
+    };
+    let eis = match rd.connect_to_eis(&session, Default::default()).await {
+        Ok(fd) => {
+            let stream = UnixStream::from(fd);
+            stream.set_nonblocking(true)?;
+            let ctx = ei::Context::new(stream)?;
+            let (conn, events) = ctx
+                .handshake_tokio("flowcursor-inject", ei::handshake::ContextType::Sender)
+                .await
+                .map_err(|e| anyhow!("EI handshake: {e:?}"))?;
+            info!("injection via libei (RemoteDesktop.ConnectToEIS)");
+            Some((ctx, conn, events))
+        }
+        Err(e) => {
+            warn!("ConnectToEIS not supported ({e}); falling back to RemoteDesktop D-Bus Notify* calls");
+            None
+        }
+    };
+    Ok((rd, session, clipboard, eis))
+}
+
+#[derive(Default)]
+struct EiDevices {
+    list: Vec<reis::event::Device>,
+    resumed: HashMap<u64, bool>,
+}
+
+fn dev_key(d: &reis::event::Device) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    d.device().hash(&mut h);
+    h.finish()
+}
+
+impl EiDevices {
+    fn with<T: ei::Interface>(&self) -> Option<(&reis::event::Device, T)> {
+        self.list
+            .iter()
+            .filter(|d| self.resumed.get(&dev_key(d)).copied().unwrap_or(false))
+            .find_map(|d| d.interface::<T>().map(|i| (d, i)))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_ei_sender(
+    ctx: ei::Context,
+    conn: reis::event::Connection,
+    mut events: reis::tokio::EiConvertEventStream,
+    mut cmds: mpsc::UnboundedReceiver<InjCmd>,
+    _rd: RemoteDesktop,
+    session: Session<RemoteDesktop>,
+    clipboard: Option<Clipboard>,
+    tx: EventTx,
+) {
+    let mut devs = EiDevices::default();
+    let mut sequence = 1u32;
+    let mut last_abs: Option<(f32, f32)> = None;
+    let clip = clipboard;
+    let mut owned: Option<ClipContent> = None;
+    let (mut owner_changes, mut transfers) = match &clip {
+        Some(c) => (
+            c.receive_selection_owner_changed::<RemoteDesktop>().await.ok().map(|s| s.boxed()),
+            c.receive_selection_transfer::<RemoteDesktop>().await.ok().map(|s| s.boxed()),
+        ),
+        None => (None, None),
+    };
+    loop {
+        tokio::select! {
+            ev = events.next() => match ev {
+                Some(Ok(ev)) => match ev {
+                    EiEvent::SeatAdded(s) => {
+                        s.seat.bind_capabilities(
+                            DeviceCapability::Pointer | DeviceCapability::PointerAbsolute | DeviceCapability::Keyboard
+                                | DeviceCapability::Scroll | DeviceCapability::Button,
+                        );
+                        let _ = ctx.flush();
+                    }
+                    EiEvent::DeviceAdded(d) => {
+                        debug!(name = ?d.device.name(), "EI device added");
+                        devs.list.push(d.device);
+                    }
+                    EiEvent::DeviceRemoved(d) => {
+                        let k = dev_key(&d.device);
+                        devs.list.retain(|x| dev_key(x) != k);
+                        devs.resumed.remove(&k);
+                    }
+                    EiEvent::DeviceResumed(r) => {
+                        devs.resumed.insert(dev_key(&r.device), true);
+                        r.device.device().start_emulating(r.serial, sequence);
+                        sequence += 1;
+                        let _ = ctx.flush();
+                    }
+                    EiEvent::DevicePaused(p) => {
+                        devs.resumed.insert(dev_key(&p.device), false);
+                    }
+                    EiEvent::Disconnected(d) => {
+                        warn!("EI injection connection closed: {:?}", d.reason);
+                        return;
+                    }
+                    _ => {}
+                },
+                Some(Err(e)) => {
+                    warn!("EI injection error: {e:?}");
+                    return;
+                }
+                None => return,
+            },
+            cmd = cmds.recv() => match cmd {
+                None => return,
+                Some(InjCmd::Inject(a)) => {
+                    ei_inject(&devs, &conn, a, &mut last_abs);
+                    let _ = ctx.flush();
+                }
+                Some(InjCmd::SetClipboard(c)) => {
+                    if let Some(cs) = &clip {
+                        let mimes: Vec<&str> = match &c {
+                            ClipContent::Text(_) => TEXT_MIMES.to_vec(),
+                            ClipContent::Image { .. } => vec![PNG_MIME],
+                        };
+                        owned = Some(c);
+                        if let Err(e) = cs.set_selection(&session, SetSelectionOptions::default().set_mime_types(&mimes)).await {
+                            warn!("setting the clipboard failed: {e}");
+                        }
+                    }
+                }
+            },
+            Some((_s, change)) = async { match owner_changes.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => {
+                if change.session_is_owner() == Some(true) {
+                    continue;
+                }
+                let Some(cs) = &clip else { continue };
+                let mimes = change.mime_types();
+                let pick = if mimes.iter().any(|m| m == PNG_MIME) {
+                    Some(PNG_MIME.to_string())
+                } else {
+                    TEXT_MIMES.iter().find(|t| mimes.iter().any(|m| m == *t)).map(|s| s.to_string())
+                };
+                if let Some(mime) = pick {
+                    match cs.selection_read(&session, &mime).await {
+                        Ok(fd) => {
+                            let tx = tx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                use std::io::Read;
+                                let mut f = std::fs::File::from(std::os::fd::OwnedFd::from(fd));
+                                let mut buf = Vec::new();
+                                if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                                    let c = if mime == PNG_MIME {
+                                        ClipContent::Image { png: buf }
+                                    } else {
+                                        ClipContent::Text(String::from_utf8_lossy(&buf).into_owned())
+                                    };
+                                    let _ = tx.send(LocalEvent::Clipboard(c));
+                                }
+                            });
+                        }
+                        Err(e) => debug!("clipboard read failed: {e}"),
+                    }
+                }
+            }
+            Some((_s, mime, serial)) = async { match transfers.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => {
+                let Some(cs) = &clip else { continue };
+                let data: Option<Vec<u8>> = match &owned {
+                    Some(ClipContent::Text(t)) if TEXT_MIMES.contains(&mime.as_str()) => Some(t.as_bytes().to_vec()),
+                    Some(ClipContent::Image { png }) if mime == PNG_MIME => Some(png.clone()),
+                    _ => None,
+                };
+                let ok = match (data, cs.selection_write(&session, serial).await) {
+                    (Some(d), Ok(fd)) => tokio::task::spawn_blocking(move || {
+                        use std::io::Write;
+                        std::fs::File::from(std::os::fd::OwnedFd::from(fd)).write_all(&d).is_ok()
+                    }).await.unwrap_or(false),
+                    _ => false,
+                };
+                let _ = cs.selection_write_done(&session, serial, ok).await;
+            }
+        }
+    }
+}
+
+fn ei_inject(devs: &EiDevices, conn: &reis::event::Connection, a: Action, last_abs: &mut Option<(f32, f32)>) {
+    let serial = conn.serial();
+    let t = now_us();
+    match a {
+        Action::Entered { x, y } | Action::MoveAbs { x, y, .. } => {
+            let (x, y) = (x as f32, y as f32);
+            if let Some((d, p)) = devs.with::<ei::PointerAbsolute>() {
+                p.motion_absolute(x, y);
+                d.device().frame(serial, t);
+            } else if let Some((d, p)) = devs.with::<ei::Pointer>() {
+                // Relative only: move by the difference to the last position
+                // (or by the sender's delta when we do not know it yet).
+                let (dx, dy) = match (*last_abs, a) {
+                    (Some((lx, ly)), _) => (x - lx, y - ly),
+                    (None, Action::MoveAbs { dx, dy, .. }) => (dx as f32, dy as f32),
+                    _ => (0.0, 0.0),
+                };
+                p.motion_relative(dx, dy);
+                d.device().frame(serial, t);
+            }
+            *last_abs = Some((x, y));
+        }
+        Action::Key { usage, down } => {
+            if let (Some(code), Some((d, k))) = (flow_keymap::hid_to_evdev(usage), devs.with::<ei::Keyboard>()) {
+                k.key(code as u32, if down { ei::keyboard::KeyState::Press } else { ei::keyboard::KeyState::Released });
+                d.device().frame(serial, t);
+            }
+        }
+        Action::Button { button, down } => {
+            if let Some((d, b)) = devs.with::<ei::Button>() {
+                b.button(
+                    button_to_evdev(button),
+                    if down { ei::button::ButtonState::Press } else { ei::button::ButtonState::Released },
+                );
+                d.device().frame(serial, t);
+            }
+        }
+        Action::Wheel { dx, dy } => {
+            if let Some((d, s)) = devs.with::<ei::Scroll>() {
+                // EI: 120 = one detent, positive y = down; ours: positive = up.
+                s.scroll_discrete(dx, -dy);
+                d.device().frame(serial, t);
+            }
+        }
+        Action::Left => *last_abs = None,
+    }
+}
+
+async fn run_dbus_injector(
+    rd: RemoteDesktop,
+    session: Session<RemoteDesktop>,
+    mut cmds: mpsc::UnboundedReceiver<InjCmd>,
+    _clipboard: Option<Clipboard>,
+    _tx: EventTx,
+) {
+    // Without a screencast stream only relative motion is available.
+    let mut last: Option<(i32, i32)> = None;
+    while let Some(c) = cmds.recv().await {
+        let r = match c {
+            InjCmd::Inject(Action::Entered { x, y }) => {
+                last = Some((x, y));
+                Ok(())
+            }
+            InjCmd::Inject(Action::MoveAbs { x, y, dx, dy }) => {
+                let (mx, my) = match last {
+                    Some((lx, ly)) => (x - lx, y - ly),
+                    None => (dx, dy),
+                };
+                last = Some((x, y));
+                rd.notify_pointer_motion(&session, mx as f64, my as f64, Default::default()).await
+            }
+            InjCmd::Inject(Action::Key { usage, down }) => match flow_keymap::hid_to_evdev(usage) {
+                Some(code) => {
+                    let st = if down { KeyState::Pressed } else { KeyState::Released };
+                    rd.notify_keyboard_keycode(&session, code as i32, st, Default::default()).await
+                }
+                None => Ok(()),
+            },
+            InjCmd::Inject(Action::Button { button, down }) => {
+                let st = if down { KeyState::Pressed } else { KeyState::Released };
+                rd.notify_pointer_button(&session, button_to_evdev(button) as i32, st, Default::default()).await
+            }
+            InjCmd::Inject(Action::Wheel { dx, dy }) => {
+                if dy != 0 {
+                    let _ =
+                        rd.notify_pointer_axis_discrete(&session, Axis::Vertical, -dy / 120, Default::default()).await;
+                }
+                if dx != 0 {
+                    let _ =
+                        rd.notify_pointer_axis_discrete(&session, Axis::Horizontal, dx / 120, Default::default()).await;
+                }
+                Ok(())
+            }
+            InjCmd::Inject(Action::Left) => {
+                last = None;
+                Ok(())
+            }
+            InjCmd::SetClipboard(_) => Ok(()),
+        };
+        if let Err(e) = r {
+            debug!("RemoteDesktop notify failed: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// capture: InputCapture
+// ---------------------------------------------------------------------------
+
+async fn start_capture(tx: EventTx, monitors: Arc<Mutex<Vec<Monitor>>>) -> Result<mpsc::UnboundedSender<CapCmd>> {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let ready = spawn_portal_thread("portal-capture", move |ready| async move {
+        let ic = match InputCapture::new().await.context("InputCapture portal") {
+            Ok(ic) => ic,
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
+        match CaptureSession::create(&ic).await {
+            Ok(cs) => {
+                *monitors.lock().expect("poisoned") = zones_to_monitors(&cs.zones);
+                let _ = ready.send(Ok(()));
+                run_capture(ic, cs, cmd_rx, tx, monitors).await;
+            }
+            Err(e) => {
+                let _ = ready.send(Err(e));
+            }
+        }
+    });
+    ready.await.map_err(|_| anyhow!("portal thread died"))??;
+    Ok(cmd_tx)
+}
+
+struct CaptureSession {
+    session: Session<InputCapture>,
+    ctx: ei::Context,
+    events: reis::tokio::EiConvertEventStream,
+    zones: Zones,
+}
+
+impl CaptureSession {
+    async fn create(ic: &InputCapture) -> Result<Self> {
+        info!("asking for input capture permission");
+        let (session, caps) = ic
+            .create_session(None, IcCreate::default().set_capabilities(IcCaps::KEYBOARD | IcCaps::POINTER))
+            .await
+            .context("creating InputCapture session")?;
+        debug!(?caps, "InputCapture session");
+        let fd = ic.connect_to_eis(&session, Default::default()).await.context("InputCapture.ConnectToEIS")?;
+        let stream = UnixStream::from(fd);
+        stream.set_nonblocking(true)?;
+        let ctx = ei::Context::new(stream)?;
+        let (_conn, events) = ctx
+            .handshake_tokio("flowcursor-capture", ei::handshake::ContextType::Receiver)
+            .await
+            .map_err(|e| anyhow!("EI handshake: {e:?}"))?;
+        let zones = ic.zones(&session, Default::default()).await?.response()?;
+        Ok(CaptureSession { session, ctx, events, zones })
+    }
+}
+
+fn zones_to_monitors(z: &Zones) -> Vec<Monitor> {
+    z.regions()
+        .iter()
+        .enumerate()
+        .map(|(i, r)| Monitor {
+            name: format!("zone-{i}"),
+            rect: Rect::new(r.x_offset(), r.y_offset(), r.width() as i32, r.height() as i32),
+            primary: i == 0,
+        })
+        .collect()
+}
+
+fn barrier_for(e: &Edge) -> BarrierPosition {
+    let (a, b) = (e.start, e.end - 1);
+    match e.side {
+        Side::Left | Side::Right => BarrierPosition::new(e.pos, a, e.pos, b),
+        Side::Top | Side::Bottom => BarrierPosition::new(a, e.pos, b, e.pos),
+    }
+}
+
+/// Position just inside the screen next to a barrier hit at (x, y).
+fn inside(side: Side, x: f64, y: f64) -> (f64, f64) {
+    match side {
+        Side::Right => (x - 2.0, y),
+        Side::Left => (x + 2.0, y),
+        Side::Bottom => (x, y - 2.0),
+        Side::Top => (x, y + 2.0),
+    }
+}
+
+async fn apply_barriers(ic: &InputCapture, cs: &CaptureSession, edges: &[Edge]) -> Result<HashMap<u32, Side>> {
+    let mut map = HashMap::new();
+    let barriers: Vec<Barrier> = edges
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let id = BarrierID::new(i as u32 + 1)?;
+            map.insert(i as u32 + 1, e.side);
+            Some(Barrier::new(id, barrier_for(e)))
+        })
+        .collect();
+    let resp =
+        ic.set_pointer_barriers(&cs.session, &barriers, cs.zones.zone_set(), Default::default()).await?.response()?;
+    let failed = resp.failed_barriers();
+    if !failed.is_empty() {
+        warn!(?failed, "the compositor refused some pointer barriers (they must lie on outer screen edges)");
+    }
+    info!(barriers = barriers.len() - failed.len(), "pointer barriers set");
+    Ok(map)
+}
+
+async fn run_capture(
+    ic: InputCapture,
+    mut cs: CaptureSession,
+    mut cmds: mpsc::UnboundedReceiver<CapCmd>,
+    tx: EventTx,
+    monitors: Arc<Mutex<Vec<Monitor>>>,
+) {
+    let (Ok(activated), Ok(deactivated), Ok(disabled), Ok(zones_changed)) = (
+        ic.receive_activated().await,
+        ic.receive_deactivated().await,
+        ic.receive_disabled().await,
+        ic.receive_zones_changed().await,
+    ) else {
+        warn!("cannot subscribe to InputCapture signals");
+        return;
+    };
+    let (mut activated, mut deactivated, mut disabled, mut zones_changed) =
+        (activated.boxed(), deactivated.boxed(), disabled.boxed(), zones_changed.boxed());
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut ids: HashMap<u32, Side> = HashMap::new();
+    let mut enabled = false;
+    // (activation id, side, cursor position) while captured.
+    let mut active: Option<(Option<u32>, Side, (f64, f64))> = None;
+    let mut released_by_us = false;
+    let mut scroll_acc = (0.0f32, 0.0f32);
+    loop {
+        tokio::select! {
+            cmd = cmds.recv() => match cmd {
+                None => return,
+                Some(CapCmd::SetEdges(new)) => {
+                    if new == edges && enabled {
+                        continue;
+                    }
+                    edges = new;
+                    if enabled {
+                        // GNOME 46 cannot re-enable a disabled session: start a new one.
+                        let _ = ic.disable(&cs.session, Default::default()).await;
+                        let _ = cs.session.close().await;
+                        match CaptureSession::create(&ic).await {
+                            Ok(n) => cs = n,
+                            Err(e) => { warn!("recreating the capture session failed: {e:#}"); enabled = false; continue; }
+                        }
+                        *monitors.lock().expect("poisoned") = zones_to_monitors(&cs.zones);
+                    }
+                    if edges.is_empty() {
+                        enabled = false;
+                        continue;
+                    }
+                    match apply_barriers(&ic, &cs, &edges).await {
+                        Ok(m) => ids = m,
+                        Err(e) => { warn!("setting pointer barriers failed: {e:#}"); continue; }
+                    }
+                    match ic.enable(&cs.session, Default::default()).await {
+                        Ok(()) => enabled = true,
+                        Err(e) => warn!("enabling input capture failed: {e}"),
+                    }
+                }
+                Some(CapCmd::Release(warp)) => {
+                    if let Some((aid, side, (x, y))) = active.take() {
+                        let pos = warp.map(|(x, y)| (x as f64, y as f64)).unwrap_or_else(|| inside(side, x, y));
+                        released_by_us = true;
+                        let opts = ReleaseOptions::default().set_activation_id(aid).set_cursor_position(pos);
+                        if let Err(e) = ic.release(&cs.session, opts).await {
+                            warn!("releasing input capture failed: {e}");
+                        }
+                    }
+                }
+            },
+            Some(a) = activated.next() => {
+                let side = a.barrier_id().and_then(|b| match b {
+                    ashpd::desktop::input_capture::ActivatedBarrier::Barrier(id) => ids.get(&id.get()).copied(),
+                    _ => None,
+                });
+                let (x, y) = a.cursor_position().map(|(x, y)| (x as f64, y as f64)).unwrap_or((0.0, 0.0));
+                let Some(side) = side else {
+                    // Activated without one of our barriers: give control back.
+                    let opts = ReleaseOptions::default().set_activation_id(a.activation_id());
+                    let _ = ic.release(&cs.session, opts).await;
+                    continue;
+                };
+                active = Some((a.activation_id(), side, (x, y)));
+                released_by_us = false;
+                scroll_acc = (0.0, 0.0);
+                let _ = tx.send(LocalEvent::EdgeHit { side, x: x.round() as i32, y: y.round() as i32 });
+            }
+            Some(_) = deactivated.next() => {
+                if active.take().is_some() && !released_by_us {
+                    let _ = tx.send(LocalEvent::CaptureEnded);
+                }
+            }
+            Some(_) = disabled.next() => {
+                warn!("input capture was disabled by the compositor; it is re-enabled on the next layout change");
+                enabled = false;
+                if active.take().is_some() {
+                    let _ = tx.send(LocalEvent::CaptureEnded);
+                }
+            }
+            Some(_) = zones_changed.next() => {
+                if let Ok(z) = ic.zones(&cs.session, Default::default()).await.and_then(|r| r.response()) {
+                    cs.zones = z;
+                    let m = zones_to_monitors(&cs.zones);
+                    *monitors.lock().expect("poisoned") = m.clone();
+                    let _ = tx.send(LocalEvent::MonitorsChanged(m));
+                }
+            }
+            ev = cs.events.next() => match ev {
+                Some(Ok(ev)) => {
+                    if let EiEvent::SeatAdded(s) = &ev {
+                        s.seat.bind_capabilities(
+                            DeviceCapability::Pointer | DeviceCapability::PointerAbsolute | DeviceCapability::Keyboard
+                                | DeviceCapability::Scroll | DeviceCapability::Button,
+                        );
+                        let _ = cs.ctx.flush();
+                        continue;
+                    }
+                    if active.is_none() {
+                        continue;
+                    }
+                    if let Some(le) = ei_to_local(&ev, &mut scroll_acc) {
+                        let _ = tx.send(le);
+                    }
+                }
+                Some(Err(e)) => { warn!("EI capture stream error: {e:?}"); enabled = false; }
+                None => { warn!("EI capture stream closed"); enabled = false; std::future::pending::<()>().await; }
+            },
+        }
+    }
+}
+
+fn ei_to_local(ev: &EiEvent, scroll_acc: &mut (f32, f32)) -> Option<LocalEvent> {
+    Some(match ev {
+        EiEvent::PointerMotion(m) => LocalEvent::Motion { dx: m.dx as f64, dy: m.dy as f64 },
+        EiEvent::Button(b) => {
+            LocalEvent::Button { button: evdev_to_button(b.button)?, down: b.state == ei::button::ButtonState::Press }
+        }
+        EiEvent::ScrollDiscrete(s) => LocalEvent::Wheel { dx: s.discrete_dx, dy: -s.discrete_dy },
+        EiEvent::ScrollDelta(s) => {
+            // Smooth scrolling in logical pixels; ~15 px per wheel detent.
+            scroll_acc.0 += s.dx * 8.0;
+            scroll_acc.1 += s.dy * 8.0;
+            let (dx, dy) = (scroll_acc.0.trunc() as i32, scroll_acc.1.trunc() as i32);
+            if dx == 0 && dy == 0 {
+                return None;
+            }
+            scroll_acc.0 -= dx as f32;
+            scroll_acc.1 -= dy as f32;
+            LocalEvent::Wheel { dx, dy: -dy }
+        }
+        EiEvent::KeyboardKey(k) => LocalEvent::Key {
+            usage: flow_keymap::evdev_to_hid(k.key as u16)?,
+            down: k.state == ei::keyboard::KeyState::Press,
+        },
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_proto::NodeId;
+
+    #[test]
+    fn barrier_geometry_matches_portal_convention() {
+        let e = Edge { side: Side::Right, pos: 1920, start: 0, end: 1080, to: NodeId(2) };
+        assert_eq!(barrier_for(&e).as_tuple(), (1920, 0, 1920, 1079));
+        let e = Edge { side: Side::Top, pos: 0, start: 100, end: 300, to: NodeId(2) };
+        assert_eq!(barrier_for(&e).as_tuple(), (100, 0, 299, 0));
+        assert_eq!(inside(Side::Right, 1920.0, 5.0), (1918.0, 5.0));
+    }
 }

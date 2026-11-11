@@ -80,8 +80,34 @@ pub struct AgentState {
     /// Set when the hub revoked this agent; it will not re-enrol from a
     /// token in the config file until `flow-agent join` is run again.
     pub revoked: bool,
-    /// xdg-desktop-portal restore tokens (Linux), keyed by portal.
-    pub portal_restore_tokens: std::collections::BTreeMap<String, String>,
+}
+
+/// xdg-desktop-portal restore tokens (Linux), kept in their own file so the
+/// backend and the hub client never overwrite each other's state.
+pub const PORTAL_TOKENS_FILE: &str = "portal-tokens.json";
+
+pub fn load_portal_token(dir: &Path, portal: &str) -> Option<String> {
+    let s = std::fs::read_to_string(dir.join(PORTAL_TOKENS_FILE)).ok()?;
+    let m: std::collections::BTreeMap<String, String> = serde_json::from_str(&s).ok()?;
+    m.get(portal).cloned()
+}
+
+pub fn save_portal_token(dir: &Path, portal: &str, token: &str) -> Result<()> {
+    let p = dir.join(PORTAL_TOKENS_FILE);
+    let mut m: std::collections::BTreeMap<String, String> =
+        std::fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    m.insert(portal.to_string(), token.to_string());
+    std::fs::create_dir_all(dir)?;
+    flow_net::identity::write_private(&p, &serde_json::to_vec_pretty(&m)?)
+}
+
+pub fn forget_portal_tokens(dir: &Path) -> Result<bool> {
+    let p = dir.join(PORTAL_TOKENS_FILE);
+    if p.exists() {
+        std::fs::remove_file(&p)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub const STATE_FILE: &str = "agent-state.json";
@@ -137,6 +163,12 @@ mod tests {
         let st = AgentState { node_id: Some(3), revoked: true, ..Default::default() };
         st.save(&dir).unwrap();
         assert_eq!(AgentState::load(&dir).unwrap(), st);
+        assert_eq!(load_portal_token(&dir, "rd"), None);
+        save_portal_token(&dir, "rd", "tok").unwrap();
+        save_portal_token(&dir, "ic", "tok2").unwrap();
+        assert_eq!(load_portal_token(&dir, "rd").as_deref(), Some("tok"));
+        assert!(forget_portal_tokens(&dir).unwrap());
+        assert_eq!(load_portal_token(&dir, "ic"), None);
         std::fs::remove_dir_all(dir).ok();
     }
 

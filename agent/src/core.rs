@@ -421,8 +421,10 @@ impl Core {
             self.backend.set_edges(Vec::new());
             return;
         };
-        let edges: Vec<_> = self.layout.edges_of(me).into_iter().filter(|e| self.reachable(e.to)).collect();
-        self.backend.set_edges(edges);
+        // All layout edges, also those to offline machines: crossing is
+        // refused at hit time. Keeping the set stable matters on Wayland,
+        // where changing pointer barriers recreates the capture session.
+        self.backend.set_edges(self.layout.edges_of(me));
     }
 
     // ------------------------------------------------------------------
