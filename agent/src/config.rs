@@ -131,6 +131,24 @@ impl AgentState {
     }
 }
 
+/// What `flow-agent join` does: forget the old enrolment, store the token
+/// for the next start and optionally the hub address in the config file.
+pub fn store_join(cfg_path: &Path, cfg: &mut AgentConfig, token: &str, hub: Option<String>) -> Result<()> {
+    let t = flow_net::token::JoinToken::parse(token.trim())
+        .context("this does not look like a FlowCursor join token (FC1-…)")?;
+    let dir = cfg.state_dir();
+    let mut st = AgentState::load(&dir)?;
+    st.node_id = None;
+    st.hub_fingerprint = None;
+    st.revoked = false;
+    st.pending_join_token = Some(t.encode());
+    st.save(&dir)?;
+    if let Some(h) = hub.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()) {
+        cfg.hub = Some(h);
+    }
+    cfg.save(cfg_path)
+}
+
 /// Parses `host`, `host:port`, `ip`, `ip:port`, `[v6]:port`.
 pub async fn resolve_hub(s: &str) -> Result<SocketAddr> {
     let s = s.trim();

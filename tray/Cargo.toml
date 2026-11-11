@@ -1,0 +1,44 @@
+[package]
+name = "flow-tray"
+description = "FlowCursor tray icon and status window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# eframe 0.37 (status window) needs 1.95.
+rust-version = "1.95"
+
+[[bin]]
+name = "flow-tray"
+path = "src/main.rs"
+
+[dependencies]
+flow-ipc.workspace = true
+anyhow.workspace = true
+png.workspace = true
+# Status window. glow (OpenGL) instead of wgpu: about half the binary size
+# and no Vulkan/DX12 loader; wayland + x11 are both loaded at run time
+# (dlopen), so nothing beyond Mesa/libxkbcommon (already on any GNOME
+# desktop) is needed. No accesskit (size).
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "clipboard", "links"] }
+# winit's default features (what eframe's own default turns on): libwayland
+# loaded with dlopen and client-side decorations, which GNOME needs.
+winit = "0.30"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
+[build-dependencies]
+embed-resource = "3"

@@ -388,3 +388,56 @@ async fn per_node_overrides_beat_the_global_settings() {
     assert_balanced(&w.a.sim.take_injected());
     w.hub.shutdown().await;
 }
+
+/// "Pause sharing" from the tray: like away, but chosen by the user and
+/// independent of the network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_node_stops_sharing_like_away_and_resumes() {
+    let w = pair().await;
+    let (ida, idb) = (w.ida, w.idb);
+
+    // A drives B, B pauses: A gets its devices back, B shows as away.
+    w.a.sim.push_edge(Side::Right, 1919, 540);
+    assert!(w.a.agent.wait(T, |s| s.controlling == Some(idb)).await);
+    w.a.sim.emit(key(KEY_A, true));
+    assert!(eventually(T, || injected(&w.b).contains(&Action::Key { usage: KEY_A, down: true })).await);
+    w.b.agent.set_paused(true);
+    assert!(w.b.agent.wait(T, |s| s.paused).await);
+    assert!(!w.b.agent.status().away, "paused is not the network check");
+    assert!(w.a.agent.wait(T, |s| s.controlling.is_none()).await);
+    assert!(eventually(T, || injected(&w.b).contains(&Action::Left)).await);
+    w.a.sim.emit(key(KEY_A, false));
+    assert!(wait_status(&w.hub, idb, "away").await);
+    assert!(w.a.agent.wait(T, |s| s.online_peers.is_empty()).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_balanced(&w.b.sim.take_injected());
+
+    // Nothing crosses either way, no clipboard.
+    let ends = w.a.sim.end_captures();
+    w.a.sim.push_edge(Side::Right, 1919, 540);
+    assert!(eventually(T, || w.a.sim.end_captures() > ends).await, "crossing into B refused");
+    assert!(eventually(T, || w.b.sim.edges().is_empty()).await);
+    w.b.sim.push_edge(Side::Left, 0, 540);
+    w.b.sim.copy(ClipContent::Text("paused".into()));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(w.b.agent.status().controlling, None);
+    assert_ne!(w.a.sim.clipboard(), Some(ClipContent::Text("paused".into())));
+
+    // A network change while paused does not resume sharing.
+    w.b.net.set([ip("10.10.15.12")]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(wait_status(&w.hub, idb, "away").await);
+
+    // Resume: B is reachable again and can drive A.
+    w.b.agent.set_paused(false);
+    assert!(w.b.agent.wait(T, |s| !s.paused).await);
+    assert!(wait_status(&w.hub, idb, "online").await);
+    assert!(eventually(T, || !w.b.sim.edges().is_empty()).await);
+    w.b.sim.push_edge(Side::Left, 0, 540);
+    assert!(w.b.agent.wait(T, |s| s.controlling == Some(ida)).await);
+    // The status carries what the tray shows.
+    let st = w.b.agent.status();
+    assert!(st.node_name.is_some());
+    assert_eq!(st.peers.iter().map(|p| p.id).collect::<Vec<_>>(), vec![ida]);
+    w.hub.shutdown().await;
+}

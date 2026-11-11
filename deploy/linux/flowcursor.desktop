@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FlowCursor
+GenericName=Mouse and keyboard sharing
+Comment=Status of FlowCursor: share mouse, keyboard and clipboard with your other computers
+Exec=@BINDIR@/flow-tray --show
+Icon=flowcursor
+Terminal=false
+Categories=Utility;Network;
+Keywords=kvm;mouse;keyboard;clipboard;share;
+StartupWMClass=flowcursor

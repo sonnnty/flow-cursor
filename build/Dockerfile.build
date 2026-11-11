@@ -1,4 +1,6 @@
-# Build environment for FlowCursor agents and hub binaries.
+# Build environment for FlowCursor agents and hub binaries, and the Windows
+# setup exe (NSIS's makensis runs on Linux; mingw's windres embeds the icon
+# and version resources into the Windows exes).
 # Ubuntu 22.04 keeps the glibc floor of the Linux binaries at 2.35, so they
 # run on Ubuntu 22.04 / Zorin OS 17 and anything newer (Zorin 18, 24.04).
 FROM ubuntu:22.04
@@ -7,6 +9,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl build-essential pkg-config dpkg-dev \
       gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+      nsis \
  && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \

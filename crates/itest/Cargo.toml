@@ -11,6 +11,7 @@ flow-proto.workspace = true
 flow-net.workspace = true
 flow-server.workspace = true
 flow-agent.workspace = true
+flow-ipc.workspace = true
 flow-keymap.workspace = true
 flow-layout.workspace = true
 anyhow.workspace = true

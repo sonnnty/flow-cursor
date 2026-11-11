@@ -6,10 +6,17 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use flow_agent::backend::{self, BackendOptions};
-use flow_agent::config::{default_config_path, AgentConfig, AgentState};
+use flow_agent::config::{default_config_path, store_join, AgentConfig, AgentState};
+use flow_agent::ipc::{AgentInfo, BindError, Control, IpcContext, IpcServer};
+use flow_agent::logbuf::LogBuffer;
+use flow_agent::StartOptions;
+use flow_ipc::endpoint::default_endpoint;
+use flow_ipc::{Command, Reply};
 use flow_net::token::JoinToken;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::{prelude::*, reload, EnvFilter};
 
@@ -33,15 +40,27 @@ enum Cmd {
         #[arg(long)]
         backend: Option<String>,
     },
-    /// Join a hub with the token shown in its dashboard / log.
+    /// Join a hub with the token shown in its dashboard / log. A running
+    /// agent stores it and restarts to join.
     Join {
         token: String,
         /// Hub address (host or host:port). Omit to use mDNS discovery.
         #[arg(long)]
         hub: Option<String>,
     },
-    /// Show configuration and enrolment state.
+    /// Show configuration and enrolment state (and the live state of a
+    /// running agent).
     Status,
+    /// Pause sharing in the running agent (like being away) until resumed
+    /// or restarted.
+    Pause,
+    /// Resume sharing in the running agent.
+    Resume,
+    /// Restart the running agent (re-reads its configuration).
+    Restart,
+    /// Stop the running agent (installers, upgrades). Exits 0 also when
+    /// none is running.
+    Stop,
     /// Forget stored xdg-desktop-portal permissions (Linux): the next start
     /// asks again.
     ForgetPortal,
@@ -52,7 +71,9 @@ enum Cmd {
     },
 }
 
-fn init_logging(level: &str, file: Option<&std::path::Path>) -> flow_agent::LogHook {
+/// Sets up logging to stdout or `file`, plus an in-memory copy of the last
+/// lines for the status window (`flow-tray`).
+fn init_logging(level: &str, file: Option<&std::path::Path>) -> (flow_agent::LogHook, LogBuffer) {
     let initial = std::env::var("RUST_LOG").unwrap_or_else(|_| level.to_string());
     let (filter, handle) = reload::Layer::new(EnvFilter::try_new(&initial).unwrap_or_else(|_| EnvFilter::new("info")));
     let file_layer = file.and_then(|p| {
@@ -63,9 +84,11 @@ fn init_logging(level: &str, file: Option<&std::path::Path>) -> flow_agent::LogH
         Some(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)))
     });
     let stdout_layer = file.is_none().then(tracing_subscriber::fmt::layer);
-    tracing_subscriber::registry().with(filter).with(stdout_layer).with(file_layer).init();
+    let logs = LogBuffer::default();
+    let mem_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer(logs.clone());
+    tracing_subscriber::registry().with(filter).with(stdout_layer).with(file_layer).with(mem_layer).init();
     let env_set = std::env::var("RUST_LOG").is_ok();
-    Arc::new(move |lvl: &str| {
+    let hook: flow_agent::LogHook = Arc::new(move |lvl: &str| {
         if env_set {
             return;
         }
@@ -76,7 +99,8 @@ fn init_logging(level: &str, file: Option<&std::path::Path>) -> flow_agent::LogH
             }
             Err(e) => warn!("ignoring invalid log level {lvl:?}: {e}"),
         }
-    })
+    });
+    (hook, logs)
 }
 
 #[tokio::main]
@@ -85,27 +109,65 @@ async fn main() -> Result<()> {
     let has_console = flow_agent::backend::windows::attach_parent_console() || cfg!(debug_assertions);
     #[cfg(not(windows))]
     let has_console = true;
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let cfg_path = cli.config.clone().unwrap_or_else(default_config_path);
     let mut cfg = AgentConfig::load(&cfg_path)?;
-    match cli.cmd.unwrap_or(Cmd::Run { backend: None }) {
+    match cli.cmd.take().unwrap_or(Cmd::Run { backend: None }) {
         Cmd::Join { token, hub } => {
-            let t = JoinToken::parse(&token).context("this does not look like a FlowCursor join token (FC1-…)")?;
-            let dir = cfg.state_dir();
-            let mut st = AgentState::load(&dir)?;
-            st.node_id = None;
-            st.hub_fingerprint = None;
-            st.revoked = false;
-            st.pending_join_token = Some(t.encode());
-            st.save(&dir)?;
-            if let Some(h) = hub {
-                cfg.hub = Some(h);
+            let t = JoinToken::parse(token.trim())
+                .context("this does not look like a FlowCursor join token (FC1-…)")?
+                .encode();
+            // A running agent stores the token itself after stopping its hub
+            // client (no race with it saving its state) and restarts. Only
+            // with the default config: it writes to its own config file.
+            if cli.config.is_none() {
+                if let Ok(reply) = ipc_request(&Command::Join { token: t.clone(), hub: hub.clone() }) {
+                    match reply {
+                        Reply::Ok { .. } => {
+                            println!("Token handed to the running agent; it restarts and joins the hub.");
+                            return Ok(());
+                        }
+                        Reply::Error { message } => bail!("the running agent refused the token: {message}"),
+                        other => bail!("unexpected reply from the running agent: {other:?}"),
+                    }
+                }
             }
-            cfg.save(&cfg_path)?;
+            store_join(&cfg_path, &mut cfg, &t, hub)?;
             println!("Token stored. Config: {}", cfg_path.display());
             println!("Start the agent (e.g. `systemctl --user restart flow-agent` or `flow-agent run`);");
             println!("it verifies the hub fingerprint from the token before sending it.");
             Ok(())
+        }
+        Cmd::Stop => {
+            match ipc_request(&Command::Shutdown) {
+                Ok(_) => {
+                    // Gone once the endpoint stops answering.
+                    for _ in 0..50 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if flow_ipc::Client::connect(&default_endpoint()).is_err() {
+                            break;
+                        }
+                    }
+                    println!("agent stopped");
+                }
+                Err(_) => println!("no agent running"),
+            }
+            Ok(())
+        }
+        cmd @ (Cmd::Pause | Cmd::Resume | Cmd::Restart) => {
+            let cmd = match cmd {
+                Cmd::Pause => Command::Pause,
+                Cmd::Resume => Command::Resume,
+                _ => Command::Restart,
+            };
+            match ipc_request(&cmd).context("no running agent answers on the local IPC endpoint")? {
+                Reply::Ok { message } => {
+                    println!("{message}");
+                    Ok(())
+                }
+                Reply::Error { message } => bail!("{message}"),
+                other => bail!("unexpected reply: {other:?}"),
+            }
         }
         Cmd::Status => {
             let dir = cfg.state_dir();
@@ -127,6 +189,10 @@ async fn main() -> Result<()> {
                 flow_agent::netcheck::SystemAddrs.addrs().iter().map(|a| a.to_string()).collect()
             };
             println!("interface addrs:  {}", if addrs.is_empty() { "(none)".into() } else { addrs.join(", ") });
+            match ipc_request(&Command::Status) {
+                Ok(Reply::Status { status: s }) => print_live_status(&s),
+                _ => println!("running agent:    no (nothing answers on {})", default_endpoint().display()),
+            }
             Ok(())
         }
         Cmd::ForgetPortal => {
@@ -155,11 +221,23 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Run { backend: b } => {
+            // Set by a restart requested over IPC (see `restart_process`);
+            // not passed on to anything this process starts.
+            let restarted = std::env::var_os(ENV_RESTARTED).is_some();
+            let start_paused = std::env::var_os(ENV_PAUSED).is_some();
+            std::env::remove_var(ENV_RESTARTED);
+            std::env::remove_var(ENV_PAUSED);
             // Without a console (Windows autostart) log to a file by default.
             let log_file = cfg.log_file.clone().or_else(|| (!has_console).then(|| cfg.state_dir().join("agent.log")));
-            let hook = init_logging(cfg.log_level.as_deref().unwrap_or("info"), log_file.as_deref());
+            let (hook, logs) = init_logging(cfg.log_level.as_deref().unwrap_or("info"), log_file.as_deref());
             if let Some(l) = &cfg.log_level {
                 hook(l);
+            }
+            let endpoint = default_endpoint();
+            // Before the backend: on Wayland creating it opens permission
+            // dialogs, which a second agent must not do.
+            if !restarted && flow_ipc::Client::connect(&endpoint).is_ok() {
+                bail!("{}", BindError::AlreadyRunning(endpoint));
             }
             let kind = backend::parse_kind(b.as_deref().or(cfg.backend.as_deref()))?;
             info!(?kind, config = %cfg_path.display(), "starting flow-agent {}", env!("CARGO_PKG_VERSION"));
@@ -169,13 +247,152 @@ async fn main() -> Result<()> {
             if be.monitors().is_empty() {
                 bail!("the backend reported no monitors");
             }
-            let agent = flow_agent::start(cfg, be, rx, Some(hook)).await?;
+            let opts = StartOptions {
+                log_hook: Some(hook),
+                paused: start_paused,
+                bind_retry: if restarted { RESTART_GRACE } else { Duration::ZERO },
+                ..Default::default()
+            };
+            let agent = flow_agent::start_with(cfg.clone(), be, rx, opts).await?;
             info!(p2p = %agent.p2p_addr, fingerprint = %agent.fingerprint, "agent running");
-            wait_for_shutdown().await;
-            info!("stopping");
+
+            let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
+            let ctx = IpcContext {
+                agent: agent.observer(),
+                info: Arc::new(AgentInfo {
+                    config_file: cfg_path.clone(),
+                    log_file: log_file.clone(),
+                    cfg: cfg.clone(),
+                }),
+                logs,
+                control: ctl_tx,
+            };
+            let ipc = serve_ipc(&endpoint, ctx, restarted).await?;
+
+            let control = tokio::select! {
+                _ = wait_for_shutdown() => None,
+                c = ctl_rx.recv() => c,
+            };
+            info!(?control, "stopping");
+            let paused = agent.status().paused;
             agent.shutdown().await;
-            Ok(())
+            if let Some(s) = ipc {
+                s.close().await;
+            }
+            match control {
+                None | Some(Control::Shutdown) => Ok(()),
+                Some(Control::Restart) => restart_process(paused),
+                Some(Control::Join { token, hub }) => {
+                    if let Err(e) = store_join(&cfg_path, &mut cfg, &token, hub) {
+                        warn!("storing the join token: {e:#}");
+                    }
+                    restart_process(paused)
+                }
+            }
         }
+    }
+}
+
+/// Environment of a process started by [`restart_process`].
+const ENV_RESTARTED: &str = "FLOW_AGENT_RESTARTED";
+const ENV_PAUSED: &str = "FLOW_AGENT_START_PAUSED";
+/// How long a restarted agent waits for the old process to release the
+/// P2P port and the IPC endpoint (Windows: both run for a moment).
+const RESTART_GRACE: Duration = Duration::from_secs(5);
+
+/// Opens the IPC endpoint. Another running agent is fatal (two agents
+/// would fight over the input devices and the P2P port); any other
+/// problem only costs the tray, so the agent keeps running without it.
+async fn serve_ipc(endpoint: &std::path::Path, ctx: IpcContext, restarted: bool) -> Result<Option<IpcServer>> {
+    let deadline = std::time::Instant::now() + if restarted { RESTART_GRACE } else { Duration::ZERO };
+    loop {
+        match flow_agent::ipc::serve(endpoint, ctx.clone()) {
+            Ok(s) => return Ok(Some(s)),
+            Err(e @ BindError::AlreadyRunning(_)) if std::time::Instant::now() >= deadline => bail!("{e}"),
+            Err(BindError::AlreadyRunning(_)) => tokio::time::sleep(Duration::from_millis(200)).await,
+            Err(e) => {
+                warn!("no local IPC endpoint (the tray icon cannot reach this agent): {e}");
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// Replaces this process with a fresh agent started the same way. Unix:
+/// `exec` in place (same pid, so systemd keeps tracking it). Windows: a new
+/// detached process, then this one exits.
+fn restart_process(paused: bool) -> Result<()> {
+    let exe = current_exe()?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(std::env::args_os().skip(1)).env(ENV_RESTARTED, "1");
+    if paused {
+        cmd.env(ENV_PAUSED, "1");
+    }
+    info!(exe = %exe.display(), paused, "restarting");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let e = cmd.exec();
+        Err(e).with_context(|| format!("restarting {}", exe.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        flow_ipc::detach::spawn_detached(&mut cmd).with_context(|| format!("restarting {}", exe.display()))?;
+        std::process::exit(0)
+    }
+}
+
+/// The running executable. On Linux an upgrade may have replaced it: the
+/// kernel then reports `<path> (deleted)` and the new file is at `<path>`.
+fn current_exe() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe().context("locating flow-agent")?;
+    if !exe.exists() {
+        if let Some(p) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            return Ok(p.into());
+        }
+    }
+    Ok(exe)
+}
+
+/// One request to the running agent of this user.
+fn ipc_request(cmd: &Command) -> std::io::Result<Reply> {
+    flow_ipc::client::request(&default_endpoint(), cmd)
+}
+
+fn print_live_status(s: &flow_ipc::Snapshot) {
+    println!("running agent:    pid {} (version {}, backend {})", s.pid, s.agent_version, s.backend);
+    let hub = if s.hub_connected {
+        "connected".to_string()
+    } else {
+        format!("not connected{}", s.hub_error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default())
+    };
+    println!("hub connection:   {hub}");
+    println!("node name:        {}", s.node_name.as_deref().unwrap_or("-"));
+    let sharing = match (s.paused, s.away) {
+        (true, _) => "paused by the user",
+        (false, true) => "away (not on an allowed network)",
+        _ => "on",
+    };
+    println!("sharing:          {sharing}");
+    if let Some(c) = &s.controlling {
+        println!("controlling:      {}", c.name);
+    }
+    for c in &s.controlled_by {
+        println!("controlled by:    {}", c.name);
+    }
+    for p in &s.peers {
+        let state = match (p.online, p.away, p.enabled) {
+            (_, _, false) => "disabled",
+            (false, _, _) => "offline",
+            (true, true, _) => "away",
+            (true, false, _) => "online",
+        };
+        let path = p.path.as_deref().unwrap_or("-");
+        let rtt = p.rtt_ms.map(|r| format!(" {r:.1} ms")).unwrap_or_default();
+        println!("peer:             {} ({state}, {path}{rtt})", p.name);
+    }
+    for p in &s.problems {
+        println!("problem:          {p}");
     }
 }
 

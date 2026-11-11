@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["proto", "crates/keymap", "crates/layout", "crates/net", "crates/itest", "server", "agent", "tools/bench"]
+members = ["proto", "crates/keymap", "crates/layout", "crates/net", "crates/ipc", "crates/itest", "server", "agent", "tray", "tools/bench"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ flow-proto = { path = "proto" }
 flow-keymap = { path = "crates/keymap" }
 flow-layout = { path = "crates/layout" }
 flow-net = { path = "crates/net" }
+flow-ipc = { path = "crates/ipc" }
 flow-server = { path = "server" }
 flow-agent = { path = "agent" }
 
