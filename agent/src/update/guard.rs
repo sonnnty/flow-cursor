@@ -7,8 +7,8 @@
 //! as it starts ([`super::on_start`], [`super::on_backend_ready`]) and
 //! clears once it reached the hub. If the new version
 //!
-//! * does not start within [`GuardOptions::start_timeout`] (e.g. it cannot
-//!   even be loaded),
+//! * does not start within [`GuardOptions::start_timeout`] (30 s; e.g. it
+//!   cannot even be loaded),
 //! * keeps crashing ([`GuardOptions::max_starts`] starts),
 //! * stops and stays down, or
 //! * does not reach the hub within the trial timeout after its input
@@ -37,7 +37,7 @@ pub struct GuardOptions {
 
 impl Default for GuardOptions {
     fn default() -> Self {
-        GuardOptions { poll: Duration::from_millis(500), start_timeout: Duration::from_secs(60), max_starts: 4 }
+        GuardOptions { poll: Duration::from_millis(500), start_timeout: Duration::from_secs(30), max_starts: 4 }
     }
 }
 
@@ -300,14 +300,15 @@ mod tests {
         let down = |_| false;
         // Not started yet.
         assert_eq!(verdict(&trial(Stage::Installed), 1030, &o, &up), None);
-        assert!(verdict(&trial(Stage::Installed), 1061, &o, &up).unwrap().contains("did not start"));
+        assert!(verdict(&trial(Stage::Installed), 1031, &o, &up).unwrap().contains("did not start within 30 s"));
         // Starting: X11/Windows backends come up in seconds.
         let s = |b: &str| Stage::Starting { pid: 7, at: 1000, backend: b.into() };
         assert_eq!(verdict(&trial(s("x11")), 1100, &o, &up), None);
         assert!(verdict(&trial(s("x11")), 1121, &o, &up).unwrap().contains("backend"));
         // Wayland: waits for the permission dialogs as long as it runs.
         assert_eq!(verdict(&trial(s("wayland")), 9999, &o, &up), None);
-        assert!(verdict(&trial(s("wayland")), 1061, &o, &down).unwrap().contains("stopped"));
+        assert_eq!(verdict(&trial(s("wayland")), 1030, &o, &down), None, "a moment to restart");
+        assert!(verdict(&trial(s("wayland")), 1031, &o, &down).unwrap().contains("stopped"));
         // Connecting: the trial timeout.
         let c = Stage::Connecting { pid: 7, at: 1000 };
         assert_eq!(verdict(&trial(c.clone()), 1100, &o, &up), None);

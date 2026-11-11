@@ -354,8 +354,9 @@ Windows = named pipe `\\.\pipe\flowcursor-agent-<SID ของผู้ใช้
 * `manifest.json`: เวอร์ชัน, build id, commit, ชื่อไฟล์ ขนาด และ SHA-256 ของทุกไฟล์ (เขียนโดย `flow-server` ที่ build พร้อมกัน จึงตรงกับ hub เสมอ)
 
 hub ตรวจขนาดและ SHA-256 ของทุกไฟล์เทียบ manifest ตอนเริ่ม (platform ที่ไม่ตรงจะไม่ถูกเสนอ และ log บอกเหตุผล)
-ค่าใช้จ่าย: image ใหญ่ขึ้นราว 47 MB (agent Linux 12 MB + tray 14 MB, Windows exe 17 MB + setup 5 MB) — image ทั้งหมดราว 120 MB
-(ไม่บีบอัดซ้ำ: layer ของ Docker ถูกบีบอัดตอน push/pull อยู่แล้ว)
+ค่าใช้จ่าย: layer ของ agent builds 48.5 MB (agent Linux 12 MB + tray 14 MB, Windows exe 17 MB + setup 5 MB);
+`docker images` รายงาน image 120 MB (เดิม 47 MB) และทั้ง image บีบอัด (gzip) สำหรับส่ง/ดึงราว 36 MB
+(ไม่บีบอัดไฟล์ซ้ำใน image: layer ของ Docker ถูกบีบอัดตอน push/pull อยู่แล้ว)
 คัดลอก setup exe ออกจาก image เพื่อติดตั้งเครื่องใหม่:
 `docker create --name fc flow-cursor-server:<tag> && docker cp fc:/usr/share/flowcursor/agent-builds ./agent-builds && docker rm fc`
 
@@ -582,7 +583,7 @@ build/build.sh --no-image # ไม่ build image
 ```
 build id มาจาก git (`<จำนวน commit>.g<commit>`, `.dirty.<เวลา>` ถ้ามีไฟล์ที่ยังไม่ commit) หรือกำหนดเอง `FLOW_BUILD_ID=...`
 ทุกโปรแกรมใน build เดียวกันได้ id เดียวกัน; hub image สร้างจาก `build/out` ด้วย `build/Dockerfile.hub` (distroless, ไม่ compile ซ้ำ)
-และพิมพ์ขนาด image ตอนจบ (ราว 120 MB รวม agent builds ราว 47 MB)
+และพิมพ์ขนาด image ตอนจบ (ราว 120 MB; layer ของ agent builds 48.5 MB)
 
 ผลลัพธ์ใน `build/out/` (ไม่ commit):
 `linux/` (`flow-agent`, `flow-tray` glibc ≥ 2.35, `.deb`, `install.sh`, `uninstall.sh`, `flow-agent.service`, ไฟล์ `.desktop`, `icons/`),
