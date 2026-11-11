@@ -28,8 +28,10 @@ Copy-Item $src $exe -Force
 if ($Token) {
   $joinArgs = @("join", $Token)
   if ($Hub) { $joinArgs += @("--hub", $Hub) }
-  & $exe @joinArgs
-  if ($LASTEXITCODE -ne 0) { throw "flow-agent join failed" }
+  # flow-agent.exe is a GUI-subsystem program, so `& $exe` neither waits for it
+  # nor sets $LASTEXITCODE; wait explicitly and read its exit code.
+  $p = Start-Process -FilePath $exe -ArgumentList $joinArgs -Wait -PassThru -NoNewWindow
+  if ($p.ExitCode -ne 0) { throw "flow-agent join failed (exit code $($p.ExitCode))" }
 }
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
