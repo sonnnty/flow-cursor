@@ -37,7 +37,12 @@ pub enum HubEvent {
     ReleaseControl,
     Revoked,
     Rejected(String),
-    Clipboard { from: Option<NodeId>, content: ClipContent },
+    /// A connection attempt or session ended with this error.
+    Error(String),
+    Clipboard {
+        from: Option<NodeId>,
+        content: ClipContent,
+    },
 }
 
 /// Relay through the hub, usable by link actors.
@@ -141,6 +146,7 @@ impl HubClient {
                 Ok(End::Retry(d)) => Attempt::Retry(d),
                 Err(e) => {
                     warn!("hub connection: {e:#}");
+                    let _ = self.events.send(HubEvent::Error(format!("{e:#}")));
                     Attempt::Failed { healthy: session_start.is_some_and(|t: Instant| t.elapsed() >= HEALTHY_SESSION) }
                 }
             };

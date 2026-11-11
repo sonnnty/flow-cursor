@@ -83,6 +83,7 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
         Ok((s, clip)) => (Some(s), clip),
         Err(e) if is_refusal(&e) => {
             warn!("{RD_REFUSED}");
+            crate::problems::set(PROBLEM_RD, RD_REFUSED);
             (None, false)
         }
         Err(e) => {
@@ -94,6 +95,7 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
         Ok(s) => Some(s),
         Err(e) if is_refusal(&e) => {
             warn!("{IC_REFUSED}");
+            crate::problems::set(PROBLEM_IC, IC_REFUSED);
             None
         }
         Err(e) => {
@@ -308,6 +310,7 @@ async fn keep_injecting<S>(
                     }
                     None => {
                         info!("remote control session re-created");
+                        crate::problems::clear(PROBLEM_RD);
                         // Queued while a dialog was open: stale by now.
                         if drop_stale(cmds) {
                             return;
@@ -323,6 +326,7 @@ async fn keep_injecting<S>(
                 }
                 if is_refusal(&e) {
                     warn!("{RD_REFUSED} (asked again after the session was lost)");
+                    crate::problems::set(PROBLEM_RD, RD_REFUSED);
                     return;
                 }
                 warn!("re-creating the remote control session failed: {e:#}");
@@ -361,6 +365,9 @@ fn drop_stale(cmds: &mut mpsc::UnboundedReceiver<InjCmd>) -> bool {
     }
 }
 
+/// Keys of the refusals in [`crate::problems`].
+const PROBLEM_RD: &str = "wayland-remote-desktop";
+const PROBLEM_IC: &str = "wayland-input-capture";
 const RD_REFUSED: &str = "remote control permission (RemoteDesktop portal) was refused in the GNOME dialog: other \
                           machines cannot control this one until flow-agent is restarted; controlling them from \
                           here still works";
@@ -1241,6 +1248,7 @@ impl<P: CapturePortal> Capture<P> {
     fn open_failed(&mut self, e: anyhow::Error, what: &str) {
         if is_refusal(&e) {
             warn!("{IC_REFUSED}");
+            crate::problems::set(PROBLEM_IC, IC_REFUSED);
         } else {
             warn!("{what}: {e:#}");
             self.schedule_retry();
@@ -1252,6 +1260,7 @@ impl<P: CapturePortal> Capture<P> {
             Ok(m) => {
                 info!("input capture session re-created");
                 self.open = true;
+                crate::problems::clear(PROBLEM_IC);
                 self.opened_at = Instant::now();
                 self.take_queued_edges();
                 let changed = *self.monitors.lock().expect("poisoned") != m;

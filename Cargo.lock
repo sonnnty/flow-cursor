@@ -558,6 +558,7 @@ dependencies = [
  "ashpd",
  "clap",
  "directories",
+ "flow-ipc",
  "flow-keymap",
  "flow-layout",
  "flow-net",
@@ -613,6 +614,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flow-agent",
+ "flow-ipc",
  "flow-keymap",
  "flow-layout",
  "flow-net",

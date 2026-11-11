@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 
 pub mod client;
+pub mod detach;
 pub mod endpoint;
 #[cfg(windows)]
 pub mod windows;
@@ -106,6 +107,8 @@ pub struct Snapshot {
     /// Last hub address that worked (also set with mDNS discovery).
     pub hub_last_address: Option<String>,
     pub hub_connected: bool,
+    /// Why the last connection attempt failed (while not connected).
+    pub hub_error: Option<String>,
     /// Pinned hub certificate fingerprint (hex).
     pub hub_fingerprint: Option<String>,
     /// Hub dashboard (`http://<hub host>:7880`), when the hub host is known.

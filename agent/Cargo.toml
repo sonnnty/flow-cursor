@@ -17,6 +17,7 @@ flow-proto.workspace = true
 flow-keymap.workspace = true
 flow-layout.workspace = true
 flow-net.workspace = true
+flow-ipc.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -48,6 +48,8 @@ pub struct AgentStatus {
     pub controlled_by: Vec<NodeId>,
     pub revoked: bool,
     pub rejected: Option<String>,
+    /// Why the last hub connection attempt failed (cleared on connect).
+    pub hub_error: Option<String>,
     pub settings: Option<AgentSettings>,
     pub layout_nodes: usize,
     pub online_peers: Vec<NodeId>,
@@ -128,6 +130,17 @@ impl AgentHandle {
         }
     }
 
+    /// A cloneable view of the running agent for the local IPC server.
+    pub fn observer(&self) -> AgentObserver {
+        AgentObserver {
+            status: self.status.clone(),
+            links: self.links.clone(),
+            backend: self.backend.clone(),
+            state: self.state.clone(),
+            cmds: self.cmds.clone(),
+        }
+    }
+
     pub async fn shutdown(self) {
         for t in &self.tasks {
             t.abort();
@@ -136,6 +149,43 @@ impl AgentHandle {
             l.shutdown();
         }
         self.endpoint.close(0u32.into(), b"agent stopped");
+    }
+}
+
+/// What the IPC server needs from a running agent (see
+/// [`AgentHandle::observer`]); stays valid but stale after shutdown.
+#[derive(Clone)]
+pub struct AgentObserver {
+    status: watch::Receiver<AgentStatus>,
+    links: Links,
+    backend: Arc<dyn Backend>,
+    state: Arc<Mutex<AgentState>>,
+    cmds: mpsc::UnboundedSender<CoreCmd>,
+}
+
+impl AgentObserver {
+    pub fn status(&self) -> AgentStatus {
+        self.status.borrow().clone()
+    }
+
+    pub fn watch(&self) -> watch::Receiver<AgentStatus> {
+        self.status.clone()
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        let _ = self.cmds.send(CoreCmd::SetPaused(paused));
+    }
+
+    pub fn agent_state(&self) -> AgentState {
+        self.state.lock().expect("poisoned").clone()
+    }
+
+    pub fn backend(&self) -> &Arc<dyn Backend> {
+        &self.backend
+    }
+
+    pub fn link_status(&self, peer: NodeId) -> Option<LinkStatus> {
+        self.links.lock().expect("poisoned").get(&peer).map(|l| l.status())
     }
 }
 
@@ -148,6 +198,9 @@ pub struct StartOptions {
     /// Start with sharing paused (kept across a restart requested by the
     /// tray; a fresh start always shares).
     pub paused: bool,
+    /// Keep trying to bind the P2P port this long when it is in use (a
+    /// restarted agent on Windows starts before the old process is gone).
+    pub bind_retry: Duration,
 }
 
 impl Default for StartOptions {
@@ -157,6 +210,7 @@ impl Default for StartOptions {
             addrs: Arc::new(SystemAddrs),
             net_check_interval: NET_CHECK_INTERVAL,
             paused: false,
+            bind_retry: Duration::ZERO,
         }
     }
 }
@@ -185,7 +239,7 @@ pub async fn start_with(
     events: EventRx,
     opts: StartOptions,
 ) -> Result<AgentHandle> {
-    let StartOptions { log_hook, addrs, net_check_interval, paused } = opts;
+    let StartOptions { log_hook, addrs, net_check_interval, paused, bind_retry } = opts;
     let state_dir = cfg.state_dir();
     std::fs::create_dir_all(&state_dir).with_context(|| format!("creating {}", state_dir.display()))?;
     let host = hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "agent".into());
@@ -195,7 +249,17 @@ pub async fn start_with(
     let dir = PeerDirectory::new();
     let sc = server_config(&identity, ALPN_P2P, dir.clone(), TransportOpts::P2P)?;
     let port = cfg.p2p_port.unwrap_or(flow_proto::DEFAULT_P2P_PORT);
-    let endpoint = bind(SocketAddr::from(([0, 0, 0, 0], port)), Some(sc))?;
+    let retry_until = Instant::now() + bind_retry;
+    let endpoint = loop {
+        match bind(SocketAddr::from(([0, 0, 0, 0], port)), Some(sc.clone())) {
+            Ok(e) => break e,
+            Err(e) if Instant::now() < retry_until => {
+                debug!("binding the P2P port: {e:#}; retrying");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    };
     let p2p_addr = endpoint.local_addr()?;
     info!(%p2p_addr, fingerprint = %identity.fingerprint, backend = backend.name(), "agent P2P listener up");
 
@@ -443,6 +507,7 @@ impl Core {
                     s.connected = true;
                     s.revoked = false;
                     s.rejected = None;
+                    s.hub_error = None;
                     s.node_id = Some(w.node_id);
                     s.node_name = Some(w.name.clone());
                 });
@@ -491,6 +556,7 @@ impl Core {
                 });
             }
             HubEvent::Rejected(r) => self.status.send_modify(|s| s.rejected = Some(r)),
+            HubEvent::Error(e) => self.status.send_modify(|s| s.hub_error = Some(e)),
             HubEvent::Clipboard { from, content } => {
                 if self.away {
                     debug!(?from, "clipboard from hub ignored (away)");

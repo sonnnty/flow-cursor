@@ -46,6 +46,12 @@ pub fn runtime_dir() -> PathBuf {
     }
 }
 
+/// Real uid of this process.
+#[cfg(unix)]
+pub fn current_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
 /// Per-user directory for runtime files of the tray (Windows: the local
 /// app data directory, which is private to the user).
 #[cfg(windows)]
