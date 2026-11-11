@@ -23,6 +23,8 @@ pub struct SimState {
     pub clipboard: Option<ClipContent>,
     /// Absolute pointer position after injected moves.
     pub pointer: (i32, i32),
+    /// Optional observer notified of every injected action (latency bench).
+    pub observer: Option<mpsc::UnboundedSender<Action>>,
 }
 
 pub struct SimBackend {
@@ -72,6 +74,12 @@ impl SimControl {
     pub fn edges(&self) -> Vec<Edge> {
         self.state.lock().unwrap().edges.clone()
     }
+    /// Streams every injected action as it happens.
+    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Action> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.state.lock().unwrap().observer = Some(tx);
+        rx
+    }
     pub fn last_warp(&self) -> Option<(i32, i32)> {
         self.state.lock().unwrap().warps.last().copied()
     }
@@ -106,6 +114,9 @@ impl Backend for SimBackend {
         match action {
             Action::MoveAbs { x, y, .. } | Action::Entered { x, y } => s.pointer = (*x, *y),
             _ => {}
+        }
+        if let Some(o) = &s.observer {
+            let _ = o.send(*action);
         }
         s.injected.push(*action);
     }

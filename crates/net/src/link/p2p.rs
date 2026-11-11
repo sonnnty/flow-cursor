@@ -199,6 +199,10 @@ async fn handle_conn(conn: Connection, from: NodeId, sink: Arc<dyn LinkSink>) {
                         }
                     }
                     Ok(None) => return,
+                    Err(crate::frame::FrameError::Io(e)) => {
+                        debug!(peer = %from, "link stream ended: {e}");
+                        return;
+                    }
                     Err(e) => {
                         warn!(peer = %from, "closing link stream after bad frame: {e}");
                         let _ = recv.stop(2u32.into());
