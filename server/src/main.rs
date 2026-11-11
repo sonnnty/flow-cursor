@@ -24,7 +24,7 @@ struct Args {
     #[arg(long, env = "FLOW_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
     /// Disable mDNS advertisement.
-    #[arg(long, env = "FLOW_NO_MDNS")]
+    #[arg(long, env = "FLOW_NO_MDNS", value_parser = clap::builder::BoolishValueParser::new())]
     no_mdns: bool,
     /// Hub name (mDNS instance name).
     #[arg(long, env = "FLOW_NAME")]
@@ -44,20 +44,20 @@ async fn main() -> Result<()> {
     let name = args.name.clone().unwrap_or_else(|| {
         hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "flowcursor".into())
     });
+    let name = format!("FlowCursor hub on {name}");
+    if args.print_token {
+        println!("{}", flow_server::join_token_from_dir(&args.data, &name)?);
+        return Ok(());
+    }
     let cfg = HubConfig {
         data_dir: args.data.clone(),
         quic_addr: args.quic,
-        http_addr: if args.print_token { None } else { Some(args.http) },
+        http_addr: Some(args.http),
         admin_token: args.admin_token.clone(),
-        mdns: !args.no_mdns && !args.print_token,
-        name: format!("FlowCursor hub on {name}"),
+        mdns: !args.no_mdns,
+        name,
     };
     let hub = start(cfg).await?;
-    if args.print_token {
-        println!("{}", hub.join_token());
-        hub.shutdown().await;
-        return Ok(());
-    }
     {
         let level = hub.hub.lock().p.settings.log_level.clone();
         if std::env::var("RUST_LOG").is_err() {

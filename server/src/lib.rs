@@ -87,6 +87,14 @@ impl HubHandle {
     }
 }
 
+/// Join token of the hub whose state lives in `data_dir`, without starting
+/// it (works while the hub is running).
+pub fn join_token_from_dir(data_dir: &std::path::Path, name: &str) -> Result<String> {
+    let identity = Identity::load_or_create(data_dir, "hub", name)?;
+    let p = Persisted::load_or_create(data_dir)?;
+    Ok(JoinToken::new(p.join_secret_bytes(), &identity.fingerprint).encode())
+}
+
 pub async fn start(cfg: HubConfig) -> Result<HubHandle> {
     std::fs::create_dir_all(&cfg.data_dir).with_context(|| format!("creating {}", cfg.data_dir.display()))?;
     let identity = Identity::load_or_create(&cfg.data_dir, "hub", &cfg.name)?;
