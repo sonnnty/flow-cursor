@@ -2,7 +2,8 @@
 
 use flow_agent::backend::sim::{SimBackend, SimControl};
 use flow_agent::config::AgentConfig;
-use flow_agent::AgentHandle;
+use flow_agent::netcheck::StaticAddrs;
+use flow_agent::{AgentHandle, StartOptions};
 use flow_net::endpoint::{client_config, TransportOpts, SNI};
 use flow_net::frame::{read_frame, write_frame};
 use flow_net::link::Action;
@@ -14,8 +15,9 @@ use flow_proto::{
     ToHub, ALPN_HUB, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
 };
 use flow_server::{HubConfig, HubHandle};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -60,6 +62,17 @@ pub struct TestAgent {
     pub agent: AgentHandle,
     pub sim: SimControl,
     pub state_dir: PathBuf,
+    /// The agent's (simulated) interface addresses; `set` simulates a
+    /// network change, picked up within [`NET_CHECK`].
+    pub net: StaticAddrs,
+}
+
+/// How often test agents re-read their (simulated) addresses.
+pub const NET_CHECK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Parses an IP address (test shorthand).
+pub fn ip(s: &str) -> IpAddr {
+    s.parse().unwrap()
 }
 
 pub struct AgentSpec {
@@ -68,6 +81,8 @@ pub struct AgentSpec {
     pub p2p_port: u16,
     pub advertise: Vec<SocketAddr>,
     pub state_dir: Option<PathBuf>,
+    /// Initial interface addresses.
+    pub addrs: Vec<IpAddr>,
 }
 
 impl AgentSpec {
@@ -78,6 +93,7 @@ impl AgentSpec {
             p2p_port: 0,
             advertise: vec![],
             state_dir: None,
+            addrs: vec![ip("10.10.15.10")],
         }
     }
 }
@@ -94,8 +110,10 @@ pub async fn start_agent(hub: &HubHandle, spec: AgentSpec) -> TestAgent {
         ..Default::default()
     };
     let (backend, sim, rx) = SimBackend::with_control(spec.monitors);
-    let agent = flow_agent::start(cfg, backend, rx, None).await.expect("agent starts");
-    TestAgent { agent, sim, state_dir }
+    let net = StaticAddrs::new(spec.addrs);
+    let opts = StartOptions { log_hook: None, addrs: Arc::new(net.clone()), net_check_interval: NET_CHECK };
+    let agent = flow_agent::start_with(cfg, backend, rx, opts).await.expect("agent starts");
+    TestAgent { agent, sim, state_dir, net }
 }
 
 /// Collects injected actions until `pred` is satisfied by the collected
@@ -110,6 +128,29 @@ pub async fn collect_until(sim: &SimControl, timeout: Duration, pred: impl Fn(&[
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Panics unless every key/button pressed in `actions` is released later
+/// and nothing is released without a press (no stuck or phantom keys).
+pub fn assert_balanced(actions: &[Action]) {
+    let mut keys = std::collections::BTreeSet::new();
+    let mut buttons = std::collections::BTreeSet::new();
+    for a in actions {
+        match *a {
+            Action::Key { usage, down: true } => {
+                assert!(keys.insert(usage), "key {usage:#x} pressed twice: {actions:?}")
+            }
+            Action::Key { usage, down: false } => {
+                assert!(keys.remove(&usage), "key {usage:#x} released without a press: {actions:?}")
+            }
+            Action::Button { button, down: true } => assert!(buttons.insert(button), "{button:?} pressed twice"),
+            Action::Button { button, down: false } => {
+                assert!(buttons.remove(&button), "{button:?} released without a press: {actions:?}")
+            }
+            _ => {}
+        }
+    }
+    assert!(keys.is_empty() && buttons.is_empty(), "stuck: keys {keys:x?} buttons {buttons:?} in {actions:?}");
 }
 
 /// Waits until `f` returns true.

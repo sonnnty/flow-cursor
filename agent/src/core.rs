@@ -221,6 +221,7 @@ pub async fn start_with(
         log_hook,
         down_since: None,
         controllers: BTreeSet::new(),
+        injected_down: HashSet::new(),
         addr_source: addrs,
         allowed: Vec::new(),
         away: false,
@@ -243,6 +244,13 @@ enum Mode {
         x: f64,
         y: f64,
     },
+}
+
+/// A key or button a controlling machine pressed here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Injected {
+    Key(u32),
+    Button(Button),
 }
 
 /// Result of trying to cross at a local edge.
@@ -293,6 +301,8 @@ struct Core {
     log_hook: Option<LogHook>,
     down_since: Option<Instant>,
     controllers: BTreeSet<NodeId>,
+    /// Keys/buttons injected here and not released yet, per source.
+    injected_down: HashSet<(NodeId, Injected)>,
     addr_source: Arc<dyn AddrSource>,
     /// Parsed `settings.allowed_networks` (empty = no restriction).
     allowed: Vec<Cidr>,
@@ -889,12 +899,24 @@ impl Core {
     // ------------------------------------------------------------------
 
     fn on_action(&mut self, from: NodeId, a: Action) {
-        // Away: nothing is injected except releases (those from going away
-        // and from sources that have not heard about it yet).
-        let release = matches!(a, Action::Left | Action::Key { down: false, .. } | Action::Button { down: false, .. });
-        if self.away && !release {
+        // Away: nothing is injected except releases of what was injected
+        // before (from going away, or from sources that have not heard about
+        // it yet), so the local OS never sees a release without a press.
+        let pressed = |k| self.injected_down.contains(&(from, k));
+        let allowed_while_away = match a {
+            Action::Left => true,
+            Action::Key { usage, down: false } => pressed(Injected::Key(usage)),
+            Action::Button { button, down: false } => pressed(Injected::Button(button)),
+            _ => false,
+        };
+        if self.away && !allowed_while_away {
             debug!(source = %from, ?a, "input from a controlling machine dropped (away)");
             return;
+        }
+        match a {
+            Action::Key { usage, down } => self.note_injected(from, Injected::Key(usage), down),
+            Action::Button { button, down } => self.note_injected(from, Injected::Button(button), down),
+            _ => {}
         }
         match a {
             Action::Entered { .. } => {
@@ -903,6 +925,7 @@ impl Core {
             }
             Action::Left => {
                 self.controllers.remove(&from);
+                self.injected_down.retain(|(src, _)| *src != from);
                 info!(source = %from, "remote machine released this one");
             }
             _ => {}
@@ -910,6 +933,14 @@ impl Core {
         self.backend.inject(&a);
         if matches!(a, Action::Entered { .. } | Action::Left) {
             self.publish();
+        }
+    }
+
+    fn note_injected(&mut self, from: NodeId, what: Injected, down: bool) {
+        if down {
+            self.injected_down.insert((from, what));
+        } else {
+            self.injected_down.remove(&(from, what));
         }
     }
 
