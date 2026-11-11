@@ -36,7 +36,7 @@ def menu_labels(owner, path):
 
 
 def dump():
-    for owner, service in items:
+    for owner, service in list(items):
         try:
             obj = bus.get_object(owner, "/StatusNotifierItem")
             p = obj.GetAll("org.kde.StatusNotifierItem", dbus_interface=dbus.PROPERTIES_IFACE)
@@ -54,6 +54,10 @@ def dump():
                 + [f"    {l}" for l in menu_labels(owner, p["Menu"])]
             )
         except dbus.DBusException as e:
+            if e.get_dbus_name() == "org.freedesktop.DBus.Error.ServiceUnknown":
+                log.write(f"item {service} went away\n\n")
+                items.remove((owner, service))
+                return True
             text = f"item {service}: {e.get_dbus_message()}"
         if last.get(service) != text:
             last[service] = text

@@ -15,15 +15,16 @@
 3. [ติดตั้ง Hub ด้วย Docker Compose](#ติดตั้ง-hub-ด้วย-docker-compose)
 4. [ติดตั้ง Agent บน Zorin OS / Linux](#ติดตั้ง-agent-บน-zorin-os--linux)
 5. [ติดตั้ง Agent บน Windows 11](#ติดตั้ง-agent-บน-windows-11)
-6. [Dashboard และหน้า Settings](#dashboard-และหน้า-settings)
-7. [ใช้งานเฉพาะในเครือข่ายที่อนุญาต (allowed networks)](#ใช้งานเฉพาะในเครือข่ายที่อนุญาต-allowed-networks)
-8. [กดปุ่มค้างเพื่อข้ามจอ (crossing key)](#กดปุ่มค้างเพื่อข้ามจอ-crossing-key)
-9. [ไฟล์ตั้งค่าของ Agent](#ไฟล์ตั้งค่าของ-agent)
-10. [Emergency hotkey](#emergency-hotkey)
-11. [Build จากซอร์ส](#build-จากซอร์ส)
-12. [การทดสอบและวัด latency](#การทดสอบและวัด-latency)
-13. [ข้อจำกัดที่รู้อยู่](#ข้อจำกัดที่รู้อยู่)
-14. [แก้ปัญหาเบื้องต้น](#แก้ปัญหาเบื้องต้น)
+6. [ไอคอนถาดระบบ (tray) และหน้าต่างสถานะ](#ไอคอนถาดระบบ-tray-และหน้าต่างสถานะ)
+7. [Dashboard และหน้า Settings](#dashboard-และหน้า-settings)
+8. [ใช้งานเฉพาะในเครือข่ายที่อนุญาต (allowed networks)](#ใช้งานเฉพาะในเครือข่ายที่อนุญาต-allowed-networks)
+9. [กดปุ่มค้างเพื่อข้ามจอ (crossing key)](#กดปุ่มค้างเพื่อข้ามจอ-crossing-key)
+10. [ไฟล์ตั้งค่าของ Agent](#ไฟล์ตั้งค่าของ-agent)
+11. [Emergency hotkey](#emergency-hotkey)
+12. [Build จากซอร์ส](#build-จากซอร์ส)
+13. [การทดสอบและวัด latency](#การทดสอบและวัด-latency)
+14. [ข้อจำกัดที่รู้อยู่](#ข้อจำกัดที่รู้อยู่)
+15. [แก้ปัญหาเบื้องต้น](#แก้ปัญหาเบื้องต้น)
 
 ---
 
@@ -53,8 +54,16 @@
                  ┌─────────┴────────┐  QUIC P2P  ┌────┴─────────────┐
                  │ flow-agent (Linux)│◄──:7879──►│ flow-agent (Win11)│
                  │ capture/inject    │  input     │ capture/inject    │
+                 └─────────┬─────────┘            └────┬──────────────┘
+              local IPC (socket/pipe เฉพาะผู้ใช้)         │
+                 ┌─────────┴─────────┐            ┌────┴──────────────┐
+                 │ flow-tray: ไอคอน + │            │ flow-tray: ไอคอน + │
+                 │ หน้าต่างสถานะ       │            │ หน้าต่างสถานะ       │
                  └───────────────────┘            └───────────────────┘
 ```
+
+Agent เป็น process ที่รันตลอดและไม่มี UI; `flow-tray` เป็นโปรแกรมแยกที่แสดงสถานะและสั่งงาน agent ผ่าน local IPC
+(ไม่มี tray ก็ใช้ได้ตามเดิม เช่นเครื่องที่ไม่มีหน้าจอ: `flow-agent run`)
 
 **Control plane vs data plane**
 * Hub = control plane: ทะเบียน, layout, focus, settings, clipboard, สมุดที่อยู่, dashboard
@@ -90,10 +99,12 @@
 | `crates/layout` | layout engine: เพื่อนบ้าน, edge crossing แบบ proportional, virtual cursor |
 | `crates/net` | identity/cert, QUIC + pinning, framing, join token, mDNS, **link/path manager** (P2P ↔ relay) |
 | `server/` | `flow-server` (Hub) + dashboard (HTML ฝังใน binary) |
-| `agent/` | `flow-agent` + backend: `wayland`, `x11`, `windows`, `sim` (จำลอง) |
+| `agent/` | `flow-agent` + backend: `wayland`, `x11`, `windows`, `sim` (จำลอง) + local IPC server |
+| `crates/ipc` | โปรโตคอล local IPC ระหว่าง agent กับ tray (JSON ทีละบรรทัด มีเลขเวอร์ชัน), endpoint, client |
+| `tray/` | `flow-tray`: ไอคอนถาดระบบ (Linux: StatusNotifierItem, Windows: notification area) + หน้าต่างสถานะ (egui) + ไอคอนที่วาดด้วยโค้ด |
 | `crates/itest` | integration test (hub + agent จำลองหลายตัว) |
 | `tools/bench` | `flow-bench` วัด latency P2P vs relay |
-| `build/`, `deploy/` | สคริปต์ build ผ่าน Docker, Dockerfile, compose, installer, systemd unit |
+| `build/`, `deploy/` | สคริปต์ build ผ่าน Docker, Dockerfile, compose, installer (NSIS, PowerShell, shell), systemd unit, desktop entries, ไอคอน |
 
 ## ติดตั้ง Hub ด้วย Docker Compose
 
@@ -137,17 +148,31 @@ busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/
 จาก `build/out/linux/` (ผลจาก `build/build.sh`):
 
 ```bash
-# แบบไม่ใช้ root (แนะนำ): ติดตั้งลง ~/.local/bin + systemd user service
+# แบบไม่ใช้ root (แนะนำ): ติดตั้งลง ~/.local/bin + systemd user service + ไอคอนถาดระบบ
 ./install.sh FC1-XXXX-YYYY            # หา hub ด้วย mDNS
 ./install.sh FC1-XXXX-YYYY 192.168.1.10   # หรือระบุที่อยู่ hub
+./install.sh                          # ไม่ใส่ token: ใส่ทีหลังในหน้าต่าง FlowCursor (เปิดเองครั้งแรก)
 
-# หรือ .deb
+# หรือ .deb (มีทั้ง flow-agent และ flow-tray)
 sudo apt install ./flow-agent_0.1.0_amd64.deb
-flow-agent join FC1-XXXX-YYYY --hub 192.168.1.10
 systemctl --user enable --now flow-agent
+flow-tray --show                      # หรือ logout/login: ไอคอนเริ่มเองทุกครั้งที่ login
 ```
 
-ดูสถานะ/ log: `systemctl --user status flow-agent`, `journalctl --user -u flow-agent -f`, `flow-agent status`
+สิ่งที่ติดตั้ง:
+* `flow-agent` — systemd **user** service `flow-agent` (เริ่มพร้อม graphical session)
+* `flow-tray` — ไอคอนบนแถบด้านบน เริ่มเองตอน login จาก `~/.config/autostart/flowcursor-tray.desktop`
+  (`.deb`: `/etc/xdg/autostart/`), เมนูแอป **FlowCursor** (เปิดหน้าต่างสถานะ) และไอคอนในธีม hicolor
+* ถอนการติดตั้ง: `./uninstall.sh` (เพิ่ม `--purge` เพื่อลบ identity/ข้อมูล) หรือ `sudo apt remove flow-agent`
+
+**ไอคอนถาดระบบบน GNOME**: GNOME ไม่มี system tray ในตัว ต้องเปิด extension
+**"AppIndicator and KStatusNotifierItem Support"** — Zorin OS และ Ubuntu เปิดไว้ให้แล้ว
+(ตรวจ: `gnome-extensions list --enabled | grep -i appindicator`; ติดตั้ง: `sudo apt install gnome-shell-extension-appindicator`
+แล้ว logout/login และเปิดในแอป Extensions) KDE, Xfce, Cinnamon, MATE แสดงได้เลย
+ถ้าไม่มี tray เลย `flow-tray` จะเขียนคำแนะนำลง log แล้วรันต่อ (ไอคอนจะโผล่เองเมื่อเปิด extension) และหน้าต่างสถานะยังเปิดได้จากเมนูแอป
+หน้าต่างสถานะใช้ OpenGL (Mesa) + libxkbcommon ซึ่งมีในทุก desktop GNOME อยู่แล้ว ทำงานทั้ง Wayland และ Xorg
+
+ดูสถานะ/ log: ไอคอน FlowCursor บนแถบด้านบน, `systemctl --user status flow-agent`, `journalctl --user -u flow-agent -f`, `flow-agent status`
 
 ### 2) หน้าต่างขออนุญาตของ GNOME (Wayland)
 ครั้งแรกที่ agent เริ่ม GNOME จะถาม:
@@ -178,19 +203,99 @@ GNOME ไม่รองรับ `wlr-data-control` โปรแกรมเบ
 
 ## ติดตั้ง Agent บน Windows 11
 
-จาก `build/out/windows/` เปิด PowerShell ในโฟลเดอร์นั้น:
+ใช้ไฟล์ติดตั้ง **`FlowCursor-setup-<เวอร์ชัน>.exe`** จาก `build/out/windows/` (ผลจาก `build/build.sh`) ดับเบิลคลิกแล้วทำตามขั้นตอน:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -Token FC1-XXXX-YYYY -Hub 192.168.1.10
-```
+1. **SmartScreen จะเตือนครั้งแรก** ("Windows protected your PC") เพราะไฟล์ไม่ได้ sign ด้วย code-signing certificate —
+   กด **More info → Run anyway** (เตือนครั้งเดียวต่อไฟล์)
+2. เลือกส่วนประกอบ:
+   * **Start FlowCursor when I sign in** — ให้ไอคอน FlowCursor (และ agent) เริ่มเองตอน login (ค่าเริ่มต้น: เปิด)
+   * **Allow direct connections in Windows Firewall** — เพิ่ม rule ให้ `flow-agent.exe` รับ **UDP 7879** บนเครือข่าย Private/Domain
+     (ใช้สำหรับ P2P) **ขั้นนี้ขั้นเดียวที่ต้องใช้สิทธิ์ admin**: Windows จะถาม UAC หนึ่งครั้งเฉพาะคำสั่ง `netsh`
+     ตัวติดตั้งและโปรแกรมที่เริ่มหลังติดตั้งยังรันเป็นผู้ใช้ปกติ (ไม่ติ๊ก/กด No ที่ UAC ก็ได้ — Windows อาจถามเรื่อง firewall ตอน agent เริ่มครั้งแรกแทน ให้เลือก Private)
+3. หน้า **Join your FlowCursor hub**: วาง join token (จาก dashboard → Overview) และที่อยู่ hub (เว้นว่าง = หาเองด้วย mDNS)
+   — จะเว้นว่างไว้ก็ได้ แล้วใส่ทีหลังในหน้าต่าง FlowCursor ซึ่งจะเปิดเองเมื่อยังไม่ได้ join
+4. หน้าสุดท้าย **Start FlowCursor now** → ไอคอนขึ้นที่ notification area (มุมขวาล่าง; ถ้าไม่เห็นให้ดูใน ^ แล้วลากออกมา) และเปิดหน้าต่างสถานะ
 
-* ติดตั้งที่ `%LOCALAPPDATA%\Programs\FlowCursor\flow-agent.exe` และตั้งให้เริ่มตอน login (registry `HKCU\...\Run`) ไม่ต้องใช้ admin
-* ครั้งแรก Windows Firewall อาจถาม — อนุญาตบน **Private network** (agent รับ P2P ที่ UDP 7879) ถ้ารัน installer เป็น admin จะสร้าง rule ให้
-* `-Elevated` (ต้องเปิด PowerShell แบบ admin): ให้ agent รันแบบ elevated ผ่าน Scheduled Task ทำให้ควบคุมหน้าต่างของโปรแกรมที่รันแบบ admin ได้
+สิ่งที่ติดตั้ง (เฉพาะผู้ใช้คนนี้ ไม่ต้องใช้ admin):
+* `%LOCALAPPDATA%\Programs\FlowCursor\` — `flow-agent.exe`, `flow-tray.exe`, `uninstall.exe`
+* Start menu → โฟลเดอร์ **FlowCursor** (เปิดหน้าต่างสถานะ / Uninstall) และรายการใน **Settings → Apps → Installed apps**
+* เริ่มตอน login: registry `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` → `flow-tray.exe` ซึ่งจะ **เริ่ม `flow-agent.exe` เอง**
+  แบบไม่ผูกกับ console ใด (ปิดหน้าต่าง terminal แล้ว agent ไม่ตายตาม) และเริ่มใหม่ให้ถ้า agent หยุดไป (ไม่ถี่กว่าทุก 30 วินาที)
 * Log: `%LOCALAPPDATA%\flowcursor\data\agent.log` · config: `%APPDATA%\flowcursor\config\agent.toml`
-* ถอนการติดตั้ง: `.\uninstall.ps1` (เพิ่ม `-Purge` เพื่อลบ identity/ข้อมูลด้วย)
+
+**อัปเดต**: รันไฟล์ติดตั้งเวอร์ชันใหม่ทับได้เลย — ตัวติดตั้งปิดไอคอนและหยุด agent ที่รันอยู่, แทนที่ไฟล์, แล้วเริ่มใหม่
+ค่าตั้งและ identity (`%APPDATA%\flowcursor`, `%LOCALAPPDATA%\flowcursor`) ไม่ถูกแตะ จึงไม่ต้อง join ใหม่
+
+**ถอนการติดตั้ง**: Settings → Apps → FlowCursor → Uninstall (หรือ Start menu → FlowCursor → Uninstall) —
+ติ๊ก *Also delete settings, identity and logs* ถ้าต้องการลบข้อมูลด้วย; ถ้าเคยเพิ่ม firewall rule ไว้ จะถาม UAC เพื่อลบ rule
+
+**ติดตั้งแบบไม่มีหน้าจอ / สคริปต์** (เช่นผ่าน remote shell):
+```powershell
+.\FlowCursor-setup-0.1.0.exe /S /TOKEN=FC1-XXXX-YYYY /HUB=192.168.1.10 /FIREWALL
+```
+* `/S` เงียบ, `/TOKEN=` `/HUB=` join ทันที, `/FIREWALL` เพิ่ม firewall rule (ถ้าไม่ได้รันแบบ admin จะมี UAC),
+  `/NOAUTOSTART` ไม่เริ่มตอน login, `/NORUN` ไม่เริ่มหลังติดตั้ง, `/D=C:\path` เปลี่ยนที่ติดตั้ง (ต้องอยู่ท้ายสุด)
+* exit code: 0 สำเร็จ, 2 ติดตั้งแล้วแต่ join ไม่สำเร็จ
+* ถอนแบบเงียบ: `"%LOCALAPPDATA%\Programs\FlowCursor\uninstall.exe" /S` (เพิ่ม `/PURGE` เพื่อลบข้อมูล)
+
+**ทางเลือก: `install.ps1`** (อยู่คู่กับ exe ใน `build/out/windows/`) ยังใช้ได้สำหรับสคริปต์ และสำหรับโหมด **`-Elevated`**:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Token FC1-XXXX-YYYY -Hub 192.168.1.10 [-Elevated]
+```
+* ติดตั้งไฟล์ชุดเดียวกันที่ที่เดียวกัน (สลับไปมากับ setup exe ได้) แต่ไม่ลงทะเบียนใน Apps — ถอนด้วย `.\uninstall.ps1 [-Purge]`
+* `-Elevated` (ต้องเปิด PowerShell แบบ admin): ให้ agent รันแบบ elevated ผ่าน Scheduled Task ทำให้ควบคุมหน้าต่างของโปรแกรมที่รันแบบ admin ได้
+  ไอคอนจะเริ่มด้วย `--no-start-agent` (แสดงสถานะอย่างเดียว ไม่เริ่ม agent ตัวที่สองแบบไม่ elevated)
+  — setup exe ตรวจเจอ task นี้และตั้งค่าแบบเดียวกันให้
 * **ข้อจำกัด:** หน้าต่าง UAC, หน้าจอล็อก และ Ctrl+Alt+Del อยู่บน secure desktop ซึ่งโปรแกรมระดับผู้ใช้ควบคุมไม่ได้
   ต้องมี Windows service ที่รันเป็น SYSTEM (ยังไม่ได้ทำในเวอร์ชันนี้)
+
+## ไอคอนถาดระบบ (tray) และหน้าต่างสถานะ
+
+`flow-tray` แสดงว่า agent ทำงานอยู่และอยู่ในสถานะไหนในแวบเดียว (Windows: notification area มุมขวาล่าง,
+Linux: แถบด้านบนของ GNOME ผ่าน AppIndicator) — คลิกซ้าย = เปิดหน้าต่างสถานะ, คลิกขวา = เมนู
+
+| ไอคอน | สถานะ |
+| :---: | :--- |
+| ![idle](deploy/icons/states/idle-64.png) | เชื่อมต่อ hub แล้ว พร้อมใช้ (จอสีเขียวอมฟ้า) |
+| ![active](deploy/icons/states/active-64.png) | กำลังคุมเครื่องอื่น หรือถูกเครื่องอื่นคุมอยู่ (จอสีน้ำเงิน + ป้ายเขียว ▶) |
+| ![away](deploy/icons/states/away-64.png) | หยุดแชร์ชั่วคราว: กด **Pause sharing** เอง หรือ **away** (ไม่อยู่ในเครือข่ายที่อนุญาต) (สีเหลือง + ป้าย ⏸) |
+| ![disconnected](deploy/icons/states/disconnected-64.png) | ไม่ได้เชื่อมต่อ hub หรือ agent ไม่ทำงาน (จอกลวงสีเทา + ป้าย ×) |
+| ![error](deploy/icons/states/error-64.png) | ต้องแก้: ยังไม่ได้ join / ถูก revoke / hub ปฏิเสธ / ไม่ได้รับสิทธิ์ (เช่นกด Deny ที่หน้าต่างสิทธิ์ของ GNOME) (ป้ายแดง !) |
+
+**เมนู**: บรรทัดสถานะ (hub เชื่อมต่อหรือไม่, ชื่อเครื่องนี้, การแชร์, focus — กำลังคุม/ถูกคุมโดยใคร, แต่ละเครื่อง: p2p/relay + RTT
+หรือ offline/away, ปัญหาที่พบ), **Open status window**, **Open dashboard** (`http://<hub>:7880` ในเบราว์เซอร์),
+**Pause sharing / Resume sharing**, **Restart agent** (หรือ *Start agent* เมื่อ agent ไม่ทำงาน), **Open log**, **Quit**
+
+* **Pause sharing** ทำเหมือน away ทุกอย่าง: ไม่ข้ามขอบจอไปเครื่องอื่น, ไม่ยอมให้ถูกคุม, ไม่แชร์คลิปบอร์ด, dashboard แสดงเครื่องนี้เป็น away
+  ถ้ากำลังคุม/ถูกคุมอยู่จะคืนเมาส์และปล่อยปุ่มทันที — **การ pause ไม่ถูกบันทึกถาวร**: คงอยู่ถ้ากด Restart agent
+  แต่เริ่มเครื่อง/ login ใหม่จะกลับมาแชร์ตามปกติ (กันลืม pause ไว้แล้ววันรุ่งขึ้น KVM ใช้ไม่ได้โดยไม่รู้ตัว)
+* **Open log**: Windows เปิด `agent.log`; Linux (log อยู่ใน journal) เขียน log ล่าสุด ~1000 บรรทัดที่ agent เก็บในหน่วยความจำ
+  ลงไฟล์ส่วนตัวใน `$XDG_RUNTIME_DIR/flowcursor/` แล้วเปิด (log เต็ม: `journalctl --user -u flow-agent`)
+* **Quit**: Windows = ปิดไอคอน **และหยุด agent** (ไอคอนคือหน้าตาของ FlowCursor บน Windows จึงไม่ทิ้ง agent ที่มองไม่เห็นไว้);
+  Linux = ปิดเฉพาะไอคอน agent (systemd service) ยังทำงานต่อ — เปิดไอคอนใหม่: เมนูแอป FlowCursor หรือ `flow-tray`
+* มีไอคอนได้หนึ่งตัวต่อ session (เปิดซ้ำจะไม่สร้างตัวที่สอง; `flow-tray --show` จะเปิดหน้าต่างของตัวที่รันอยู่แทน)
+
+**หน้าต่างสถานะ** (เมนู Open status window, Start menu / เมนูแอป "FlowCursor", หรือ `flow-tray --window`):
+ที่อยู่ hub และสถานะการเชื่อมต่อ (พร้อมสาเหตุถ้าต่อไม่ได้), fingerprint ของ hub, ลิงก์ dashboard;
+ตารางเครื่องอื่น (online/away/offline, path p2p/relay, RTT, ใครคุมใคร); ชื่อ/node id ของเครื่องนี้, สถานะการแชร์, focus,
+crossing key และ emergency hotkey ที่ใช้อยู่จริง, ความสามารถ (capture/inject/clipboard), ที่อยู่ไฟล์ config/log;
+allowed networks และที่อยู่ IP ของทุก interface (ใช้ตัดสิน away); log ล่าสุด (อัปเดตทุก 2 วินาที);
+ปุ่ม Pause/Resume, Restart agent, Open dashboard, Open log และฟอร์ม **Join a hub** (token + ที่อยู่ hub) —
+เปิดอยู่แล้วเมื่อยังไม่ได้ join (ครั้งแรกหน้าต่างจะเปิดเอง) และใช้ join ใหม่/ย้าย hub ได้: agent เก็บ token แล้ว restart ตัวเองเพื่อ join
+![หน้าต่างสถานะ](docs/status-window.png)
+
+**Local IPC** (สิ่งที่ tray ใช้คุยกับ agent): Linux = Unix socket `$XDG_RUNTIME_DIR/flowcursor/agent.sock`
+(สิทธิ์ 0600 ในโฟลเดอร์ 0700 ของผู้ใช้ และตรวจ uid ของผู้เชื่อมต่อทุกครั้ง — ผู้ใช้อื่นรวมถึง root เชื่อมไม่ได้),
+Windows = named pipe `\\.\pipe\flowcursor-agent-<SID ของผู้ใช้>` ที่ DACL อนุญาตเฉพาะผู้ใช้คนนั้น
+ข้อความเป็น JSON บรรทัดละข้อความ มีเลขเวอร์ชัน (`"v":1`) ทุกข้อความ — tray กับ agent ต่างเวอร์ชันกันได้ภายในเวอร์ชัน IPC เดียวกัน
+คำสั่งเดียวกันใช้จาก command line ได้: `flow-agent status | pause | resume | restart | stop`
+และ `flow-agent join` จะส่ง token ให้ agent ที่รันอยู่ (agent restart เพื่อ join เอง) — agent รันซ้ำสองตัวในผู้ใช้เดียวกันไม่ได้
+
+ชุดเครื่องมือ UI: หน้าต่างใช้ **egui (eframe) + OpenGL (glow)** ไม่ใช้ wgpu/accesskit: `flow-tray` ขนาดราว 14 MB บน Linux / 8 MB บน Windows
+(ไม่ต้องลงแพ็กเกจเพิ่ม — Wayland/X11/EGL/xkbcommon ถูกโหลดตอนรันจากไลบรารีที่ GNOME มีอยู่แล้ว, build ข้าม Windows ด้วย mingw ได้)
+เลือกแทน slint (ต้องมี fontconfig/freetype ตอน build, ใหญ่กว่า) และ egui+wgpu (ลาก Vulkan/DX12 มาด้วย ขนาดราวสองเท่า);
+ไอคอนถาดใช้ `ksni` (D-Bus ล้วน Rust ไม่ต้องใช้ GTK/libappindicator) บน Linux และ `tray-icon` (Win32) บน Windows
+หน้าต่างรันเป็น process แยกสั้นๆ (`flow-tray --window`) ไอคอนจึงไม่ถือ OpenGL context ค้างไว้
 
 ## Dashboard และหน้า Settings
 
@@ -282,7 +387,8 @@ backend = "auto"              # auto | wayland | x11 | windows | sim
 ไฟล์ที่ agent เขียนเอง (ใน `state_dir`, สิทธิ์ 0600): `agent.crt`/`agent.key` (identity), `agent-state.json`
 (node id, fingerprint ของ hub ที่ pin ไว้, ที่อยู่ hub ล่าสุด), `portal-tokens.json` (Linux)
 
-คำสั่ง: `flow-agent run | join <token> [--hub] | status | forget-portal | monitors`
+คำสั่ง: `flow-agent run | join <token> [--hub] | status | pause | resume | restart | stop | forget-portal | monitors`
+(`pause`/`resume`/`restart`/`stop` และ `join` ส่งผ่าน local IPC ไปยัง agent ที่รันอยู่ — ดู [tray](#ไอคอนถาดระบบ-tray-และหน้าต่างสถานะ))
 
 ค่าที่ต้องทำงานได้แม้ไม่มี hub (ที่อยู่ hub, fingerprint, hotkey) อยู่ในไฟล์นี้ ค่าอื่นมาจาก Settings ของ hub
 ถ้า hub ล่ม agent ยังใช้ layout/สมุดที่อยู่ล่าสุดที่ cache ไว้และคุมกันผ่าน P2P ต่อได้ (relay ใช้ไม่ได้จนกว่า hub กลับมา)
@@ -306,16 +412,21 @@ build/build.sh --no-image # ไม่ build image
 ```
 
 ผลลัพธ์ใน `build/out/` (ไม่ commit):
-`linux/` (`flow-agent` glibc ≥ 2.35, `.deb`, `install.sh`, `uninstall.sh`, `flow-agent.service`),
-`windows/` (`flow-agent.exe` cross-compile ด้วย mingw, `install.ps1`, `uninstall.ps1`),
+`linux/` (`flow-agent`, `flow-tray` glibc ≥ 2.35, `.deb`, `install.sh`, `uninstall.sh`, `flow-agent.service`, ไฟล์ `.desktop`, `icons/`),
+`windows/` (**`FlowCursor-setup-<เวอร์ชัน>.exe`** สร้างด้วย NSIS `makensis` ใน container, `flow-agent.exe`/`flow-tray.exe`
+cross-compile ด้วย mingw พร้อมไอคอน/ข้อมูลเวอร์ชันฝังใน exe, `install.ps1`, `uninstall.ps1`),
 `server/` (`flow-server`, `compose.yaml`), `tools/flow-bench`, `SHA256SUMS`
 
-พัฒนาด้วย Rust ในเครื่อง (stable ≥ 1.88):
+ไอคอนของแอป (`deploy/icons/`: `.ico` หลายขนาด, PNG, SVG) วาดด้วยโค้ดเดียวกับไอคอนสถานะของ tray —
+สร้างใหม่ด้วย `cargo run -p flow-tray --example gen-icons`
+
+พัฒนาด้วย Rust ในเครื่อง (stable ≥ 1.88; `flow-tray` ต้อง ≥ 1.95 ตาม eframe):
 ```bash
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 # ตรวจว่าโค้ด Windows compile ได้ (ต้องมี mingw สำหรับ ring — หรือใช้ container ของ build/)
 docker build -t flow-cursor-builder -f build/Dockerfile.build build
-docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-pc-windows-gnu --workspace -- -D warnings
+docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-pc-windows-gnu \
+  -p flow-agent -p flow-tray -p flow-ipc --all-targets -- -D warnings
 ```
 
 ## การทดสอบและวัด latency
@@ -328,6 +439,14 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
   (คืนการควบคุม, ปล่อยปุ่มค้าง, ข้ามไป/ออกไม่ได้, ไม่มีคลิปบอร์ด, dashboard แสดง away) แล้วกลับมาเมื่อที่อยู่กลับ;
   crossing key ทั้งแบบ X11/Windows และแบบ Wayland (ค้างที่ขอบ), กดปุ่มขณะดันขอบแล้วข้าม, ขากลับ, ค่าต่อเครื่องชนะค่ากลาง
   และตรวจทุกลำดับ event ว่าไม่มีปุ่มค้าง/ปล่อยโดยไม่กด
+* `crates/itest/tests/ipc.rs`: local IPC ของ agent จริง (hub + agent จำลอง + Unix socket จริง + client แบบเดียวกับ tray):
+  snapshot ครบ (hub, peer, path, RTT), subscribe ได้รับการเปลี่ยนแปลงเมื่อ pause, resume, log, join (token ผิดถูกปฏิเสธ),
+  restart/stop, ข้อความเวอร์ชันผิด/คำสั่งไม่รู้จักได้ error โดยไม่ตัดการเชื่อมต่อ, **สิทธิ์ socket 0600 / โฟลเดอร์ 0700**,
+  socket เก่าที่ค้างถูกแทนที่, ไฟล์ที่ไม่ใช่ socket ไม่ถูกลบ, โฟลเดอร์ที่เป็น symlink ถูกปฏิเสธ, agent ตัวที่สองถูกปฏิเสธ, ตรวจ uid ผู้เชื่อมต่อ
+  (`crates/ipc`: รูปแบบข้อความ/เวอร์ชัน, `tray`: การเลือกไอคอน/ข้อความในเมนู, ไฟล์ `.ico`)
+* `build/ui-smoke.sh` (Docker, ไม่ต้องมีจอ): hub + agent จำลองสองตัว + `flow-tray` กับ StatusNotifierWatcher จำลองบน session bus ส่วนตัว
+  + หน้าต่างสถานะบน Xvfb — บันทึกสิ่งที่ tray host เห็น (ชื่อ, สถานะ, tooltip, ขนาดไอคอน, เมนู) และ screenshot
+  (ครั้งแรกที่ยังไม่ join, หลัง join ผ่าน IPC, ขณะ pause) ลง `build/out/ui-smoke/`
 * `flow-bench` (`build/out/tools/flow-bench` หรือ `cargo run --release -p flow-bench`) วัด latency ปลายถึงปลาย
   (event จาก capture → inject ที่อีก agent) บน localhost แยก P2P / relay เช่น (เครื่อง build นี้, 1000 ตัวอย่าง):
 
@@ -358,6 +477,11 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
   ตอนที่เมาส์ดันขอบอยู่; ระหว่างค้างที่ขอบ ปุ่ม/คลิกแรกที่ไม่ใช่ crossing key จะถูกใช้เพื่อคืนเมาส์ (เครื่องตัวเองไม่ได้รับปุ่ม/คลิกนั้น)
   ทั้งสองกรณีเกิดเฉพาะตอนที่เมาส์ดันขอบที่ต่อกับเครื่องอื่นอยู่เท่านั้น
 * Allowed networks ตัดสินจากที่อยู่ IP ล้วนๆ: เครือข่ายนอกบ้านที่ใช้ช่วงเดียวกับที่บ้านจะนับว่าอยู่บ้าน
+* **ไฟล์ติดตั้ง Windows, ไอคอนและหน้าต่างบน Windows ยังไม่ได้ทดสอบบน Windows จริง** (build บน Linux; ตรวจได้แค่ compile/clippy
+  และการทดสอบเท่าที่ทำได้ใน container) — ไอคอนและหน้าต่างบน Linux ทดสอบแบบ headless (Xvfb + StatusNotifierWatcher จำลอง) ไม่ใช่บน GNOME จริง
+* ไฟล์ติดตั้งไม่ได้ sign: SmartScreen เตือนครั้งแรก; antivirus บางตัวอาจสงสัยโปรแกรมที่อ่านคีย์บอร์ด/เมาส์และไม่ได้ sign
+* หน้าต่างสถานะเป็นภาษาอังกฤษ (ฟอนต์ในตัวของ egui ไม่มีอักษรไทย — ชื่อเครื่องภาษาไทยแสดงได้ถ้าเครื่องมีฟอนต์ไทย เช่น Leelawadee UI / Noto Sans Thai / Garuda)
+* บน GNOME/Wayland หน้าต่างสถานะขอ focus ตัวเองไม่ได้ (Wayland ห้าม) — เปิดซ้ำจากเมนูขณะเปิดอยู่ หน้าต่างอาจไม่ขึ้นมาด้านหน้า
 * ไม่รองรับ macOS (ตั้งใจ)
 
 ## แก้ปัญหาเบื้องต้น
@@ -374,3 +498,7 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
 | ปุ่มค้าง | กด emergency hotkey; ฝั่งที่ถูกคุมจะปล่อยเองภายใน 2.5 วินาทีถ้าต้นทางหายไป |
 | GNOME ไม่ถามสิทธิ์อีก / อยากรีเซ็ต | `flow-agent forget-portal` แล้ว `systemctl --user restart flow-agent` |
 | log ละเอียด | Settings → log level = `debug` (หรือ `flow_net=trace`) |
+| ไม่เห็นไอคอนบน GNOME | เปิด extension *AppIndicator and KStatusNotifierItem Support* (ดู [ติดตั้งบน Linux](#1-ติดตั้ง)); log ของ tray: `flow-tray` จาก terminal |
+| ไอคอนเป็นสีเทา (×) แต่ agent รันอยู่ | ไม่ได้เชื่อมต่อ hub — ดูสาเหตุในหน้าต่างสถานะ (บรรทัด Connection) |
+| `another flow-agent of this user is already running` | มี agent ทำงานอยู่แล้ว (เช่น service + รันเองใน terminal) — ใช้ `flow-agent status` / `flow-agent stop` |
+| Windows: ไอคอนหายหลังกด Quit | Quit หยุดทั้งไอคอนและ agent — เปิดใหม่จาก Start menu → FlowCursor |

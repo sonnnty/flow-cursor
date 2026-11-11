@@ -50,6 +50,7 @@ $B/flow-tray > "$OUT/tray.log" 2>&1 &
 sleep 2
 log "tray process: $(pgrep -c flow-tray) running (first-run window auto-opened: $(pgrep -fc -- '--window' || true))"
 pkill -f -- 'flow-tray --window' || true
+while pgrep -f -- 'flow-tray --window' >/dev/null; do sleep 0.2; done
 FLOW_TRAY_SCREENSHOT="$OUT/status-window-first-run.png" timeout 30 $B/flow-tray --window 2>>"$OUT/tray.log" || log "window exit $?"
 
 # --- join through the agent's IPC (what the window's Join button does) -----
