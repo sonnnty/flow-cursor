@@ -50,7 +50,11 @@ if ($Elevated) {
   Start-ScheduledTask -TaskName "FlowCursor Agent"
 } else {
   Set-ItemProperty -Path $runKey -Name "FlowCursor" -Value "`"$exe`" run"
-  Start-Process -FilePath $exe -ArgumentList "run" -WindowStyle Hidden
+  # Start it through Explorer, not as a child of this PowerShell: flow-agent
+  # attaches to its parent's console to print CLI output, so a child of this
+  # terminal would be killed when the terminal window is closed. With no
+  # arguments flow-agent runs the agent.
+  Start-Process -FilePath "explorer.exe" -ArgumentList "`"$exe`""
 }
 
 if ($isAdmin) {
