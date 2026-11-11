@@ -190,3 +190,111 @@ async fn forced_relay_and_unknown_peer() {
     relay.up.store(false, Ordering::SeqCst);
     assert!(link.wait_path(PathKind::Down, Duration::from_secs(2)).await);
 }
+
+const KEY_LEFT_SHIFT: u32 = 0x0007_00E1;
+const KEY_LEFT_CTRL: u32 = 0x0007_00E0;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiple_held_keys_and_buttons_across_failover_and_recovery() {
+    let id_a = Identity::generate("a").unwrap();
+    let id_b = Identity::generate("b").unwrap();
+
+    let dir = PeerDirectory::new();
+    dir.set([(id_a.fingerprint, A)]);
+    let sc = server_config(&id_b, ALPN_P2P, dir.clone(), TransportOpts::P2P).unwrap();
+    let ep_b = bind("127.0.0.1:0".parse().unwrap(), Some(sc)).unwrap();
+    let (act_tx, mut act_rx) = mpsc::unbounded_channel();
+    let receiver = LinkReceiver::new(act_tx);
+    tokio::spawn(serve_p2p(ep_b.clone(), dir, receiver.clone()));
+    let proxy = UdpProxy::start(ep_b.local_addr().unwrap()).await.unwrap();
+
+    let relay = Arc::new(FakeRelay {
+        sink: receiver.clone(),
+        back: OnceLock::new(),
+        up: AtomicBool::new(true),
+        sent: AtomicUsize::new(0),
+    });
+    let ep_a = bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+    let cfg = LinkConfig { probe_interval: Duration::from_millis(250), ..Default::default() };
+    let link = spawn_link(
+        PeerTarget { id: B, fingerprint: id_b.fingerprint, addrs: vec![proxy.addr] },
+        ep_a,
+        id_a,
+        relay.clone(),
+        cfg,
+    );
+    relay.back.set(link.clone()).ok();
+    link.set_active(true);
+
+    assert!(link.wait_path(PathKind::P2p, Duration::from_secs(5)).await);
+
+    // 1. Enter and press Shift, Ctrl, Key A, Button Left
+    link.send_event(InputEvent::Enter { x: 50, y: 50 });
+    link.send_event(key(KEY_LEFT_SHIFT, true));
+    link.send_event(key(KEY_LEFT_CTRL, true));
+    link.send_event(key(0x0007_0004, true)); // Key A
+    link.send_event(InputEvent::Button { button: flow_proto::Button::Left, down: true });
+    assert!(link.wait_acked(Duration::from_secs(2)).await);
+
+    let initial = drain(&mut act_rx).await;
+    assert_eq!(
+        initial,
+        vec![
+            Action::Entered { x: 50, y: 50 },
+            Action::Key { usage: KEY_LEFT_SHIFT, down: true },
+            Action::Key { usage: KEY_LEFT_CTRL, down: true },
+            Action::Key { usage: 0x0007_0004, down: true },
+            Action::Button { button: flow_proto::Button::Left, down: true },
+        ]
+    );
+
+    // 2. Block direct path -> fall back to Relay
+    proxy.set_blocked(true);
+    assert!(link.wait_path(PathKind::Relay, Duration::from_secs(4)).await);
+
+    // On relay, release Key A and Button Left; press Key B and Button Right
+    link.send_event(key(0x0007_0004, false)); // Release A
+    link.send_event(InputEvent::Button { button: flow_proto::Button::Left, down: false }); // Release Left
+    link.send_event(key(0x0007_0005, true)); // Press B
+    link.send_event(InputEvent::Button { button: flow_proto::Button::Right, down: true }); // Press Right
+    assert!(link.wait_acked(Duration::from_secs(2)).await);
+
+    let on_relay = drain(&mut act_rx).await;
+    assert_eq!(
+        on_relay,
+        vec![
+            Action::Key { usage: 0x0007_0004, down: false },
+            Action::Button { button: flow_proto::Button::Left, down: false },
+            Action::Key { usage: 0x0007_0005, down: true },
+            Action::Button { button: flow_proto::Button::Right, down: true },
+        ]
+    );
+
+    // 3. Unblock direct path -> recover to P2P
+    proxy.set_blocked(false);
+    assert!(link.wait_path(PathKind::P2p, Duration::from_secs(10)).await);
+
+    // On P2P, release Key B, LeftShift, LeftCtrl, Button Right; then Leave
+    link.send_event(key(0x0007_0005, false));
+    link.send_event(key(KEY_LEFT_SHIFT, false));
+    link.send_event(key(KEY_LEFT_CTRL, false));
+    link.send_event(InputEvent::Button { button: flow_proto::Button::Right, down: false });
+    link.send_event(InputEvent::Leave);
+    assert!(link.wait_acked(Duration::from_secs(2)).await);
+
+    let on_p2p_recovery = drain(&mut act_rx).await;
+    assert_eq!(
+        on_p2p_recovery,
+        vec![
+            Action::Key { usage: 0x0007_0005, down: false },
+            Action::Key { usage: KEY_LEFT_SHIFT, down: false },
+            Action::Key { usage: KEY_LEFT_CTRL, down: false },
+            Action::Button { button: flow_proto::Button::Right, down: false },
+            Action::Left,
+        ]
+    );
+
+    // Verify receiver has no stuck keys or controllers
+    assert!(receiver.controllers().is_empty());
+    link.shutdown();
+}
