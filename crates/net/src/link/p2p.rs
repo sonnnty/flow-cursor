@@ -13,11 +13,12 @@ use tracing::{debug, info, warn};
 
 /// Fingerprints of the peers the hub says we may talk to. Used as the TLS
 /// client authorizer of the P2P listener; connections of peers that are
-/// removed are closed immediately.
+/// removed are closed immediately. Accepted connections are tracked while
+/// they are open (keyed by quinn's `stable_id`) and dropped when they close.
 #[derive(Debug, Default)]
 pub struct PeerDirectory {
     map: RwLock<HashMap<Fingerprint, NodeId>>,
-    conns: Mutex<Vec<(Fingerprint, Connection)>>,
+    conns: Mutex<HashMap<usize, (Fingerprint, Connection)>>,
 }
 
 impl PeerDirectory {
@@ -29,7 +30,7 @@ impl PeerDirectory {
         let new: HashMap<Fingerprint, NodeId> = peers.into_iter().collect();
         {
             let mut conns = self.conns.lock().expect("poisoned");
-            conns.retain(|(fp, c)| {
+            conns.retain(|_, (fp, c)| {
                 let keep = new.contains_key(fp) && c.close_reason().is_none();
                 if !keep {
                     c.close(1u32.into(), b"peer revoked");
@@ -45,7 +46,16 @@ impl PeerDirectory {
     }
 
     fn track(&self, fp: Fingerprint, c: Connection) {
-        self.conns.lock().expect("poisoned").push((fp, c));
+        self.conns.lock().expect("poisoned").insert(c.stable_id(), (fp, c));
+    }
+
+    fn untrack(&self, c: &Connection) {
+        self.conns.lock().expect("poisoned").remove(&c.stable_id());
+    }
+
+    /// Number of accepted P2P connections currently tracked.
+    pub fn tracked_connections(&self) -> usize {
+        self.conns.lock().expect("poisoned").len()
     }
 }
 
@@ -166,7 +176,9 @@ pub async fn serve_p2p(ep: Endpoint, dir: Arc<PeerDirectory>, sink: Arc<dyn Link
             };
             dir.track(fp, conn.clone());
             info!(peer = %from, %remote, "accepted direct connection");
-            handle_conn(conn, from, sink).await;
+            // Returns once the connection is closed (by either side).
+            handle_conn(conn.clone(), from, sink).await;
+            dir.untrack(&conn);
         });
     }
 }
