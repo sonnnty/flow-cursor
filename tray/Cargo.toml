@@ -15,6 +15,14 @@ path = "src/main.rs"
 flow-ipc.workspace = true
 anyhow.workspace = true
 png.workspace = true
+# Status window. glow (OpenGL) instead of wgpu: about half the binary size
+# and no Vulkan/DX12 loader; wayland + x11 are both loaded at run time
+# (dlopen), so nothing beyond Mesa/libxkbcommon (already on any GNOME
+# desktop) is needed. No accesskit (size).
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "clipboard", "links"] }
+# winit's default features (what eframe's own default turns on): libwayland
+# loaded with dlopen and client-side decorations, which GNOME needs.
+winit = "0.30"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }

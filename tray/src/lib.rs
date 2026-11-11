@@ -73,12 +73,12 @@ impl TrayCore {
                         self.first_run_shown = true;
                         instance::open_window();
                     }
-                    AgentState::Unreachable(_) if self.start_agent => {
-                        if self.last_start.is_none_or(|t| t.elapsed() >= START_INTERVAL) {
-                            self.last_start = Some(Instant::now());
-                            if let Err(e) = actions::start_agent() {
-                                eprintln!("flow-tray: starting the agent: {e}");
-                            }
+                    AgentState::Unreachable(_)
+                        if self.start_agent && self.last_start.is_none_or(|t| t.elapsed() >= START_INTERVAL) =>
+                    {
+                        self.last_start = Some(Instant::now());
+                        if let Err(e) = actions::start_agent() {
+                            eprintln!("flow-tray: starting the agent: {e}");
                         }
                     }
                     _ => {}

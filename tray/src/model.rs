@@ -159,8 +159,11 @@ pub fn view(state: &AgentState) -> View {
         "FlowCursor: sharing paused".to_string()
     } else if s.away {
         "FlowCursor: away (not on an allowed network)".to_string()
-    } else {
+    } else if s.controlling.is_some() || !s.controlled_by.is_empty() || s.holding_edge {
         format!("FlowCursor: {}", focus_label(s))
+    } else {
+        let online = s.peers.iter().filter(|p| p.online && p.enabled && !p.away).count();
+        format!("FlowCursor: connected, {online} of {} other machines online", s.peers.len())
     };
 
     let mut lines = Vec::new();
@@ -238,7 +241,7 @@ mod tests {
     #[test]
     fn menu_lines() {
         let v = view(&AgentState::Running(Box::new(joined())));
-        assert_eq!(v.headline, "FlowCursor: this machine");
+        assert_eq!(v.headline, "FlowCursor: connected, 1 of 1 other machines online");
         assert_eq!(
             v.lines,
             vec![

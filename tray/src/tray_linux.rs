@@ -29,7 +29,7 @@ fn pixmaps(v: Variant) -> Vec<ksni::Icon> {
         .map(|s| {
             let rgba = render(v, s);
             let mut data = Vec::with_capacity(rgba.len());
-            for p in rgba.chunks_exact(4) {
+            for p in rgba.as_chunks::<4>().0 {
                 data.extend_from_slice(&[p[3], p[0], p[1], p[2]]);
             }
             ksni::Icon { width: s as i32, height: s as i32, data }
