@@ -380,7 +380,8 @@ async function renderOverrides(global) {
     const keyMode = el("select", {}, el("option", { value: "inherit" }, `inherit (${gKey})`), el("option", { value: "own" }, "own key"));
     keyMode.value = n.crossing_key == null ? "inherit" : "own";
     const key = keyField(n.crossing_key || "");
-    const sync = () => { nets.hidden = netMode.value !== "own"; key.el.hidden = keyMode.value !== "own"; };
+    // style.display, not `hidden`: the key field is a flex row and CSS display wins over the attribute.
+    const sync = () => { nets.style.display = netMode.value === "own" ? "" : "none"; key.el.style.display = keyMode.value === "own" ? "" : "none"; };
     netMode.addEventListener("change", sync); keyMode.addEventListener("change", sync); sync();
     const save = el("button", { class: "btn primary" }, "Save");
     save.addEventListener("click", async () => {
