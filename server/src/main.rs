@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use flow_server::{start, HubConfig};
+use flow_server::{start, AdminTokenSource, HubConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -19,8 +19,8 @@ struct Args {
     /// Dashboard (HTTP) listen address.
     #[arg(long, env = "FLOW_HTTP_ADDR", default_value = "0.0.0.0:7880")]
     http: SocketAddr,
-    /// Dashboard token. If unset a random token is generated, stored in the
-    /// data directory and printed at startup.
+    /// Dashboard token. If unset or empty a random token is generated,
+    /// stored in the data directory and printed at startup.
     #[arg(long, env = "FLOW_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
     /// Disable mDNS advertisement.
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
     }
     info!("hub fingerprint: {}", hub.fingerprint());
     info!("join token (give this to `flow-agent join`): {}", hub.join_token());
-    if args.admin_token.is_none() {
+    if hub.hub.admin_token_source == AdminTokenSource::Persisted {
         info!("dashboard token: {}", hub.hub.admin_token);
     }
     tokio::signal::ctrl_c().await.ok();

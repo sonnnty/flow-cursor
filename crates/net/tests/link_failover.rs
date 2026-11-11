@@ -298,3 +298,53 @@ async fn multiple_held_keys_and_buttons_across_failover_and_recovery() {
     assert!(receiver.controllers().is_empty());
     link.shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_p2p_connections_leave_the_peer_directory() {
+    use flow_net::endpoint::client_config;
+    use flow_net::tls::ServerPin;
+
+    let id_a = Identity::generate("a").unwrap();
+    let id_b = Identity::generate("b").unwrap();
+    let dir = PeerDirectory::new();
+    dir.set([(id_a.fingerprint, A)]);
+    let sc = server_config(&id_b, ALPN_P2P, dir.clone(), TransportOpts::P2P).unwrap();
+    let ep_b = bind("127.0.0.1:0".parse().unwrap(), Some(sc)).unwrap();
+    let (act_tx, _act_rx) = mpsc::unbounded_channel();
+    tokio::spawn(serve_p2p(ep_b.clone(), dir.clone(), LinkReceiver::new(act_tx)));
+    let addr_b = ep_b.local_addr().unwrap();
+    let ep_a = bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+
+    let until = |n: usize| {
+        let dir = dir.clone();
+        async move {
+            for _ in 0..200 {
+                if dir.tracked_connections() == n {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+    };
+    // Reconnects (path flaps): every closed connection is forgotten.
+    for _ in 0..5 {
+        let cc = client_config(&id_a, ALPN_P2P, ServerPin::Exact(id_b.fingerprint), TransportOpts::P2P).unwrap();
+        let c = ep_a.connect_with(cc, addr_b, flow_net::endpoint::SNI).unwrap().await.unwrap();
+        assert!(until(1).await, "an open connection is tracked");
+        c.close(0u32.into(), b"bye");
+        assert!(until(0).await, "a closed connection must be removed, {} left", dir.tracked_connections());
+    }
+    // Two at once, then the peer is revoked: both are closed and removed.
+    let mut open = Vec::new();
+    for _ in 0..2 {
+        let cc = client_config(&id_a, ALPN_P2P, ServerPin::Exact(id_b.fingerprint), TransportOpts::P2P).unwrap();
+        open.push(ep_a.connect_with(cc, addr_b, flow_net::endpoint::SNI).unwrap().await.unwrap());
+    }
+    assert!(until(2).await);
+    dir.set([]);
+    assert!(until(0).await);
+    for c in open {
+        tokio::time::timeout(Duration::from_secs(2), c.closed()).await.expect("revoked peer is disconnected");
+    }
+}

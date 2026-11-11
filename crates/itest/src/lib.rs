@@ -3,13 +3,22 @@
 use flow_agent::backend::sim::{SimBackend, SimControl};
 use flow_agent::config::AgentConfig;
 use flow_agent::AgentHandle;
+use flow_net::endpoint::{client_config, TransportOpts, SNI};
+use flow_net::frame::{read_frame, write_frame};
 use flow_net::link::Action;
-use flow_proto::{Monitor, Rect};
+use flow_net::quinn;
+use flow_net::tls::ServerPin;
+use flow_net::Identity;
+use flow_proto::{
+    Capabilities, FromHub, Hello, Monitor, NodeId, OsKind, Rect, RelayDatagramDown, RelayDown, RelayUp, StreamKind,
+    ToHub, ALPN_HUB, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
+};
 use flow_server::{HubConfig, HubHandle};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 pub const ADMIN: &str = "test-admin-token";
 
@@ -137,4 +146,99 @@ pub async fn http(
     let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
     (status, body)
+}
+
+/// A node that speaks the hub protocol by hand instead of running an agent
+/// core, for tests that need to send what a real agent never would. It is
+/// registered (Hello with the join token, Welcome received), so its frames
+/// reach the hub's routing code.
+pub struct RawNode {
+    pub id: NodeId,
+    pub identity: Identity,
+    pub conn: quinn::Connection,
+    pub endpoint: quinn::Endpoint,
+    /// Keeps the control stream open.
+    _ctl: quinn::SendStream,
+}
+
+impl RawNode {
+    pub async fn join(hub: &HubHandle, token: &str, hostname: &str) -> RawNode {
+        let identity = Identity::generate(hostname).unwrap();
+        let cc = client_config(&identity, ALPN_HUB, ServerPin::Exact(hub.fingerprint()), TransportOpts::HUB).unwrap();
+        let endpoint = flow_net::endpoint::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let conn = endpoint.connect_with(cc, hub.quic_addr, SNI).unwrap().await.unwrap();
+        let (mut ctl, mut ctl_r) = conn.open_bi().await.unwrap();
+        let hello = Hello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.1.0".into(),
+            hostname: hostname.into(),
+            os: OsKind::Linux,
+            join_token: Some(token.into()),
+            p2p_port: 0,
+            p2p_addrs: vec![],
+            monitors: monitor(1920, 1080),
+            caps: Capabilities { capture: true, inject: true, clipboard: true },
+        };
+        write_frame(&mut ctl, &ToHub::Hello(hello)).await.unwrap();
+        let id = match read_frame::<_, FromHub>(&mut ctl_r, MAX_CONTROL_FRAME).await.unwrap() {
+            Some(FromHub::Welcome(w)) => w.node_id,
+            other => panic!("expected Welcome, got {other:?}"),
+        };
+        // Drain later control messages (layout, peers) so the hub's writer
+        // never blocks on flow control.
+        tokio::spawn(async move {
+            while let Ok(Some(_)) = read_frame::<_, FromHub>(&mut ctl_r, MAX_CONTROL_FRAME).await {}
+        });
+        RawNode { id, identity, conn, endpoint, _ctl: ctl }
+    }
+
+    /// Opens a relay stream; frames the hub delivers on it arrive on the
+    /// returned channel.
+    pub async fn relay(&self) -> (quinn::SendStream, mpsc::UnboundedReceiver<RelayDown>) {
+        let (mut s, mut r) = self.conn.open_bi().await.unwrap();
+        write_frame(&mut s, &StreamKind::Relay).await.unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(Some(d)) = read_frame::<_, RelayDown>(&mut r, MAX_CONTROL_FRAME).await {
+                if tx.send(d).is_err() {
+                    break;
+                }
+            }
+        });
+        (s, rx)
+    }
+
+    /// Relay datagrams the hub delivers to this node.
+    pub fn datagrams(&self) -> mpsc::UnboundedReceiver<RelayDatagramDown> {
+        let conn = self.conn.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(b) = conn.read_datagram().await {
+                if let Ok(d) = flow_proto::decode::<RelayDatagramDown>(&b) {
+                    if tx.send(d).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        rx
+    }
+}
+
+/// Sends `probe` frames on `send` until one arrives on `rx`: the hub
+/// registers a relay stream asynchronously, so frames sent right after
+/// opening it may be dropped. Returns the first delivered frame.
+pub async fn relay_probe(
+    send: &mut quinn::SendStream,
+    probe: &RelayUp,
+    rx: &mut mpsc::UnboundedReceiver<RelayDown>,
+) -> RelayDown {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        write_frame(send, probe).await.unwrap();
+        if let Ok(Some(d)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            return d;
+        }
+        assert!(Instant::now() < deadline, "relay to {} never got through", probe.to);
+    }
 }

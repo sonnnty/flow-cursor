@@ -106,7 +106,8 @@ docker compose logs flow-server | grep -E "join token|dashboard token|fingerprin
 * พอร์ต: **UDP 7878** (agent ↔ hub, QUIC), **TCP 7880** (dashboard), UDP 5353 (mDNS) — เปิด firewall ของ server ด้วย
 * ข้อมูลทั้งหมดอยู่ใน volume `flowcursor-data` (`/data`): `hub.crt`/`hub.key` (identity), `state.json` (เครื่อง, layout, settings, secret)
   **อย่าลบ volume** ไม่เช่นนั้น fingerprint ของ Hub จะเปลี่ยนและทุก agent ต้อง join ใหม่
-* ถ้าไม่ตั้ง `FLOW_ADMIN_TOKEN` Hub จะสุ่ม token, เก็บใน volume และพิมพ์ไว้ใน log
+* ถ้าไม่ตั้ง `FLOW_ADMIN_TOKEN` หรือตั้งเป็นค่าว่าง (ค่า default ของ `compose.yaml`) Hub จะสุ่ม token, เก็บใน volume และพิมพ์ `dashboard token: …` ไว้ใน log ทุกครั้งที่เริ่ม
+  (ถ้าตั้งเองจะไม่พิมพ์)
 * ใช้ image ที่ build ไว้แล้ว: `build/build.sh` สร้าง `flow-cursor-server:flowcursor-mvp` (ดู [Build](#build-จากซอร์ส))
 * ตัวแปรเพิ่มเติม: `FLOW_QUIC_ADDR`, `FLOW_HTTP_ADDR`, `FLOW_NO_MDNS=1`, `FLOW_NAME`, `RUST_LOG`
 * พิมพ์ join token (ระหว่างที่ hub รันอยู่ก็ได้): `docker compose exec flow-server flow-server --print-token` — image เป็น distroless จึงไม่มี shell
@@ -153,6 +154,14 @@ systemctl --user enable --now flow-agent
    ครั้งต่อไปจะไม่ถามอีก (ถ้าอยากให้ถามใหม่: `flow-agent forget-portal` แล้ว restart service)
 2. **Input Capture** — ให้เครื่องนี้ไปควบคุมเครื่องอื่น InputCapture v1 ของ GNOME 46 ไม่มี restore token
    จึงอาจถามทุกครั้งที่ agent เริ่ม/เมื่อ layout ของขอบจอเปลี่ยน (GNOME 46 เปิดใช้ session เดิมซ้ำไม่ได้ ต้องสร้าง session ใหม่)
+
+สองสิทธิ์นี้แยกกัน (แต่ละ session มี D-Bus connection ของตัวเอง):
+* กด **Cancel/Deny** ที่หน้าต่าง Remote Desktop → เครื่องนี้ยังไปควบคุมเครื่องอื่นได้ตามปกติ แต่เครื่องอื่นคุมเครื่องนี้ไม่ได้
+  (log: `remote control permission (RemoteDesktop portal) was refused ...`) และกลับกันสำหรับ Input Capture
+  (log: `input capture permission (InputCapture portal) was refused ...`) — agent จะไม่ถามซ้ำเอง ให้ restart service เพื่อให้ถามใหม่
+* ถ้า session หลุดระหว่างใช้งาน (EI/EIS ตัดการเชื่อมต่อ, xdg-desktop-portal restart) agent จะคืนเมาส์/คีย์บอร์ดให้เครื่องนี้ทันที
+  แล้วสร้าง session ใหม่เอง (รอ 1 วินาที เพิ่มเป็นสองเท่าทุกครั้งที่ล้มเหลว สูงสุด 60 วินาที) ไม่ต้อง restart agent;
+  Remote Desktop ใช้ restore token จึงปกติไม่ถามซ้ำ ส่วน Input Capture อาจถามใหม่ (GNOME 46)
 
 ### 3) คลิปบอร์ดบน GNOME
 GNOME ไม่รองรับ `wlr-data-control` โปรแกรมเบื้องหลังจึงอ่าน/เขียนคลิปบอร์ด Wayland ตรงๆ ไม่ได้ agent จึงใช้ตามลำดับ:
@@ -293,6 +302,7 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
 | `this agent was removed from the hub` | ถูก revoke ใน dashboard — ต้อง `flow-agent join` ใหม่ |
 | path เป็น `relay` ตลอด | firewall บล็อก UDP 7879 ระหว่างเครื่อง หรือที่อยู่ที่ประกาศผิด (ตั้ง `p2p_advertise`) |
 | เมาส์ไม่ข้ามจอ | layout ใน dashboard ต้องให้ขอบเครื่องชิดกัน, เครื่องปลายทางต้อง online และ enabled; Wayland ต้องอนุญาต Input Capture |
+| log `... permission (... portal) was refused` | กดปฏิเสธหน้าต่างของ GNOME ไปแล้ว — `systemctl --user restart flow-agent` แล้วกด Allow |
 | ปุ่มค้าง | กด emergency hotkey; ฝั่งที่ถูกคุมจะปล่อยเองภายใน 2.5 วินาทีถ้าต้นทางหายไป |
 | GNOME ไม่ถามสิทธิ์อีก / อยากรีเซ็ต | `flow-agent forget-portal` แล้ว `systemctl --user restart flow-agent` |
 | log ละเอียด | Settings → log level = `debug` (หรือ `flow_net=trace`) |

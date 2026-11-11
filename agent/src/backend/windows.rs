@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
@@ -615,12 +615,18 @@ unsafe fn put_global(fmt: u32, data: &[u8]) -> bool {
     }
     let p = GlobalLock(h) as *mut u8;
     if p.is_null() {
+        GlobalFree(h);
         return false;
     }
     std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
     GlobalUnlock(h);
-    // On success the system owns the memory.
-    !SetClipboardData(fmt, h).is_null()
+    // Only a successful SetClipboardData hands the memory to the system;
+    // otherwise it is still ours to free.
+    if SetClipboardData(fmt, h).is_null() {
+        GlobalFree(h);
+        return false;
+    }
+    true
 }
 
 unsafe fn write_clipboard(hwnd: HWND, png_fmt: u32, c: &ClipContent) -> bool {

@@ -1,12 +1,18 @@
 //! Integration tests for malformed packets, oversized frames, corrupted datagrams, and protocol edge cases.
 
+use flow_agent::backend::LocalEvent;
 use flow_itest::*;
+use flow_keymap::keys;
 use flow_net::endpoint::{client_config, TransportOpts, SNI};
 use flow_net::frame::write_raw;
+use flow_net::link::Action;
 use flow_net::tls::ServerPin;
 use flow_net::token::JoinToken;
 use flow_net::Identity;
-use flow_proto::{Fingerprint, ALPN_HUB, ALPN_P2P, MAX_CONTROL_FRAME};
+use flow_proto::{
+    Fingerprint, LinkDatagram, NodeId, PathKind, RelayDatagramDown, RelayDatagramUp, ALPN_HUB, ALPN_P2P,
+    MAX_CONTROL_FRAME,
+};
 use std::time::Duration;
 
 const T: Duration = Duration::from_secs(5);
@@ -93,40 +99,143 @@ async fn hub_handles_truncated_frame_then_eof() {
     hub.shutdown().await;
 }
 
+/// Sends `ping` until a matching pong arrives (datagrams may be dropped).
+async fn ping_until_pong<T>(
+    mut send: impl FnMut(LinkDatagram),
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+    is_pong: impl Fn(&T, u64) -> bool,
+    nonce: u64,
+) -> bool {
+    for _ in 0..50 {
+        send(LinkDatagram::Ping { session: 0, nonce });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while let Ok(Some(x)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if is_pong(&x, nonce) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hub_and_agent_handle_corrupted_datagrams() {
     init_logs();
     let hub = start_hub().await;
     let token = hub.join_token();
 
+    // Layout in join order: A | B | R. A controls B; R is a registered,
+    // authenticated node that sends garbage to the hub and to B.
     let a = start_agent(&hub, AgentSpec::new(&token)).await;
+    let b = start_agent(&hub, AgentSpec::new(&token)).await;
     assert!(a.agent.wait(T, |s| s.connected).await);
+    assert!(b.agent.wait(T, |s| s.connected).await);
+    let idb = b.agent.status().node_id.unwrap();
+    let r = RawNode::join(&hub, &token, "datagram-flooder").await;
+    assert!(b.agent.wait(T, |s| s.online_peers.len() == 2).await, "B knows R as a peer");
+    let mut relayed_to_r = r.datagrams();
 
-    // Send garbage datagrams to the hub
-    let id = Identity::generate("datagram-flooder").unwrap();
-    let cc = client_config(&id, ALPN_HUB, ServerPin::Exact(hub.fingerprint()), TransportOpts::HUB).unwrap();
-    let ep = flow_net::endpoint::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
-    let conn = ep.connect_with(cc, hub.quic_addr, SNI).unwrap().await.unwrap();
+    // R's datagrams reach B's parser through the hub: a Ping is answered.
+    let relay_dg = |dg| {
+        let _ = r.conn.send_datagram(flow_proto::encode(&RelayDatagramUp { to: idb, dg }).into());
+    };
+    let relay_pong = |d: &RelayDatagramDown, n| d.from == idb && d.dg == LinkDatagram::Pong { nonce: n };
+    assert!(ping_until_pong(relay_dg, &mut relayed_to_r, relay_pong, 1).await, "relay path from R to B works");
 
-    for _ in 0..50 {
-        let _ = conn.send_datagram(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22].into());
+    // ... and directly: B's P2P listener accepts R (a known peer) and
+    // answers its pings, so garbage on this connection reaches the parser.
+    let p2p_addr: std::net::SocketAddr = format!("127.0.0.1:{}", b.agent.p2p_addr.port()).parse().unwrap();
+    let cc_p2p =
+        client_config(&r.identity, ALPN_P2P, ServerPin::Exact(b.agent.fingerprint), TransportOpts::P2P).unwrap();
+    let p2p = r.endpoint.connect_with(cc_p2p, p2p_addr, SNI).unwrap().await.expect("B accepts R");
+    let (p2p_tx, mut p2p_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let p2p = p2p.clone();
+        tokio::spawn(async move {
+            while let Ok(d) = p2p.read_datagram().await {
+                if let Ok(d) = flow_proto::decode::<LinkDatagram>(&d) {
+                    let _ = p2p_tx.send(d);
+                }
+            }
+        });
     }
+    let direct_dg = |dg| {
+        let _ = p2p.send_datagram(flow_proto::encode(&dg).into());
+    };
+    let direct_pong = |d: &LinkDatagram, n| *d == LinkDatagram::Pong { nonce: n };
+    assert!(ping_until_pong(direct_dg, &mut p2p_rx, direct_pong, 2).await, "direct path from R to B works");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Send garbage datagrams to agent's P2P listener
-    let p2p_addr: std::net::SocketAddr = format!("127.0.0.1:{}", a.agent.p2p_addr.port()).parse().unwrap();
-    let cc_p2p = client_config(&id, ALPN_P2P, ServerPin::Exact(a.agent.fingerprint), TransportOpts::P2P).unwrap();
-    if let Ok(p2p_conn) = ep.connect_with(cc_p2p, p2p_addr, SNI).unwrap().await {
-        for _ in 0..50 {
-            let _ = p2p_conn.send_datagram(vec![0xCA, 0xFE, 0xBA, 0xBE].into());
+    // Garbage, from the registered node.
+    let valid = flow_proto::encode(&RelayDatagramUp { to: idb, dg: LinkDatagram::Pong { nonce: 9 } });
+    let mut trailing = valid.clone();
+    trailing.extend_from_slice(&[0xff; 7]);
+    let corrupted: Vec<Vec<u8>> = vec![
+        vec![],
+        vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22],
+        vec![0xff; 64],
+        valid[..valid.len() - 1].to_vec(), // truncated
+        trailing,
+        valid.iter().map(|b| b ^ 0x5a).collect(), // bit-flipped
+    ];
+    for _ in 0..20 {
+        for g in &corrupted {
+            let _ = r.conn.send_datagram(g.clone().into());
+            let _ = p2p.send_datagram(g.clone().into());
+        }
+        // Well-formed but bogus: motion for a session B never saw, huge
+        // coordinates; datagrams for unknown nodes and for R itself.
+        let bogus = LinkDatagram::Motion(flow_proto::Motion {
+            session: 0xdead,
+            mseq: u64::MAX,
+            after_seq: 0,
+            x: i32::MAX,
+            y: i32::MIN,
+            dx: i32::MIN,
+            dy: i32::MAX,
+        });
+        relay_dg(bogus);
+        direct_dg(bogus);
+        for to in [NodeId(9999), r.id] {
+            let _ = r.conn.send_datagram(flow_proto::encode(&RelayDatagramUp { to, dg: bogus }).into());
         }
     }
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The hub and B still answer R on both paths, and nothing was injected.
+    assert!(ping_until_pong(relay_dg, &mut relayed_to_r, relay_pong, 3).await, "hub relay still works");
+    assert!(ping_until_pong(direct_dg, &mut p2p_rx, direct_pong, 4).await, "B's P2P listener still works");
+    assert!(p2p.close_reason().is_none(), "B keeps the connection open");
+    assert!(b.sim.take_injected().is_empty(), "garbage must not be injected");
+    assert!(a.agent.status().connected && b.agent.status().connected);
 
-    // Both hub and agent must continue operating normally
-    assert!(a.agent.status().connected);
+    // A still controls B, directly and through the hub relay.
+    a.sim.emit(LocalEvent::EdgeHit { side: flow_layout::Side::Right, x: 1919, y: 540 });
+    assert!(a.agent.wait(T, |s| s.controlling == Some(idb)).await);
+    a.sim.emit(LocalEvent::Key { usage: keys::A, down: true });
+    a.sim.emit(LocalEvent::Key { usage: keys::A, down: false });
+    let got = collect_until(&b.sim, T, |v| v.len() >= 3).await;
+    assert_eq!(
+        got,
+        vec![
+            Action::Entered { x: 0, y: 540 },
+            Action::Key { usage: keys::A, down: true },
+            Action::Key { usage: keys::A, down: false },
+        ]
+    );
+    let web = hub.http_addr.unwrap();
+    let (_, s) = http(web, "GET", "/api/settings", Some(ADMIN), None).await;
+    let mut s: serde_json::Value = serde_json::from_str(&s).unwrap();
+    s["path_policy"] = "force_relay".into();
+    assert_eq!(http(web, "PUT", "/api/settings", Some(ADMIN), Some(&s.to_string())).await.0, 200);
+    assert!(a.agent.wait_link_path(idb, PathKind::Relay, T).await);
+    a.sim.emit(LocalEvent::Key { usage: keys::A + 1, down: true });
+    a.sim.emit(LocalEvent::Key { usage: keys::A + 1, down: false });
+    let got = collect_until(&b.sim, T, |v| v.len() >= 2).await;
+    assert_eq!(
+        got,
+        vec![Action::Key { usage: keys::A + 1, down: true }, Action::Key { usage: keys::A + 1, down: false }],
+        "relayed through the hub"
+    );
     hub.shutdown().await;
 }
 
