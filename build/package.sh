@@ -8,9 +8,9 @@ OUT=build/out
 export CARGO_TARGET_DIR=/src/target/docker
 
 echo "==> Linux x86_64 (glibc) build"
-cargo build --release --locked -p flow-agent -p flow-server -p flow-bench
+cargo build --release --locked -p flow-agent -p flow-tray -p flow-server -p flow-bench
 echo "==> Windows x86_64 build (mingw)"
-cargo build --release --locked --target x86_64-pc-windows-gnu -p flow-agent
+cargo build --release --locked --target x86_64-pc-windows-gnu -p flow-agent -p flow-tray
 
 rm -rf "$OUT"
 mkdir -p "$OUT/linux" "$OUT/windows" "$OUT/server" "$OUT/tools"
@@ -54,9 +54,11 @@ chmod 755 "$PKG/DEBIAN/postinst"
 dpkg-deb --root-owner-group --build "$PKG" "$OUT/linux/flow-agent_${VERSION}_amd64.deb" >/dev/null
 rm -rf "$PKG"
 
-# --- Windows agent -----------------------------------------------------------
-install -m755 "$W/flow-agent.exe" "$OUT/windows/flow-agent.exe"
+# --- Windows: setup exe (NSIS) and the plain exes + scripts ----------------
+install -m755 "$W/flow-agent.exe" "$W/flow-tray.exe" "$OUT/windows/"
 install -m644 deploy/windows/install.ps1 deploy/windows/uninstall.ps1 "$OUT/windows/"
+makensis -V2 -DVERSION="$VERSION" -DBINDIR="$W" -DICON="$PWD/deploy/icons/flowcursor.ico" \
+  -DOUTFILE="$PWD/$OUT/windows/FlowCursor-setup-$VERSION.exe" deploy/windows/flowcursor.nsi
 
 # --- Hub binary and tools ----------------------------------------------------
 install -m755 "$R/flow-server" "$OUT/server/flow-server"

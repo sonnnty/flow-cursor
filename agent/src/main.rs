@@ -58,6 +58,9 @@ enum Cmd {
     Resume,
     /// Restart the running agent (re-reads its configuration).
     Restart,
+    /// Stop the running agent (installers, upgrades). Exits 0 also when
+    /// none is running.
+    Stop,
     /// Forget stored xdg-desktop-portal permissions (Linux): the next start
     /// asks again.
     ForgetPortal,
@@ -133,6 +136,22 @@ async fn main() -> Result<()> {
             println!("Token stored. Config: {}", cfg_path.display());
             println!("Start the agent (e.g. `systemctl --user restart flow-agent` or `flow-agent run`);");
             println!("it verifies the hub fingerprint from the token before sending it.");
+            Ok(())
+        }
+        Cmd::Stop => {
+            match ipc_request(&Command::Shutdown) {
+                Ok(_) => {
+                    // Gone once the endpoint stops answering.
+                    for _ in 0..50 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if flow_ipc::Client::connect(&default_endpoint()).is_err() {
+                            break;
+                        }
+                    }
+                    println!("agent stopped");
+                }
+                Err(_) => println!("no agent running"),
+            }
             Ok(())
         }
         cmd @ (Cmd::Pause | Cmd::Resume | Cmd::Restart) => {
