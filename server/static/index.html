@@ -123,7 +123,7 @@
     </div>
     <div class="card grow">
       <h2>Machines</h2>
-      <div class="scroll"><table><thead><tr><th>Name</th><th>Status</th><th>OS / monitors</th><th>Mouse speed</th><th>On</th><th></th></tr></thead><tbody id="nodes"></tbody></table></div>
+      <div class="scroll"><table><thead><tr><th>Name</th><th>Status</th><th>OS / monitors</th><th>Version / update</th><th>Mouse speed</th><th>On</th><th></th></tr></thead><tbody id="nodes"></tbody></table></div>
     </div>
     <div class="card tight" style="max-height:30%">
       <h2>Input paths</h2>
@@ -150,7 +150,7 @@
   </div>
   <div class="col">
     <div class="card tight" style="max-height:60%">
-      <h2>Network, crossing and cursor</h2>
+      <h2>Network, crossing, cursor and updates</h2>
       <div class="scroll"><div class="grid">
         <label for="s-nets">Allowed networks</label><div><textarea id="s-nets" rows="2" cols="34" placeholder="empty = everywhere (no restriction)"></textarea>
           <div class="hint">CIDR blocks, one per line (IPv4 or IPv6), e.g. <code>10.10.15.0/24</code>. A machine shares mouse, keyboard and clipboard only while one of <b>its own</b> network interfaces has an address inside a block; otherwise it is <b>away</b> (stays connected, shown in the dashboard). A VPN address (e.g. 10.8.0.5) is not inside the home block, so the VPN alone never counts as home.</div></div>
@@ -158,12 +158,14 @@
           <div class="hint">Hold this key (or combo) while the pointer reaches an edge to switch machines; without it the pointer stays at the edge (useful for games). Applies when leaving a machine's screen, also on the way back. Empty = cross freely.</div></div>
         <label for="s-park">Cursor while controlling another machine</label><div><select id="s-park"></select>
           <div class="hint">While its mouse drives another machine. Coming back over an edge, the cursor enters where the pointer crossed; any other way back shows it where it is. GNOME on Wayland can only keep it at the edge.</div></div>
+        <label for="s-update">Agent updates</label><div><select id="s-update"></select>
+          <div class="hint">When this hub carries another agent build (built into its image): <b>automatic</b> installs it once the machine is idle (not controlling or controlled, no keys held) and restarts; <b>notify</b> shows "update available" and <i>Update now</i> in the tray; <b>off</b> does nothing on its own. <i>Update now</i> on the Overview tab works with every choice.</div></div>
       </div></div>
     </div>
     <div class="card grow">
       <h2>Per-machine settings</h2>
-      <p class="hint" style="margin:0 0 6px">Each machine inherits the global allowed networks, crossing key and cursor behaviour, or uses its own. Rename, enable/disable, mouse speed and removal (credential revocation) are on the Overview tab.</p>
-      <div class="scroll"><table><thead><tr><th>Machine</th><th>Allowed networks</th><th>Crossing key</th><th>Cursor</th><th></th></tr></thead><tbody id="overrides"></tbody></table></div>
+      <p class="hint" style="margin:0 0 6px">Each machine inherits the global allowed networks, crossing key, cursor behaviour and update policy, or uses its own. Rename, enable/disable, mouse speed and removal (credential revocation) are on the Overview tab.</p>
+      <div class="scroll"><table><thead><tr><th>Machine</th><th>Allowed networks</th><th>Crossing key</th><th>Cursor</th><th>Updates</th><th></th></tr></thead><tbody id="overrides"></tbody></table></div>
     </div>
   </div>
   <div class="row footer"><button class="btn primary" id="savesettings">Save settings</button><button class="btn" id="reloadsettings">Reload</button></div>
@@ -200,7 +202,10 @@ const ms = (us) => us == null ? "–" : (us / 1000).toFixed(2) + " ms";
 async function refresh() {
   try { state = await api("GET", "/state"); } catch (e) { return; }
   $("app").hidden = false; $("login").hidden = true;
-  $("hubinfo").textContent = "v" + state.hub.version + " · fingerprint " + state.hub.fingerprint.slice(0, 16) + "…";
+  const ab = state.hub.agent_builds;
+  const builds = ab ? `agent builds ${ab.version} (${ab.platforms.map(p => p.platform).join(", ") || "none valid"})` : "no agent builds in this hub";
+  $("hubinfo").textContent = "v" + state.hub.version + " · " + builds + " · fingerprint " + state.hub.fingerprint.slice(0, 16) + "…";
+  $("hubinfo").title = ab ? ab.platforms.map(p => p.platform + ":\n" + p.files.map(f => `  ${f.name} ${f.size} B sha256 ${f.sha256}`).join("\n")).join("\n") : "";
   $("token").textContent = state.hub.join_token;
   renderNodes(); renderPairs();
   if (!dirty) { pos = {}; for (const n of state.nodes) pos[n.id] = { x: n.x, y: n.y }; }
@@ -219,7 +224,7 @@ function renderNodes() {
     speed.addEventListener("change", () => patch(n.id, { mouse_speed: parseFloat(speed.value) }));
     const en = el("input", { type: "checkbox" }); en.checked = n.enabled;
     en.addEventListener("change", () => patch(n.id, { enabled: en.checked }));
-    const status = el("span", { class: "badge " + ({ online: "ok", away: "warn" }[n.status] || "mute") }, n.status);
+    const status = el("span", { class: "badge " + ({ online: "ok", away: "warn", update_only: "warn" }[n.status] || "mute") }, n.status.replace("_", "-"));
     const why = statusWhy(n);
     const mons = n.monitors.map(m => `${m.rect.w}×${m.rect.h}`).join(" + ") || "–";
     const ctl = focusBy[n.id] ? "controls " + nameOf(focusBy[n.id]) : "";
@@ -229,9 +234,47 @@ function renderNodes() {
       try { await api("DELETE", "/nodes/" + n.id); toast("Removed " + n.name); refresh(); } catch (e) { toast(e.message, true); }
     });
     const caps = [n.caps.capture ? "capture" : null, n.caps.inject ? "inject" : null, n.caps.clipboard ? "clipboard" : null].filter(Boolean).join(", ");
-    tb.append(el("tr", {}, el("td", {}, name, el("div", { class: "hint" }, n.hostname + (n.remote ? " · " + n.remote : ""))), el("td", {}, status, why ? el("div", { class: "hint" }, why) : "", el("div", { class: "hint" }, caps), ctl ? el("div", { class: "hint" }, ctl) : ""), el("td", {}, n.os, el("div", { class: "hint" }, mons)), el("td", {}, speed), el("td", {}, en), el("td", {}, rm)));
+    tb.append(el("tr", {}, el("td", {}, name, el("div", { class: "hint" }, n.hostname + (n.remote ? " · " + n.remote : ""))), el("td", {}, status, why ? el("div", { class: "hint" }, why) : "", el("div", { class: "hint" }, caps), ctl ? el("div", { class: "hint" }, ctl) : ""), el("td", {}, n.os, el("div", { class: "hint" }, mons)), el("td", {}, ...versionCell(n)), el("td", {}, speed), el("td", {}, en), el("td", {}, rm)));
   }
-  if (!state.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 6, class: "hint" }, "No machines yet. Run flow-agent join <token> on a computer.")));
+  if (!state.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 7, class: "hint" }, "No machines yet. Run flow-agent join <token> on a computer.")));
+}
+// Agent version, update state and the "Update now" button of a machine.
+const UPD = { auto: "automatic", notify: "notify", off: "off" };
+function versionCell(n) {
+  const out = [el("div", {}, n.agent_version || "–")];
+  const hint = [];
+  if (n.platform) hint.push(n.platform);
+  const u = n.update;
+  let badge = null;
+  if (n.legacy) {
+    badge = ["bad", "update by hand"];
+    hint.push(`agent ${n.legacy.version} (protocol ${n.legacy.protocol}) is too old to update itself: install ${state.hub.version.split("+")[0]} on it once`);
+  } else if (u && n.status !== "offline") {
+    const to = u.target ? " " + u.target : "";
+    const pct = u.total ? Math.floor(100 * u.done / u.total) + "%" : "";
+    badge = {
+      current: ["ok", "current"], available: ["warn", "available"], downloading: ["warn", "downloading " + pct],
+      ready: ["warn", "ready, waits for idle"], installing: ["warn", "installing"], unsupported: ["bad", "manual update"],
+    }[u.state] || ["mute", u.state];
+    if (u.state !== "current" && u.state !== "unsupported") hint.push("→" + to);
+    if (u.detail) hint.push(u.detail);
+    if (u.failed) hint.push(`failed ${u.failed.target}: ${u.failed.reason}` + (u.failed.rolled_back ? " (previous version restored)" : ""));
+  } else if (n.offered_version && n.agent_version && n.offered_version !== n.agent_version) {
+    badge = ["mute", "outdated"];
+  }
+  if (badge) out.push(el("span", { class: "badge " + badge[0] }, badge[1]));
+  hint.push("policy " + UPD[n.effective_update_policy] + (n.update_policy == null ? " (global)" : ""));
+  out.push(el("div", { class: "hint" }, hint.join(" · ")));
+  const canUpdate = n.status !== "offline" && n.offered_version && n.offered_version !== n.agent_version
+    && (!u || ["available", "current"].includes(u.state));
+  if (canUpdate) {
+    const b = el("button", { class: "btn", title: `Install ${n.offered_version} as soon as ${n.name} is idle` }, "Update now");
+    b.addEventListener("click", async () => {
+      try { await api("POST", `/nodes/${n.id}/update`); toast(`${n.name} updates as soon as it is idle`); refresh(); } catch (e) { toast(e.message, true); }
+    });
+    out.push(b);
+  }
+  return out;
 }
 // Why a machine is online/away: the addresses its agent reported and the
 // allowlist in effect.
@@ -239,6 +282,7 @@ function statusWhy(n) {
   const nets = n.effective_allowed_networks || [];
   const addrs = (n.local_addrs || []).join(", ") || "no addresses";
   const key = n.effective_crossing_key ? "crossing key: " + n.effective_crossing_key : "";
+  if (n.status === "update_only") return n.update_only_reason || "connected only to update";
   if (n.status === "away") return `not on ${nets.join(", ")} · has ${addrs}` + (key ? " · " + key : "");
   if (n.status === "online" && nets.length) return `on an allowed network · has ${addrs}` + (key ? " · " + key : "");
   return key;
@@ -405,6 +449,8 @@ function netsFrom(area) {
 const PARK = { edge: "Stay at the edge", center: "Move to the centre", center_hide: "Move to the centre and hide" };
 function parkOptions(select) { for (const [v, t] of Object.entries(PARK)) select.append(el("option", { value: v }, t)); }
 parkOptions($("s-park"));
+function updateOptions(select) { for (const [v, t] of Object.entries(UPD)) select.append(el("option", { value: v }, t)); }
+updateOptions($("s-update"));
 // What a machine's backend allows, and what it does when that falls short
 // of its setting (the hub computes `applied_cursor_park` with the same rule
 // as the agent).
@@ -422,6 +468,7 @@ async function loadSettings() {
   $("s-nets").value = (s.allowed_networks || []).join("\n"); $("s-nets").classList.remove("invalid");
   crossField = keyField(s.crossing_key); $("s-cross").replaceChildren(crossField.el);
   $("s-park").value = s.cursor_park || "edge";
+  $("s-update").value = s.update_policy || "auto";
   renderOverrides(s);
   $("s-hotkey").value = s.emergency_hotkey;
   $("s-clip").checked = s.clipboard.enabled; $("s-cliptext").checked = s.clipboard.text; $("s-clipimg").checked = s.clipboard.images;
@@ -438,6 +485,7 @@ $("savesettings").addEventListener("click", async () => {
     path_policy: $("s-policy").value, probe_interval_ms: n("s-probe"), log_level: $("s-log").value.trim(),
     allowed_networks: netsFrom($("s-nets")), crossing_key: crossField ? crossField.input.value.trim() : "",
     cursor_park: $("s-park").value,
+    update_policy: $("s-update").value,
   };
   if (s.allowed_networks === null) return;
   try { await api("PUT", "/settings", s); toast("Settings saved and pushed to agents"); await loadSettings(); } catch (e) { toast(e.message, true); }
@@ -460,6 +508,9 @@ async function renderOverrides(global) {
     const park = el("select", {}, el("option", { value: "inherit" }, `inherit (${PARK[global.cursor_park || "edge"].toLowerCase()})`));
     parkOptions(park);
     park.value = n.cursor_park == null ? "inherit" : n.cursor_park;
+    const upd = el("select", {}, el("option", { value: "inherit" }, `inherit (${UPD[global.update_policy || "auto"]})`));
+    updateOptions(upd);
+    upd.value = n.update_policy == null ? "inherit" : n.update_policy;
     const note = cursorNote(n);
     // style.display, not `hidden`: the key field is a flex row and CSS display wins over the attribute.
     const sync = () => { nets.style.display = netMode.value === "own" ? "" : "none"; key.el.style.display = keyMode.value === "own" ? "" : "none"; };
@@ -470,17 +521,19 @@ async function renderOverrides(global) {
       if (netMode.value === "own") { const l = netsFrom(nets); if (l === null) return; body.allowed_networks = l; } else body.allowed_networks = null;
       body.crossing_key = keyMode.value === "own" ? key.input.value.trim() : null;
       body.cursor_park = park.value === "inherit" ? null : park.value;
+      body.update_policy = upd.value === "inherit" ? null : upd.value;
       try { await api("PATCH", "/nodes/" + n.id, body); toast("Saved for " + n.name); renderOverrides(global); } catch (e) { toast(e.message, true); }
     });
-    const status = el("span", { class: "badge " + ({ online: "ok", away: "warn" }[n.status] || "mute") }, n.status);
+    const status = el("span", { class: "badge " + ({ online: "ok", away: "warn", update_only: "warn" }[n.status] || "mute") }, n.status.replace("_", "-"));
     tb.append(el("tr", {},
       el("td", {}, n.name, " ", status, el("div", { class: "hint" }, statusWhy(n))),
       el("td", {}, el("div", { class: "row" }, netMode), nets),
       el("td", {}, el("div", { class: "row" }, keyMode), key.el),
       el("td", {}, park, note ? el("div", { class: "hint" }, note) : ""),
+      el("td", {}, upd),
       el("td", {}, save)));
   }
-  if (!st.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 5, class: "hint" }, "No machines yet.")));
+  if (!st.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 6, class: "hint" }, "No machines yet.")));
 }
 $("reloadsettings").addEventListener("click", () => loadSettings().catch(e => toast(e.message, true)));
 
