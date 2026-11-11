@@ -5,8 +5,8 @@
 use anyhow::{Context, Result};
 use flow_layout::LayoutExt;
 use flow_proto::{
-    AgentSettings, Capabilities, Fingerprint, FocusEntry, FromHub, HubSettings, Layout, Monitor, NodeId, NodeLayout,
-    OsKind, PathKind, PeerInfo, RelayDown,
+    AgentSettings, Capabilities, CursorPark, Fingerprint, FocusEntry, FromHub, HubSettings, Layout, Monitor, NodeId,
+    NodeLayout, OsKind, PathKind, PeerInfo, RelayDown,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -45,6 +45,10 @@ pub struct NodeRecord {
     /// Own crossing key (None = inherit; Some("") = none for this node).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crossing_key: Option<String>,
+    /// Own cursor behaviour while controlling another machine (None =
+    /// inherit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_park: Option<CursorPark>,
 }
 
 impl NodeRecord {
@@ -61,7 +65,16 @@ impl NodeRecord {
         if let Some(k) = &self.crossing_key {
             s.crossing_key = k.clone();
         }
+        if let Some(c) = self.cursor_park {
+            s.cursor_park = c;
+        }
         s
+    }
+
+    /// What this node actually does with its effective cursor setting,
+    /// given what its backend reported it can do.
+    pub fn applied_cursor_park(&self, global: &HubSettings) -> CursorPark {
+        self.effective_settings(global).cursor_park.nearest(self.caps.cursor)
     }
 }
 
@@ -320,6 +333,7 @@ mod tests {
                 last_seen: 0,
                 allowed_networks: None,
                 crossing_key: Some("ScrollLock".into()),
+                cursor_park: Some(CursorPark::CenterHide),
             },
         );
         p.save(&dir).unwrap();
@@ -339,6 +353,15 @@ mod tests {
         let eff = q.nodes[&1].effective_settings(&global);
         assert_eq!(eff.crossing_key, "ScrollLock");
         assert_eq!(eff.allowed_networks, global.allowed_networks, "inherited");
+        assert_eq!(eff.cursor_park, CursorPark::CenterHide);
+        // The backend reported no cursor support (old agent, GNOME): the
+        // closest behaviour is staying at the edge.
+        assert_eq!(q.nodes[&1].applied_cursor_park(&global), CursorPark::Edge);
+        let mut full = q.nodes[&1].clone();
+        full.caps.cursor = flow_proto::CursorSupport::FULL;
+        assert_eq!(full.applied_cursor_park(&global), CursorPark::CenterHide);
+        full.cursor_park = None;
+        assert_eq!(full.applied_cursor_park(&global), CursorPark::Edge, "inherits the global default");
         std::fs::remove_dir_all(dir).ok();
     }
 }
