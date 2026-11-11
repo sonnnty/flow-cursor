@@ -23,6 +23,10 @@ pub fn set_paused(paused: bool) -> io::Result<String> {
     request(if paused { Command::Pause } else { Command::Resume })
 }
 
+pub fn update_now() -> io::Result<String> {
+    request(Command::UpdateNow)
+}
+
 pub fn join(token: &str, hub: &str) -> io::Result<String> {
     let hub = hub.trim();
     request(Command::Join { token: token.trim().to_string(), hub: (!hub.is_empty()).then(|| hub.to_string()) })
@@ -112,6 +116,35 @@ pub fn open_log(log_file: Option<&str>) -> io::Result<()> {
     }
     std::fs::write(&path, body)?;
     open(&path.to_string_lossy())
+}
+
+/// Runs the (updated) tray binary in place of this process, same
+/// arguments; `build` is what it should be now (see [`crate::ENV_REEXEC`]).
+/// Call after the tray released its single-instance lock.
+pub fn restart_tray(build: &str) -> io::Error {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+    // Linux: the replaced file shows as "<path> (deleted)".
+    let exe = match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(p) if !exe.exists() => PathBuf::from(p),
+        _ => exe,
+    };
+    let mut cmd = Process::new(&exe);
+    cmd.args(std::env::args_os().skip(1)).env(crate::ENV_REEXEC, build);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.exec()
+    }
+    #[cfg(not(unix))]
+    {
+        match flow_ipc::detach::spawn_detached(&mut cmd) {
+            Ok(_) => std::process::exit(0),
+            Err(e) => e,
+        }
+    }
 }
 
 /// Starts this program again with `args` (the status window).

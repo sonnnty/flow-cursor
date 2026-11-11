@@ -42,6 +42,7 @@ fn action_for(id: &str) -> Option<Action> {
         "pause" => Action::SetPaused(true),
         "resume" => Action::SetPaused(false),
         "restart" => Action::RestartAgent,
+        "update" => Action::UpdateNow,
         "log" => Action::OpenLog,
         "quit" => Action::Quit,
         _ => return None,
@@ -66,6 +67,9 @@ fn menu(v: &View) -> Menu {
         Some(false) => add("pause", "Pause sharing", true),
         None => add("pause", "Pause sharing", false),
     }
+    if let Some(label) = &v.update_now {
+        add("update", label, true);
+    }
     add("restart", if v.paused.is_some() { "Restart agent" } else { "Start agent" }, true);
     add("log", "Open log", v.paused.is_some());
     let _ = m.append(&PredefinedMenuItem::separator());
@@ -73,7 +77,9 @@ fn menu(v: &View) -> Menu {
     m
 }
 
-pub fn run(show: bool, start_agent: bool) -> anyhow::Result<()> {
+/// Runs the tray until "Quit" or WM_CLOSE (Ok(None)), or until an update
+/// replaced the tray binary (Ok(Some(new build)): the caller starts it).
+pub fn run(show: bool, start_agent: bool) -> anyhow::Result<Option<String>> {
     let hwnd = win::create_hidden_window(WINDOW_CLASS)?;
     let wake_hwnd = hwnd as isize;
     let (tx, rx) = std::sync::mpsc::channel::<Action>();
@@ -132,12 +138,12 @@ pub fn run(show: bool, start_agent: bool) -> anyhow::Result<()> {
                 }
             }
             if !core.handle(a) {
-                return Ok(());
+                return Ok(core.restart_for.take());
             }
         }
     }
     // WM_CLOSE (flow-tray --quit, installer): only the tray exits.
-    Ok(())
+    Ok(None)
 }
 
 /// Closes the running tray (`flow-tray --quit`); false when none runs.

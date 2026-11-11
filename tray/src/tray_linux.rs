@@ -105,6 +105,9 @@ impl ksni::Tray for FlowTray {
             Some(false) => m.push(item("Pause sharing", true, Some(Action::SetPaused(true)))),
             None => m.push(item("Pause sharing", false, None)),
         }
+        if let Some(label) = &v.update_now {
+            m.push(item(label, true, Some(Action::UpdateNow)));
+        }
         let restart = if v.paused.is_some() { "Restart agent" } else { "Start agent" };
         m.push(item(restart, true, Some(Action::RestartAgent)));
         m.push(item("Open log", v.paused.is_some(), Some(Action::OpenLog)));
@@ -119,9 +122,10 @@ impl ksni::Tray for FlowTray {
     }
 }
 
-/// Runs the tray until "Quit". `open_window` opens the status window at
-/// start (`--show`).
-pub fn run(open_window: bool) -> anyhow::Result<()> {
+/// Runs the tray until "Quit" (Ok(None)) or until an update replaced the
+/// tray binary (Ok(Some(new build)): the caller starts it). `open_window`
+/// opens the status window at start (`--show`).
+pub fn run(open_window: bool) -> anyhow::Result<Option<String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let tray = FlowTray { view: view(&AgentState::Unknown), actions: tx.clone() };
     let handle = match tray.spawn() {
@@ -164,5 +168,5 @@ pub fn run(open_window: bool) -> anyhow::Result<()> {
     if let Some(h) = handle {
         h.shutdown().wait();
     }
-    Ok(())
+    Ok(core.restart_for)
 }

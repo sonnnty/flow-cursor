@@ -176,6 +176,15 @@ impl StatusApp {
                     ui.add_enabled(false, egui::Button::new("Pause sharing"));
                 }
             }
+            if let Some(v) = snap.filter(|s| s.update.can_update_now).and_then(|s| s.update.available.clone()) {
+                if ui
+                    .button(format!("Update now to {v}"))
+                    .on_hover_text("Installs the hub's version as soon as no machine is being controlled")
+                    .clicked()
+                {
+                    self.spawn(&ctx, actions::update_now);
+                }
+            }
             let restart = if snap.is_some() { "Restart agent" } else { "Start agent" };
             if ui.button(restart).clicked() {
                 self.spawn(&ctx, actions::restart_agent);
@@ -349,7 +358,26 @@ fn details(ui: &mut egui::Ui, s: &Snapshot) {
                 yes_no(s.can_clipboard)
             ),
         );
-        row(ui, "Agent", format!("{} {} (pid {}, backend {})", s.agent_version, s.platform, s.pid, s.backend));
+        row(ui, "Version", model::version_label(s));
+        row(ui, "Agent", format!("pid {}, backend {}", s.pid, s.backend));
+        let policy = if s.update.policy.is_empty() { "(not known yet)" } else { s.update.policy.as_str() };
+        row(ui, "Update policy", policy);
+        let update = match model::update_label(s) {
+            Some(u) if s.update.state == "unsupported" || s.update.failed.is_some() => RichText::new(u).color(AMBER),
+            Some(u) => RichText::new(u),
+            None => RichText::new("up to date with the hub").color(GREEN),
+        };
+        row(ui, "Update", update);
+        if let Some(r) = &s.update.update_only {
+            row(ui, "Hub", RichText::new(format!("connected only to update: {r}")).color(RED));
+        }
+        // (When current, the Update row already shows the failure.)
+        if s.update.state != "current" {
+            if let Some(f) = &s.update.failed {
+                let rb = if s.update.failed_rolled_back { " (previous version restored)" } else { "" };
+                row(ui, "Last failure", RichText::new(format!("{f}{rb}")).color(AMBER));
+            }
+        }
         row(ui, "Status window", flow_version::FULL);
         row(ui, "Config file", RichText::new(&s.config_file).monospace());
         row(
