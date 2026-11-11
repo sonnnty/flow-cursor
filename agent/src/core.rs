@@ -219,7 +219,8 @@ struct Core {
     to_hub: mpsc::UnboundedSender<ToHub>,
     clip_out: mpsc::UnboundedSender<ClipContent>,
     last_clip_hash: Option<u64>,
-    clip_set_at: Option<Instant>,
+    /// When and what kind of content was last set from a remote copy.
+    clip_set_at: Option<(Instant, flow_proto::ClipKind)>,
     status: watch::Sender<AgentStatus>,
     log_hook: Option<LogHook>,
     down_since: Option<Instant>,
@@ -331,7 +332,7 @@ impl Core {
                 }
                 debug!(?from, ?content, "clipboard set from remote");
                 self.last_clip_hash = Some(content.hash64());
-                self.clip_set_at = Some(Instant::now());
+                self.clip_set_at = Some((Instant::now(), content.kind()));
                 self.backend.set_clipboard(&content);
             }
         }
@@ -489,9 +490,10 @@ impl Core {
         if Some(h) == self.last_clip_hash {
             return;
         }
-        // Some backends re-encode content we just set (e.g. images); ignore
-        // changes right after a remote update to avoid ping-pong.
-        if self.clip_set_at.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) {
+        // Backends suppress notifications for content they set themselves;
+        // as a second line of defence ignore a change of the same kind right
+        // after a remote update (re-encoded images would otherwise ping-pong).
+        if self.clip_set_at.is_some_and(|(t, k)| k == c.kind() && t.elapsed() < Duration::from_millis(250)) {
             self.last_clip_hash = Some(h);
             return;
         }

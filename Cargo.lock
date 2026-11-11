@@ -515,6 +515,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-itest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flow-agent",
+ "flow-keymap",
+ "flow-layout",
+ "flow-net",
+ "flow-proto",
+ "flow-server",
+ "rand 0.8.8",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "flow-keymap"
 version = "0.1.0"
 

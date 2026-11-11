@@ -418,7 +418,11 @@ impl Actor {
         match path {
             PathKind::P2p => {
                 if let Some(p) = &self.p2p {
-                    let _ = p.conn.send_datagram(flow_proto::encode(&dg).into());
+                    if let Err(e) = p.conn.send_datagram(flow_proto::encode(&dg).into()) {
+                        debug!(peer = %self.peer.id, "datagram not sent: {e}");
+                    }
+                } else {
+                    debug!(peer = %self.peer.id, "datagram dropped: no direct connection");
                 }
             }
             PathKind::Relay => {

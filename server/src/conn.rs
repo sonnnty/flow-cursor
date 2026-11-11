@@ -238,9 +238,10 @@ async fn control_loop(hub: &Arc<Hub>, node: NodeId, recv: &mut quinn::RecvStream
             None => return Ok(()),
         };
         let mut st = hub.lock();
-        // A node revoked while connected loses everything.
+        // A revoked node is told so and disconnected by the revoking task;
+        // ignore whatever it still sends until then.
         if !st.p.nodes.contains_key(&node.0) {
-            bail!("node was revoked");
+            continue;
         }
         match msg {
             ToHub::Hello(_) => {}

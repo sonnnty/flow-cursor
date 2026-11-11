@@ -48,6 +48,8 @@ struct SourceState {
     next_expected: u64,
     pending: BTreeMap<u64, InputEvent>,
     last_mseq: u64,
+    /// Newest motion waiting for the reliable events it was sent after.
+    pending_motion: Option<Motion>,
     held_keys: BTreeSet<u32>,
     held_buttons: BTreeSet<Button>,
     entered: bool,
@@ -180,6 +182,8 @@ impl ReceiverState {
             st.next_expected = base.max(1);
             st.pending.clear();
             st.last_mseq = 0;
+            // Motion of this session may have arrived before its first event.
+            st.pending_motion = st.pending_motion.filter(|m| m.session == session);
         }
         st.last_seen = Some(now);
         if seq >= st.next_expected && (st.pending.len() < MAX_PENDING || st.pending.contains_key(&seq)) {
@@ -189,18 +193,47 @@ impl ReceiverState {
             st.apply(ev, &mut actions);
             st.next_expected += 1;
         }
+        if let Some(m) = st.pending_motion.filter(|m| m.session == session && m.after_seq < st.next_expected) {
+            st.pending_motion = None;
+            if st.entered && m.mseq > st.last_mseq {
+                st.last_mseq = m.mseq;
+                actions.push(Action::MoveAbs { x: m.x, y: m.y, dx: m.dx, dy: m.dy });
+            }
+        }
         EventOutcome { ack: Some(st.next_expected - 1), actions }
     }
 
     /// Handles a motion datagram. Returns the injection action if the
     /// motion is current and its prerequisites were applied.
     pub fn on_motion(&mut self, from: NodeId, m: &Motion, now: Instant) -> Option<Action> {
-        let st = self.sources.get_mut(&from)?;
+        let st = self.sources.entry(from).or_default();
         if st.session != m.session {
+            // Datagrams can overtake the first reliable event of a new
+            // session (its Enter): keep the newest one for when it arrives.
+            // Never displace a held-back motion of the current session.
+            let replace = match st.pending_motion {
+                None => true,
+                Some(p) if p.session == st.session && st.session != 0 => false,
+                Some(p) => p.session != m.session || p.mseq < m.mseq,
+            };
+            if replace && !st.retired.contains(&m.session) {
+                st.pending_motion = Some(*m);
+            }
             return None;
         }
         st.last_seen = Some(now);
-        if !st.entered || m.after_seq >= st.next_expected || m.mseq <= st.last_mseq {
+        if m.mseq <= st.last_mseq {
+            return None;
+        }
+        if m.after_seq >= st.next_expected {
+            // The datagram overtook a reliable event (e.g. a click); keep the
+            // newest one and apply it once that event is in.
+            if st.pending_motion.is_none_or(|p| p.session != m.session || p.mseq < m.mseq) {
+                st.pending_motion = Some(*m);
+            }
+            return None;
+        }
+        if !st.entered {
             return None;
         }
         st.last_mseq = m.mseq;
@@ -352,16 +385,21 @@ mod tests {
         let mut r = ReceiverState::new();
         let t = Instant::now();
         let m = |mseq, after_seq| Motion { session: 9, mseq, after_seq, x: 5, y: 6, dx: 1, dy: 1 };
-        // Unknown source.
-        assert_eq!(r.on_motion(S, &m(1, 0), t), None);
-        r.on_event(S, 9, 1, 1, InputEvent::Enter { x: 0, y: 0 }, t);
-        assert!(r.on_motion(S, &m(1, 1), t).is_some());
+        // Motion overtaking the Enter of a new session is held back…
+        assert_eq!(r.on_motion(S, &m(1, 1), t), None);
+        let o = r.on_event(S, 9, 1, 1, InputEvent::Enter { x: 0, y: 0 }, t);
+        assert_eq!(o.actions, vec![Action::Entered { x: 0, y: 0 }, Action::MoveAbs { x: 5, y: 6, dx: 1, dy: 1 }]);
+        assert_eq!(r.on_motion(S, &m(1, 1), t), None, "already applied");
         // Older datagram.
         assert_eq!(r.on_motion(S, &m(1, 1), t), None);
-        // Motion sent after an event we have not applied yet.
+        // Motion sent after an event we have not applied yet: held back…
         assert_eq!(r.on_motion(S, &m(2, 2), t), None);
         // Wrong session.
         assert_eq!(r.on_motion(S, &Motion { session: 8, ..m(3, 1) }, t), None);
+        // …and applied right after that event.
+        let o = r.on_event(S, 9, 2, 1, key(true), t);
+        assert_eq!(o.actions, vec![Action::Key { usage: K, down: true }, Action::MoveAbs { x: 5, y: 6, dx: 1, dy: 1 }]);
+        assert_eq!(r.on_motion(S, &m(2, 1), t), None, "already applied");
         assert!(r.on_motion(S, &m(3, 1), t).is_some());
     }
 

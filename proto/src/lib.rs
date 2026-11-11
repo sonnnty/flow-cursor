@@ -40,6 +40,8 @@ pub const MDNS_SERVICE: &str = "_flowcursor._udp.local.";
 pub const DEFAULT_HUB_PORT: u16 = 7878;
 /// Default UDP port of an agent's P2P listener (QUIC).
 pub const DEFAULT_P2P_PORT: u16 = 7879;
+/// QUIC application close code the hub uses when it revokes an agent.
+pub const CLOSE_REVOKED: u32 = 3;
 /// Max size of a control/link frame.
 pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
 /// Max size of a clipboard frame (hard cap; the configured limit is lower).

@@ -317,7 +317,7 @@ async fn delete_node(State(hub): State<Arc<Hub>>, Path(id): Path<u32>) -> Result
     if let Some(c) = conn {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            c.close(3u32.into(), b"revoked");
+            c.close(flow_proto::CLOSE_REVOKED.into(), b"revoked");
         });
     }
     Ok(StatusCode::NO_CONTENT)

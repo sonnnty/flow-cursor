@@ -312,14 +312,7 @@ impl HubClient {
                             FromHub::Pong { .. } | FromHub::Welcome(_) => continue,
                             FromHub::Reject { reason } => HubEvent::Rejected(reason),
                             FromHub::Revoked => {
-                                warn!("the hub removed this agent (credentials revoked)");
-                                let mut st = self.state.lock().expect("poisoned");
-                                st.node_id = None;
-                                st.revoked = true;
-                                st.pending_join_token = None;
-                                let _ = st.save(&self.state_dir);
-                                drop(st);
-                                let _ = self.events.send(HubEvent::Revoked);
+                                self.on_revoked();
                                 break Ok(End::Retry(Duration::from_secs(60)));
                             }
                         };
@@ -339,6 +332,21 @@ impl HubClient {
                 reason = conn.closed() => break Err(anyhow!("hub connection closed: {reason}")),
             }
         };
+        // The hub signals revocation in-band and with the close code; the
+        // close may win the race against the frame.
+        if result.is_err() {
+            // Give a pending close (with its reason code) a moment to arrive.
+            let _ = tokio::time::timeout(Duration::from_millis(500), conn.closed()).await;
+        }
+        let result = match conn.close_reason() {
+            Some(flow_net::quinn::ConnectionError::ApplicationClosed(c))
+                if c.error_code == flow_proto::CLOSE_REVOKED.into() =>
+            {
+                self.on_revoked();
+                Ok(End::Retry(Duration::from_secs(60)))
+            }
+            _ => result,
+        };
         self.relay.set(None);
         for t in tasks {
             t.abort();
@@ -346,6 +354,22 @@ impl HubClient {
         conn.close(0u32.into(), b"bye");
         info!("disconnected from hub");
         result
+    }
+}
+
+impl HubClient {
+    fn on_revoked(&self) {
+        let mut st = self.state.lock().expect("poisoned");
+        if st.revoked {
+            return;
+        }
+        warn!("the hub removed this agent (credentials revoked)");
+        st.node_id = None;
+        st.revoked = true;
+        st.pending_join_token = None;
+        let _ = st.save(&self.state_dir);
+        drop(st);
+        let _ = self.events.send(HubEvent::Revoked);
     }
 }
 

@@ -130,6 +130,7 @@ impl LinkSink for LinkReceiver {
         match dg {
             LinkDatagram::Motion(m) => {
                 let a = self.state.lock().expect("poisoned").on_motion(from, &m, Instant::now());
+                tracing::trace!(source = %from, mseq = m.mseq, after_seq = m.after_seq, applied = a.is_some(), "motion");
                 if let Some(a) = a {
                     let _ = self.actions.send((from, a));
                 }
