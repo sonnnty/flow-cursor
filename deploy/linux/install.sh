@@ -48,6 +48,10 @@ systemctl --user restart flow-agent.service
 # The tray icon now (later: at every login through the autostart entry).
 if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
   setsid -f "$bindir/flow-tray" >/dev/null 2>&1 < /dev/null || true
+elif systemctl --user show-environment 2>/dev/null | grep -q '^\(WAYLAND_\)\?DISPLAY='; then
+  # Run from a shell outside the desktop (SSH, a script): start the tray in the
+  # desktop session through the user's systemd manager, which has its display.
+  systemd-run --user --quiet --collect --unit="flowcursor-tray-$$" "$bindir/flow-tray" || true
 fi
 echo
 echo "FlowCursor installed and started (systemctl --user status flow-agent)."
