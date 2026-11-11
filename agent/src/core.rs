@@ -14,6 +14,7 @@ use crate::cross::{self, EdgeDecision, EdgeHold, HoldStep};
 use crate::edge::EdgeGate;
 use crate::hub::{HubChannels, HubClient, HubEvent, HubRelay, Links};
 use crate::netcheck::{AddrSource, SystemAddrs, NET_CHECK_INTERVAL};
+use crate::park::{self, Park};
 use anyhow::{Context, Result};
 use flow_keymap::{parse_combo, Combo};
 use flow_layout::{clamp_to_screens, LayoutExt, Move, Side};
@@ -68,6 +69,9 @@ pub struct AgentStatus {
     /// The pointer is held at an edge waiting for the crossing key
     /// (backends where hitting the edge captures, i.e. Wayland).
     pub holding_edge: bool,
+    /// Where the local cursor was moved (and whether it was hidden) while
+    /// this machine controls another one; None = left at the edge.
+    pub cursor_parked: Option<Park>,
 }
 
 pub struct AgentHandle {
@@ -144,6 +148,12 @@ impl AgentHandle {
     pub async fn shutdown(self) {
         for t in &self.tasks {
             t.abort();
+        }
+        // The core task is gone: give the local devices and the cursor back
+        // (visible, where it is) if it was capturing.
+        let s = self.status();
+        if s.controlling.is_some() || s.holding_edge {
+            self.backend.end_capture(None);
         }
         for l in self.links.lock().expect("poisoned").values() {
             l.shutdown();
@@ -294,6 +304,8 @@ pub async fn start_with(
     };
     tasks.push(tokio::spawn(client.run(HubChannels { to_hub: to_hub_rx, clip: clip_rx })));
 
+    // A previous run may have died while the cursor was hidden.
+    backend.restore_cursor();
     let settings = AgentSettings::default();
     let mut core = Core {
         me: None,
@@ -331,6 +343,7 @@ pub async fn start_with(
         net_away: false,
         paused,
         local_addrs: Vec::new(),
+        parked: None,
     };
     core.apply_settings(AgentSettings::default());
     if paused {
@@ -433,6 +446,9 @@ struct Core {
     /// Paused by the user.
     paused: bool,
     local_addrs: Vec<IpAddr>,
+    /// What was done with the local cursor when control left this machine
+    /// (undone by `end_capture` when it comes back).
+    parked: Option<Park>,
 }
 
 impl Core {
@@ -492,6 +508,7 @@ impl Core {
             };
             s.local_addrs = self.local_addrs.clone();
             s.holding_edge = matches!(self.mode, Mode::Hold(_));
+            s.cursor_parked = self.parked;
         });
     }
 
@@ -926,7 +943,28 @@ impl Core {
         self.gate.reset();
         self.backend.begin_capture();
         self.enter(to, ex, ey);
+        if matches!(self.mode, Mode::Remote { .. }) {
+            self.park_cursor(x, y);
+        }
         EdgeOutcome::Crossed
+    }
+
+    /// Control just left this machine at the local edge position (x, y):
+    /// move/hide the local cursor as configured and supported.
+    fn park_cursor(&mut self, x: i32, y: i32) {
+        let want = self.settings.cursor_park;
+        let support = self.backend.caps().cursor;
+        self.parked = park::plan(want, support, &self.backend.monitors(), x, y);
+        match self.parked {
+            Some(p) => {
+                debug!(?want, at = ?p.at, hide = p.hide, "local cursor parked");
+                self.backend.park_cursor(p);
+            }
+            None if want.moves() => {
+                debug!(?want, ?support, "the backend cannot move the cursor: it stays at the edge")
+            }
+            None => {}
+        }
     }
 
     fn on_hold_step(&mut self, step: HoldStep) {
@@ -1026,7 +1064,13 @@ impl Core {
         self.release_target();
         self.mode = Mode::Local;
         self.forget_keys_after_capture();
+        // Shows the cursor again if it was hidden. Coming back over an edge
+        // (`warp`) it enters at the mapped edge position; any other way it
+        // stays where it is (the centre it was parked at, or the edge).
         self.backend.end_capture(warp);
+        if let Some(p) = self.parked.take() {
+            debug!(parked_at = ?p.at, ?warp, "local cursor restored");
+        }
         let _ = self.to_hub.send(ToHub::FocusChanged { target: None });
         info!("focus → this machine");
         self.publish();
