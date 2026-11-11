@@ -81,6 +81,8 @@ async fn handle_conn(hub: Arc<Hub>, conn: Connection) -> Result<()> {
                 p2p_addrs,
                 agent_version: hello.agent_version.clone(),
                 since: unix_now(),
+                away: false,
+                local_addrs: Vec::new(),
             },
         );
         let rec = st.p.nodes.get(&node.0).expect("authenticated node exists");
@@ -88,7 +90,7 @@ async fn handle_conn(hub: Arc<Hub>, conn: Connection) -> Result<()> {
             node_id: node,
             name: rec.name.clone(),
             hub_version: env!("CARGO_PKG_VERSION").to_string(),
-            settings: st.p.settings.clone(),
+            settings: st.settings_for(node),
             layout: st.p.layout(),
             peers: st.peers_for(node),
             focus: st.focus_entries(),
@@ -163,9 +165,10 @@ async fn handle_conn(hub: Arc<Hub>, conn: Connection) -> Result<()> {
     result
 }
 
+/// Input may be relayed between two enabled nodes that are not away.
 fn relay_allowed(st: &crate::state::HubState, from: NodeId, to: NodeId) -> bool {
-    let en = |id: NodeId| st.p.nodes.get(&id.0).is_some_and(|n| n.enabled);
-    from != to && en(from) && en(to)
+    let ok = |id: NodeId| st.p.nodes.get(&id.0).is_some_and(|n| n.enabled) && !st.is_away(id);
+    from != to && ok(from) && ok(to)
 }
 
 /// Known certificate → its node. Unknown certificate → enrol if the join
@@ -219,6 +222,8 @@ fn authenticate(hub: &Hub, fp: &Fingerprint, hello: &Hello) -> Result<NodeId, St
             caps: hello.caps,
             created: unix_now(),
             last_seen: unix_now(),
+            allowed_networks: None,
+            crossing_key: None,
         },
     );
     st.save();
@@ -246,7 +251,27 @@ async fn control_loop(hub: &Arc<Hub>, node: NodeId, recv: &mut quinn::RecvStream
         match msg {
             ToHub::Hello(_) => {}
             ToHub::Ping { nonce } => st.send_to(node, FromHub::Pong { nonce }),
-            ToHub::Pong { .. } | ToHub::NetStatus { .. } => {}
+            ToHub::Pong { .. } => {}
+            ToHub::NetStatus { away, addrs } => {
+                let Some(o) = st.online.get_mut(&node) else { continue };
+                let changed = o.away != away;
+                o.away = away;
+                o.local_addrs = addrs;
+                if changed {
+                    let addrs: Vec<String> = o.local_addrs.iter().map(|a| a.to_string()).collect();
+                    if away {
+                        info!(%node, ?addrs, "node is away (not on an allowed network)");
+                        // Agents release on their own too; this covers
+                        // sources that have not heard about it yet.
+                        st.release_focus_on(node);
+                        st.focus.remove(&node);
+                        st.broadcast_focus();
+                    } else {
+                        info!(%node, ?addrs, "node is back on an allowed network");
+                    }
+                    st.broadcast_peers();
+                }
+            }
             ToHub::UpdateMonitors(m) => {
                 if let Some(rec) = st.p.nodes.get_mut(&node.0) {
                     if rec.monitors != m {
@@ -375,7 +400,7 @@ async fn clipboard_stream(
         {
             let mut st = hub.lock();
             let enabled = st.p.nodes.get(&node.0).is_some_and(|n| n.enabled);
-            if !enabled || !content.allowed_by(&st.p.settings.clipboard) {
+            if !enabled || st.is_away(node) || !content.allowed_by(&st.p.settings.clipboard) {
                 debug!(%node, ?content, "clipboard update dropped by settings");
                 continue;
             }
@@ -383,7 +408,7 @@ async fn clipboard_stream(
             let mut n = 0;
             for (id, o) in st.online.iter() {
                 let target_enabled = st.p.nodes.get(&id.0).is_some_and(|n| n.enabled);
-                if *id != node && target_enabled {
+                if *id != node && target_enabled && !o.away {
                     if let Some(c) = &o.clip {
                         let _ = c.send(ClipboardMsg::Update { from: Some(node), content: content.clone() });
                         n += 1;

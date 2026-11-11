@@ -11,8 +11,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use flow_proto::{Capabilities, FocusEntry, FromHub, HubSettings, Monitor, NodeId, OsKind, PathKind};
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tracing::info;
@@ -69,6 +69,16 @@ struct HubInfo {
     join_token: String,
 }
 
+/// Connection state shown in the dashboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum NodeStatus {
+    Online,
+    /// Connected, but not on one of its allowed networks.
+    Away,
+    Offline,
+}
+
 #[derive(Serialize)]
 struct NodeView {
     id: NodeId,
@@ -78,6 +88,15 @@ struct NodeView {
     os: OsKind,
     enabled: bool,
     online: bool,
+    status: NodeStatus,
+    /// The agent's own interface addresses (what the away decision uses).
+    local_addrs: Vec<IpAddr>,
+    /// Per-node overrides (null = inherit the global setting).
+    allowed_networks: Option<Vec<String>>,
+    crossing_key: Option<String>,
+    /// Values in effect for this node.
+    effective_allowed_networks: Vec<String>,
+    effective_crossing_key: String,
     mouse_speed: f32,
     x: i32,
     y: i32,
@@ -117,6 +136,12 @@ async fn get_state(State(hub): State<Arc<Hub>>) -> Json<StateView> {
             .values()
             .map(|n| {
                 let o = st.online.get(&n.id);
+                let eff = n.effective_settings(&st.p.settings);
+                let status = match o {
+                    Some(o) if o.away => NodeStatus::Away,
+                    Some(_) => NodeStatus::Online,
+                    None => NodeStatus::Offline,
+                };
                 NodeView {
                     id: n.id,
                     name: n.name.clone(),
@@ -125,6 +150,12 @@ async fn get_state(State(hub): State<Arc<Hub>>) -> Json<StateView> {
                     os: n.os,
                     enabled: n.enabled,
                     online: o.is_some(),
+                    status,
+                    local_addrs: o.map(|o| o.local_addrs.clone()).unwrap_or_default(),
+                    allowed_networks: n.allowed_networks.clone(),
+                    crossing_key: n.crossing_key.clone(),
+                    effective_allowed_networks: eff.allowed_networks,
+                    effective_crossing_key: eff.crossing_key,
                     mouse_speed: n.mouse_speed,
                     x: n.x,
                     y: n.y,
@@ -200,6 +231,27 @@ async fn get_settings(State(hub): State<Arc<Hub>>) -> Json<HubSettings> {
     Json(hub.lock().p.settings.clone())
 }
 
+const MAX_NETWORKS: usize = 64;
+
+/// Checks a list of allowed networks (CIDR syntax, IPv4 or IPv6).
+pub fn validate_networks(list: &[String]) -> Result<(), String> {
+    if list.len() > MAX_NETWORKS {
+        return Err(format!("allowed networks: at most {MAX_NETWORKS} entries"));
+    }
+    flow_proto::net::parse_networks(list).map(|_| ()).map_err(|e| format!("allowed networks: {e}"))
+}
+
+/// Checks a crossing key ("" = none; one key or a combo of key names).
+pub fn validate_crossing_key(k: &str) -> Result<(), String> {
+    if k.trim().is_empty() {
+        return Ok(());
+    }
+    if k.len() > 100 {
+        return Err("crossing key is too long".into());
+    }
+    flow_keymap::parse_combo(k).map(|_| ()).map_err(|e| format!("crossing key: {e}"))
+}
+
 pub fn validate_settings(s: &HubSettings) -> Result<(), String> {
     flow_keymap::parse_combo(&s.emergency_hotkey).map_err(|e| format!("emergency hotkey: {e}"))?;
     if s.emergency_hotkey.split('+').filter(|p| !p.trim().is_empty()).count() < 2 {
@@ -219,10 +271,22 @@ pub fn validate_settings(s: &HubSettings) -> Result<(), String> {
     if s.log_level.trim().is_empty() || s.log_level.len() > 200 {
         return Err("log level must be a tracing filter like \"info\" or \"debug\"".into());
     }
+    validate_networks(&s.allowed_networks)?;
+    validate_crossing_key(&s.crossing_key)?;
     Ok(())
 }
 
-async fn put_settings(State(hub): State<Arc<Hub>>, Json(s): Json<HubSettings>) -> Result<Json<HubSettings>, ApiError> {
+/// Normalises what the dashboard sends: trimmed, blank entries dropped.
+fn clean_networks(list: Vec<String>) -> Vec<String> {
+    list.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+async fn put_settings(
+    State(hub): State<Arc<Hub>>,
+    Json(mut s): Json<HubSettings>,
+) -> Result<Json<HubSettings>, ApiError> {
+    s.allowed_networks = clean_networks(s.allowed_networks);
+    s.crossing_key = s.crossing_key.trim().to_string();
     validate_settings(&s).map_err(ApiError::bad)?;
     let level_changed;
     {
@@ -231,6 +295,8 @@ async fn put_settings(State(hub): State<Arc<Hub>>, Json(s): Json<HubSettings>) -
         st.p.settings = s.clone();
         st.save();
         st.broadcast_settings();
+        // Peers carry each node's effective crossing key.
+        st.broadcast_peers();
     }
     if level_changed {
         if let Some(f) = hub.on_log_level.lock().expect("poisoned").as_ref() {
@@ -241,11 +307,23 @@ async fn put_settings(State(hub): State<Arc<Hub>>, Json(s): Json<HubSettings>) -
     Ok(Json(s))
 }
 
+/// Distinguishes a missing field (`None`) from an explicit `null`
+/// (`Some(None)`, = inherit the global setting).
+fn double_option<'de, T: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
+}
+
 #[derive(Deserialize)]
 struct NodePatch {
     name: Option<String>,
     enabled: Option<bool>,
     mouse_speed: Option<f32>,
+    /// `null` = inherit, list = own list (may be empty = no restriction).
+    #[serde(default, deserialize_with = "double_option")]
+    allowed_networks: Option<Option<Vec<String>>>,
+    /// `null` = inherit, string = own key ("" = none for this node).
+    #[serde(default, deserialize_with = "double_option")]
+    crossing_key: Option<Option<String>>,
 }
 
 async fn patch_node(
@@ -268,8 +346,23 @@ async fn patch_node(
             return Err(ApiError::bad("mouse speed must be 0.1–10"));
         }
     }
+    let networks = p.allowed_networks.map(|o| o.map(clean_networks));
+    if let Some(Some(list)) = &networks {
+        validate_networks(list).map_err(ApiError::bad)?;
+    }
+    let crossing = p.crossing_key.map(|o| o.map(|k| k.trim().to_string()));
+    if let Some(Some(k)) = &crossing {
+        validate_crossing_key(k).map_err(ApiError::bad)?;
+    }
     let node = NodeId(id);
     let n = st.p.nodes.get_mut(&id).ok_or_else(|| ApiError::not_found("no such node"))?;
+    let settings_changed = networks.is_some() || crossing.is_some();
+    if let Some(v) = networks {
+        n.allowed_networks = v;
+    }
+    if let Some(v) = crossing {
+        n.crossing_key = v;
+    }
     if let Some(name) = p.name {
         n.name = name.trim().to_string();
     }
@@ -288,6 +381,9 @@ async fn patch_node(
             st.send_to(node, FromHub::ReleaseControl);
         }
         st.broadcast_focus();
+    }
+    if settings_changed {
+        st.send_to(node, FromHub::Settings(st.settings_for(node)));
     }
     st.broadcast_peers();
     st.broadcast_layout();
@@ -369,5 +465,33 @@ mod tests {
         assert!(validate_settings(&s).is_err());
         s = HubSettings { probe_interval_ms: 10, ..Default::default() };
         assert!(validate_settings(&s).is_err());
+
+        // Allowed networks: CIDR syntax, IPv4 and IPv6.
+        s = HubSettings { allowed_networks: vec!["10.10.15.0/24".into(), "fd00::/8".into()], ..Default::default() };
+        assert!(validate_settings(&s).is_ok());
+        s.allowed_networks.push("10.10.15.0/33".into());
+        let e = validate_settings(&s).unwrap_err();
+        assert!(e.contains("10.10.15.0/33"), "{e}");
+        assert!(validate_networks(&vec!["10.0.0.1".to_string(); 65]).is_err());
+
+        // Crossing key: empty (none), one key, modifiers, combos.
+        for ok in ["", "Ctrl", "LeftCtrl", "Ctrl+Alt", "CapsLock", "ScrollLock", "F13", "q", "RightAlt"] {
+            assert!(validate_crossing_key(ok).is_ok(), "{ok}");
+        }
+        for bad in ["Hyper", "Ctrl+Nope", "x".repeat(101).as_str()] {
+            assert!(validate_crossing_key(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn node_patch_distinguishes_null_from_missing() {
+        let p: NodePatch = serde_json::from_str(r#"{"name":"pc"}"#).unwrap();
+        assert!(p.allowed_networks.is_none() && p.crossing_key.is_none());
+        let p: NodePatch = serde_json::from_str(r#"{"allowed_networks":null,"crossing_key":null}"#).unwrap();
+        assert_eq!(p.allowed_networks, Some(None));
+        assert_eq!(p.crossing_key, Some(None));
+        let p: NodePatch = serde_json::from_str(r#"{"allowed_networks":["10.0.0.0/8"],"crossing_key":""}"#).unwrap();
+        assert_eq!(p.allowed_networks, Some(Some(vec!["10.0.0.0/8".to_string()])));
+        assert_eq!(p.crossing_key, Some(Some(String::new())));
     }
 }
