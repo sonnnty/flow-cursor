@@ -183,6 +183,9 @@ impl Backend for WaylandBackend {
             let _ = i.send(InjCmd::Inject(*action));
         }
     }
+    fn keep_edges_stable(&self) -> bool {
+        true
+    }
     fn set_clipboard(&self, content: &ClipContent) {
         if self.portal_clip {
             if let Some(i) = &self.inj {

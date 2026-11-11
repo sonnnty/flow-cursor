@@ -12,6 +12,7 @@ use crate::backend::{monitor_at, Backend, EventRx, LocalEvent};
 use crate::config::{AgentConfig, AgentState};
 use crate::edge::EdgeGate;
 use crate::hub::{HubChannels, HubClient, HubEvent, HubRelay, Links};
+use crate::netcheck::{AddrSource, SystemAddrs, NET_CHECK_INTERVAL};
 use anyhow::{Context, Result};
 use flow_keymap::{parse_combo, Combo};
 use flow_layout::{LayoutExt, Move};
@@ -20,12 +21,13 @@ use flow_net::link::p2p::LinkReceiver;
 use flow_net::link::{serve_p2p, spawn_link, Action, LinkConfig, LinkStatus, PeerDirectory, PeerTarget};
 use flow_net::quinn::Endpoint;
 use flow_net::Identity;
+use flow_proto::net::{on_allowed_network, Cidr};
 use flow_proto::{
     AgentSettings, Button, ClipContent, Fingerprint, InputEvent, Layout, NodeId, PathKind, PathReport, PeerInfo, ToHub,
     ALPN_P2P,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -48,6 +50,11 @@ pub struct AgentStatus {
     pub settings: Option<AgentSettings>,
     pub layout_nodes: usize,
     pub online_peers: Vec<NodeId>,
+    /// Not on one of the allowed networks: no crossing, no being
+    /// controlled, no clipboard.
+    pub away: bool,
+    /// Interface addresses the away decision was made from.
+    pub local_addrs: Vec<IpAddr>,
 }
 
 pub struct AgentHandle {
@@ -104,6 +111,20 @@ impl AgentHandle {
     }
 }
 
+/// Optional parts of [`start_with`].
+pub struct StartOptions {
+    pub log_hook: Option<LogHook>,
+    /// Where the allowed-networks check reads this machine's addresses.
+    pub addrs: Arc<dyn AddrSource>,
+    pub net_check_interval: Duration,
+}
+
+impl Default for StartOptions {
+    fn default() -> Self {
+        StartOptions { log_hook: None, addrs: Arc::new(SystemAddrs), net_check_interval: NET_CHECK_INTERVAL }
+    }
+}
+
 /// Starts the agent with an already created backend.
 pub async fn start(
     cfg: AgentConfig,
@@ -111,6 +132,18 @@ pub async fn start(
     events: EventRx,
     log_hook: Option<LogHook>,
 ) -> Result<AgentHandle> {
+    start_with(cfg, backend, events, StartOptions { log_hook, ..Default::default() }).await
+}
+
+/// [`start`] with an injectable address source (tests simulate network
+/// changes with [`crate::netcheck::StaticAddrs`]).
+pub async fn start_with(
+    cfg: AgentConfig,
+    backend: Arc<dyn Backend>,
+    events: EventRx,
+    opts: StartOptions,
+) -> Result<AgentHandle> {
+    let StartOptions { log_hook, addrs, net_check_interval } = opts;
     let state_dir = cfg.state_dir();
     std::fs::create_dir_all(&state_dir).with_context(|| format!("creating {}", state_dir.display()))?;
     let host = hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "agent".into());
@@ -182,9 +215,14 @@ pub async fn start(
         log_hook,
         down_since: None,
         controllers: BTreeSet::new(),
+        addr_source: addrs,
+        allowed: Vec::new(),
+        away: false,
+        local_addrs: Vec::new(),
     };
     core.apply_settings(AgentSettings::default());
-    tasks.push(tokio::spawn(core.run(events, hub_ev_rx, act_rx)));
+    core.check_net();
+    tasks.push(tokio::spawn(core.run(events, hub_ev_rx, act_rx, net_check_interval)));
 
     Ok(AgentHandle { p2p_addr, fingerprint: identity.fingerprint, status, links, endpoint, tasks })
 }
@@ -225,6 +263,11 @@ struct Core {
     log_hook: Option<LogHook>,
     down_since: Option<Instant>,
     controllers: BTreeSet<NodeId>,
+    addr_source: Arc<dyn AddrSource>,
+    /// Parsed `settings.allowed_networks` (empty = no restriction).
+    allowed: Vec<Cidr>,
+    away: bool,
+    local_addrs: Vec<IpAddr>,
 }
 
 impl Core {
@@ -233,9 +276,12 @@ impl Core {
         mut events: EventRx,
         mut hub: mpsc::UnboundedReceiver<HubEvent>,
         mut actions: mpsc::UnboundedReceiver<(NodeId, Action)>,
+        net_check_interval: Duration,
     ) {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         let mut report = tokio::time::interval(Duration::from_secs(2));
+        let mut net = tokio::time::interval(net_check_interval);
+        net.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 Some(ev) = events.recv() => self.on_local(ev),
@@ -243,6 +289,7 @@ impl Core {
                 Some((from, a)) = actions.recv() => self.on_action(from, a),
                 _ = tick.tick() => self.on_tick(),
                 _ = report.tick() => self.report_paths(),
+                _ = net.tick() => self.check_net(),
                 else => break,
             }
         }
@@ -255,7 +302,8 @@ impl Core {
         };
         let me = self.me;
         let online: Vec<NodeId> = {
-            let mut v: Vec<NodeId> = self.peers.values().filter(|p| p.online && p.enabled).map(|p| p.id).collect();
+            let mut v: Vec<NodeId> =
+                self.peers.values().filter(|p| p.online && p.enabled && !p.away).map(|p| p.id).collect();
             v.sort();
             v
         };
@@ -266,6 +314,8 @@ impl Core {
             s.settings = Some(self.settings.clone());
             s.layout_nodes = self.layout.nodes.len();
             s.online_peers = online;
+            s.away = self.away;
+            s.local_addrs = self.local_addrs.clone();
         });
     }
 
@@ -289,6 +339,8 @@ impl Core {
                 if let Mode::Remote { target, .. } = self.mode {
                     let _ = self.to_hub.send(ToHub::FocusChanged { target: Some(target) });
                 }
+                // The hub starts every connection as "not away".
+                self.send_net_status();
                 self.report_paths();
             }
             HubEvent::Disconnected => {
@@ -326,6 +378,10 @@ impl Core {
             }
             HubEvent::Rejected(r) => self.status.send_modify(|s| s.rejected = Some(r)),
             HubEvent::Clipboard { from, content } => {
+                if self.away {
+                    debug!(?from, "clipboard from hub ignored (away)");
+                    return;
+                }
                 if !content.allowed_by(&self.settings.clipboard) {
                     debug!(?from, ?content, "clipboard from hub ignored (settings)");
                     return;
@@ -359,15 +415,79 @@ impl Core {
                 h(&s.log_level);
             }
         }
+        // The hub validates the list; skip (and report) anything odd rather
+        // than locking the machine out.
+        self.allowed = s
+            .allowed_networks
+            .iter()
+            .filter(|n| !n.trim().is_empty())
+            .filter_map(|n| Cidr::parse(n).map_err(|e| warn!("ignoring allowed network: {e}")).ok())
+            .collect();
+        let networks_changed = s.allowed_networks != self.settings.allowed_networks;
         self.settings = s;
+        if networks_changed {
+            self.check_net();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // allowed networks
+    // ------------------------------------------------------------------
+
+    /// Re-reads the interface addresses and enters or leaves away mode.
+    fn check_net(&mut self) {
+        let mut addrs = self.addr_source.addrs();
+        addrs.sort();
+        addrs.dedup();
+        let away = !on_allowed_network(&self.allowed, &addrs);
+        let changed = away != self.away || addrs != self.local_addrs;
+        self.local_addrs = addrs;
+        if away != self.away {
+            self.away = away;
+            if away {
+                warn!(addrs = ?self.local_addrs, allowed = ?self.settings.allowed_networks,
+                    "not on an allowed network: sharing is paused (away)");
+                self.go_away();
+            } else {
+                info!(addrs = ?self.local_addrs, "back on an allowed network: sharing resumed");
+                self.update_dir();
+                self.refresh_edges();
+            }
+        }
+        if changed {
+            self.send_net_status();
+            self.publish();
+        }
+    }
+
+    fn send_net_status(&self) {
+        let _ = self.to_hub.send(ToHub::NetStatus { away: self.away, addrs: self.local_addrs.clone() });
+    }
+
+    /// Stops all sharing, like a disconnect: control returns to this
+    /// machine (held keys released on the target), whatever controllers
+    /// hold here is released, peers can no longer connect directly.
+    fn go_away(&mut self) {
+        self.leave_remote(None);
+        self.receiver.release_everything();
+        self.update_dir();
+        self.refresh_edges();
+    }
+
+    /// Who may connect to us directly: enabled peers, nobody while away.
+    fn update_dir(&self) {
+        if self.away {
+            self.dir.set(std::iter::empty());
+        } else {
+            self.dir.set(self.peers.values().filter(|p| p.enabled).map(|p| (p.fingerprint, p.id)));
+        }
     }
 
     fn set_peers(&mut self, list: Vec<PeerInfo>) {
         let me = self.me;
         let old: HashSet<NodeId> = self.peers.keys().copied().collect();
         self.peers = list.into_iter().filter(|p| Some(p.id) != me).map(|p| (p.id, p)).collect();
-        // Who may connect to us directly.
-        self.dir.set(self.peers.values().filter(|p| p.enabled).map(|p| (p.fingerprint, p.id)));
+        self.update_dir();
         // Release anything held by sources that disappeared or were disabled.
         for id in old {
             if !self.peers.get(&id).is_some_and(|p| p.enabled) {
@@ -404,16 +524,18 @@ impl Core {
         }
         drop(links);
         if let Mode::Remote { target, .. } = self.mode {
-            if !self.peers.get(&target).is_some_and(|p| p.online && p.enabled) {
-                info!(%target, "target went offline or was disabled, returning control");
+            if !self.peers.get(&target).is_some_and(|p| p.online && p.enabled && !p.away) {
+                info!(%target, "target went offline, away or was disabled, returning control");
                 self.leave_remote(None);
             }
         }
         self.refresh_edges();
     }
 
+    /// Edges lead to `id` only when it is online, enabled, not away and
+    /// can inject (an away peer is skipped like an offline one).
     fn reachable(&self, id: NodeId) -> bool {
-        self.peers.get(&id).is_some_and(|p| p.online && p.enabled && p.caps.inject)
+        self.peers.get(&id).is_some_and(|p| p.online && p.enabled && !p.away && p.caps.inject)
     }
 
     fn refresh_edges(&self) {
@@ -421,6 +543,11 @@ impl Core {
             self.backend.set_edges(Vec::new());
             return;
         };
+        if self.away && !self.backend.keep_edges_stable() {
+            // Away: no edges at all, nothing to cross.
+            self.backend.set_edges(Vec::new());
+            return;
+        }
         // All layout edges, also those to offline machines: crossing is
         // refused at hit time. Keeping the set stable matters on Wayland,
         // where changing pointer barriers recreates the capture session.
@@ -488,6 +615,10 @@ impl Core {
     }
 
     fn on_local_clipboard(&mut self, c: ClipContent) {
+        if self.away {
+            debug!("local clipboard change not synced (away)");
+            return;
+        }
         let h = c.hash64();
         if Some(h) == self.last_clip_hash {
             return;
@@ -512,6 +643,9 @@ impl Core {
             return;
         }
         let deny = |b: &Arc<dyn Backend>| b.end_capture(None);
+        if self.away {
+            return deny(&self.backend);
+        }
         let Some(me) = self.me else { return deny(&self.backend) };
         let Some((to, ex, ey)) = self.layout.crossing_local(me, x as f64, y as f64, side) else {
             return deny(&self.backend);
@@ -619,6 +753,13 @@ impl Core {
     // ------------------------------------------------------------------
 
     fn on_action(&mut self, from: NodeId, a: Action) {
+        // Away: nothing is injected except releases (those from going away
+        // and from sources that have not heard about it yet).
+        let release = matches!(a, Action::Left | Action::Key { down: false, .. } | Action::Button { down: false, .. });
+        if self.away && !release {
+            debug!(source = %from, ?a, "input from a controlling machine dropped (away)");
+            return;
+        }
         match a {
             Action::Entered { .. } => {
                 self.controllers.insert(from);

@@ -39,6 +39,7 @@ axum = "0.8"
 hostname = "0.4"
 directories = "6"
 png = "0.17"
+if-addrs = "0.15"
 
 [profile.release]
 opt-level = 3

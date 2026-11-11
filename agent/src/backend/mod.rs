@@ -74,6 +74,13 @@ pub trait Backend: Send + Sync + 'static {
     /// Inject an action received from a controlling machine.
     fn inject(&self, action: &Action);
     fn set_clipboard(&self, content: &ClipContent);
+    /// True when changing the edges is expensive (Wayland: new barriers
+    /// recreate the capture session and may ask for permission again).
+    /// The core then keeps the edges and refuses crossings at hit time
+    /// instead of clearing them (e.g. while away).
+    fn keep_edges_stable(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
