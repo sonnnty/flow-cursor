@@ -77,8 +77,14 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
     let (tx, rx) = mpsc::unbounded_channel();
     let monitors = Arc::new(Mutex::new(Vec::new()));
 
+    // The two portal sessions are independent: refusing or losing one
+    // leaves the other working.
     let (inj, portal_clip) = match start_injector(opts.state_dir.clone(), tx.clone()).await {
         Ok((s, clip)) => (Some(s), clip),
+        Err(e) if is_refusal(&e) => {
+            warn!("{RD_REFUSED}");
+            (None, false)
+        }
         Err(e) => {
             warn!("RemoteDesktop portal unavailable, this machine cannot be controlled: {e:#}");
             (None, false)
@@ -86,6 +92,10 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
     };
     let cap = match start_capture(tx.clone(), monitors.clone()).await {
         Ok(s) => Some(s),
+        Err(e) if is_refusal(&e) => {
+            warn!("{IC_REFUSED}");
+            None
+        }
         Err(e) => {
             warn!(
                 "InputCapture portal unavailable ({e:#}); this machine can be controlled but cannot control others. \
@@ -219,34 +229,144 @@ where
     rx
 }
 
+/// A private session bus connection for one portal session.
+///
+/// ashpd's `Portal::new()` constructors share one cached connection, and
+/// zbus runs a connection's socket tasks on the tokio runtime that is
+/// current when it is built. With one runtime per portal thread, the
+/// connection would die with whichever thread happened to create it
+/// first (e.g. the injector thread after the user cancels the
+/// RemoteDesktop dialog) and leave the other session with a dead
+/// connection. Each session therefore builds its own connection on its
+/// own thread, which lives as long as the session can be re-created.
+async fn session_bus() -> Result<ashpd::zbus::Connection> {
+    ashpd::zbus::Connection::session().await.context("connecting to the D-Bus session bus")
+}
+
+/// Why an injection session ended.
+#[derive(Debug, PartialEq)]
+enum InjEnd {
+    /// The backend was dropped.
+    Quit,
+    /// The EI connection or the portal session went away.
+    Lost,
+}
+
 async fn start_injector(state_dir: PathBuf, tx: EventTx) -> Result<(mpsc::UnboundedSender<InjCmd>, bool)> {
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     let ready = spawn_portal_thread("portal-inject", move |ready| async move {
-        match setup_injector(&state_dir).await {
-            Ok((rd, session, clipboard, eis)) => {
-                let _ = ready.send(Ok(clipboard.is_some()));
-                match eis {
-                    Some((ctx, conn, events)) => {
-                        run_ei_sender(ctx, conn, events, cmd_rx, rd, session, clipboard, tx).await
-                    }
-                    None => run_dbus_injector(rd, session, cmd_rx, clipboard, tx).await,
+        keep_injecting(
+            ready,
+            &mut cmd_rx,
+            async || {
+                let parts = setup_injector(&state_dir).await?;
+                let clip = parts.2.is_some();
+                Ok((parts, clip))
+            },
+            async |(rd, session, clipboard, eis): InjParts, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| match eis {
+                Some((ctx, conn, events)) => {
+                    run_ei_sender(ctx, conn, events, cmds, rd, session, clipboard, tx.clone()).await
                 }
-            }
-            Err(e) => {
-                let _ = ready.send(Err(e));
-            }
-        }
+                None => run_dbus_injector(rd, session, cmds).await,
+            },
+        )
+        .await
     });
     let clip_on = ready.await.map_err(|_| anyhow!("portal thread died"))??;
     Ok((cmd_tx, clip_on))
 }
 
-type EiParts = (ei::Context, reis::event::Connection, reis::tokio::EiConvertEventStream);
+/// Runs injection sessions until the backend is dropped. The result of the
+/// first `setup` (with whether the portal clipboard is on) goes to `ready`;
+/// if it fails, nothing is retried (`create` reports it). A session that
+/// is lost later (EI disconnect, portal gone) is re-created with backoff;
+/// a refused dialog at that point stops injection.
+async fn keep_injecting<S>(
+    ready: tokio::sync::oneshot::Sender<Result<bool>>,
+    cmds: &mut mpsc::UnboundedReceiver<InjCmd>,
+    mut setup: impl AsyncFnMut() -> Result<(S, bool)>,
+    mut run: impl AsyncFnMut(S, &mut mpsc::UnboundedReceiver<InjCmd>) -> InjEnd,
+) {
+    let mut ready = Some(ready);
+    let mut backoff = Backoff::default();
+    loop {
+        let started = Instant::now();
+        let end = match setup().await {
+            Ok((session, clip)) => {
+                match ready.take() {
+                    Some(r) => {
+                        let _ = r.send(Ok(clip));
+                    }
+                    None => {
+                        info!("remote control session re-created");
+                        // Queued while a dialog was open: stale by now.
+                        if drop_stale(cmds) {
+                            return;
+                        }
+                    }
+                }
+                run(session, cmds).await
+            }
+            Err(e) => {
+                if let Some(r) = ready.take() {
+                    let _ = r.send(Err(e));
+                    return;
+                }
+                if is_refusal(&e) {
+                    warn!("{RD_REFUSED} (asked again after the session was lost)");
+                    return;
+                }
+                warn!("re-creating the remote control session failed: {e:#}");
+                InjEnd::Lost
+            }
+        };
+        if end == InjEnd::Quit {
+            return;
+        }
+        if started.elapsed() > RETRY_MAX {
+            backoff.reset();
+        }
+        let delay = backoff.next();
+        warn!(?delay, "remote control session lost; re-creating it");
+        // Input for this machine that arrives meanwhile would be stale by
+        // the time a new session is up: drop it.
+        let until = tokio::time::sleep(delay);
+        tokio::pin!(until);
+        loop {
+            tokio::select! {
+                _ = &mut until => break,
+                cmd = cmds.recv() => if cmd.is_none() { return },
+            }
+        }
+    }
+}
 
-async fn setup_injector(
-    state_dir: &std::path::Path,
-) -> Result<(RemoteDesktop, Session<RemoteDesktop>, Option<Clipboard>, Option<EiParts>)> {
-    let rd = RemoteDesktop::new().await.context("RemoteDesktop portal")?;
+/// Drops the queued commands; true when the backend is gone.
+fn drop_stale(cmds: &mut mpsc::UnboundedReceiver<InjCmd>) -> bool {
+    loop {
+        match cmds.try_recv() {
+            Ok(_) => {}
+            Err(mpsc::error::TryRecvError::Empty) => return false,
+            Err(mpsc::error::TryRecvError::Disconnected) => return true,
+        }
+    }
+}
+
+const RD_REFUSED: &str = "remote control permission (RemoteDesktop portal) was refused in the GNOME dialog: other \
+                          machines cannot control this one until flow-agent is restarted; controlling them from \
+                          here still works";
+const IC_REFUSED: &str = "input capture permission (InputCapture portal) was refused in the GNOME dialog: this \
+                          machine cannot control other machines until flow-agent is restarted; it can still be \
+                          controlled";
+
+type EiParts = (ei::Context, reis::event::Connection, reis::tokio::EiConvertEventStream);
+type InjParts = (RemoteDesktop, Session<RemoteDesktop>, Option<Clipboard>, Option<EiParts>);
+
+async fn setup_injector(state_dir: &std::path::Path) -> Result<InjParts> {
+    let bus = session_bus().await?;
+    // The clipboard must use the same connection: the portal ties the
+    // session to the caller's bus name.
+    let rd = RemoteDesktop::with_connection(bus.clone()).await.context("RemoteDesktop portal")?;
     let session = rd.create_session(Default::default()).await.context("creating RemoteDesktop session")?;
     let token = load_portal_token(state_dir, RD_TOKEN);
     rd.select_devices(
@@ -259,7 +379,7 @@ async fn setup_injector(
     .await
     .context("selecting devices")?;
     // The clipboard must be requested before Start.
-    let clipboard = match Clipboard::new().await {
+    let clipboard = match Clipboard::with_connection(bus).await {
         Ok(c) => match c.request(&session, Default::default()).await {
             Ok(()) => Some(c),
             Err(e) => {
@@ -333,12 +453,12 @@ async fn run_ei_sender(
     ctx: ei::Context,
     conn: reis::event::Connection,
     mut events: reis::tokio::EiConvertEventStream,
-    mut cmds: mpsc::UnboundedReceiver<InjCmd>,
+    cmds: &mut mpsc::UnboundedReceiver<InjCmd>,
     _rd: RemoteDesktop,
     session: Session<RemoteDesktop>,
     clipboard: Option<Clipboard>,
     tx: EventTx,
-) {
+) -> InjEnd {
     let mut devs = EiDevices::default();
     let mut sequence = 1u32;
     let mut last_abs: Option<(f32, f32)> = None;
@@ -351,7 +471,7 @@ async fn run_ei_sender(
         ),
         None => (None, None),
     };
-    loop {
+    let end = loop {
         tokio::select! {
             ev = events.next() => match ev {
                 Some(Ok(ev)) => match ev {
@@ -382,18 +502,21 @@ async fn run_ei_sender(
                     }
                     EiEvent::Disconnected(d) => {
                         warn!("EI injection connection closed: {:?}", d.reason);
-                        return;
+                        break InjEnd::Lost;
                     }
                     _ => {}
                 },
                 Some(Err(e)) => {
                     warn!("EI injection error: {e:?}");
-                    return;
+                    break InjEnd::Lost;
                 }
-                None => return,
+                None => {
+                    warn!("EI injection connection closed");
+                    break InjEnd::Lost;
+                }
             },
             cmd = cmds.recv() => match cmd {
-                None => return,
+                None => break InjEnd::Quit,
                 Some(InjCmd::Inject(a)) => {
                     ei_inject(&devs, &conn, a, &mut last_abs);
                     let _ = ctx.flush();
@@ -405,13 +528,19 @@ async fn run_ei_sender(
                             ClipContent::Image { .. } => vec![PNG_MIME],
                         };
                         owned = Some(c);
-                        if let Err(e) = cs.set_selection(&session, SetSelectionOptions::default().set_mime_types(&mimes)).await {
-                            warn!("setting the clipboard failed: {e}");
+                        let set = cs.set_selection(&session, SetSelectionOptions::default().set_mime_types(&mimes));
+                        if let Err(e) = bounded("Clipboard.SetSelection", set).await {
+                            warn!("setting the clipboard failed: {e:#}");
                         }
                     }
                 }
             },
-            Some((_s, change)) = async { match owner_changes.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => {
+            change = next_or_pending(&mut owner_changes) => {
+                let Some((_s, change)) = change else {
+                    // Not polled again once ended.
+                    owner_changes = None;
+                    continue;
+                };
                 if change.session_is_owner() == Some(true) {
                     continue;
                 }
@@ -423,7 +552,7 @@ async fn run_ei_sender(
                     TEXT_MIMES.iter().find(|t| mimes.iter().any(|m| m == *t)).map(|s| s.to_string())
                 };
                 if let Some(mime) = pick {
-                    match cs.selection_read(&session, &mime).await {
+                    match bounded("Clipboard.SelectionRead", cs.selection_read(&session, &mime)).await {
                         Ok(fd) => {
                             let tx = tx.clone();
                             tokio::task::spawn_blocking(move || {
@@ -444,23 +573,39 @@ async fn run_ei_sender(
                     }
                 }
             }
-            Some((_s, mime, serial)) = async { match transfers.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => {
+            transfer = next_or_pending(&mut transfers) => {
+                let Some((_s, mime, serial)) = transfer else {
+                    transfers = None;
+                    continue;
+                };
                 let Some(cs) = &clip else { continue };
                 let data: Option<Vec<u8>> = match &owned {
                     Some(ClipContent::Text(t)) if TEXT_MIMES.contains(&mime.as_str()) => Some(t.as_bytes().to_vec()),
                     Some(ClipContent::Image { png }) if mime == PNG_MIME => Some(png.clone()),
                     _ => None,
                 };
-                let ok = match (data, cs.selection_write(&session, serial).await) {
-                    (Some(d), Ok(fd)) => tokio::task::spawn_blocking(move || {
+                let ok = match (data, bounded("Clipboard.SelectionWrite", cs.selection_write(&session, serial)).await) {
+                    // A reader that never drains the pipe must not park this
+                    // loop: stop waiting (the blocking write is abandoned).
+                    (Some(d), Ok(fd)) => bounded("clipboard write", tokio::task::spawn_blocking(move || {
                         use std::io::Write;
                         std::fs::File::from(std::os::fd::OwnedFd::from(fd)).write_all(&d).is_ok()
-                    }).await.unwrap_or(false),
+                    })).await.unwrap_or(false),
                     _ => false,
                 };
-                let _ = cs.selection_write_done(&session, serial, ok).await;
+                let _ = bounded("Clipboard.SelectionWriteDone", cs.selection_write_done(&session, serial, ok)).await;
             }
         }
+    };
+    let _ = bounded("Session.Close", session.close()).await;
+    end
+}
+
+/// Next item of an optional stream; never resolves without a stream.
+async fn next_or_pending<S: futures_util::Stream + Unpin>(s: &mut Option<S>) -> Option<S::Item> {
+    match s {
+        Some(s) => s.next().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -512,13 +657,13 @@ fn ei_inject(devs: &EiDevices, conn: &reis::event::Connection, a: Action, last_a
     }
 }
 
+/// Injection through the RemoteDesktop `Notify*` D-Bus calls, for portals
+/// without ConnectToEIS. Runs until the backend is dropped.
 async fn run_dbus_injector(
     rd: RemoteDesktop,
     session: Session<RemoteDesktop>,
-    mut cmds: mpsc::UnboundedReceiver<InjCmd>,
-    _clipboard: Option<Clipboard>,
-    _tx: EventTx,
-) {
+    cmds: &mut mpsc::UnboundedReceiver<InjCmd>,
+) -> InjEnd {
     // Without a screencast stream only relative motion is available.
     let mut last: Option<(i32, i32)> = None;
     while let Some(c) = cmds.recv().await {
@@ -567,6 +712,7 @@ async fn run_dbus_injector(
             debug!("RemoteDesktop notify failed: {e}");
         }
     }
+    InjEnd::Quit
 }
 
 // ---------------------------------------------------------------------------
@@ -718,7 +864,8 @@ impl PortalCapture {
 impl CapturePortal for PortalCapture {
     async fn open(&mut self) -> Result<Vec<Monitor>> {
         self.close().await;
-        let ic = InputCapture::new().await.context("InputCapture portal")?;
+        // A new connection per session, see `session_bus`.
+        let ic = InputCapture::with_connection(session_bus().await?).await.context("InputCapture portal")?;
         // Subscribe before creating the session so no signal is missed.
         let activated = portal_signal(&ic, "Activated").await?;
         let deactivated = portal_signal(&ic, "Deactivated").await?;
@@ -1084,10 +1231,7 @@ impl<P: CapturePortal> Capture<P> {
 
     fn open_failed(&mut self, e: anyhow::Error, what: &str) {
         if is_refusal(&e) {
-            warn!(
-                "input capture permission refused in the GNOME dialog: this machine cannot control other machines \
-                 until flow-agent is restarted (it can still be controlled)"
-            );
+            warn!("{IC_REFUSED}");
         } else {
             warn!("{what}: {e:#}");
             self.schedule_retry();
@@ -1266,11 +1410,194 @@ mod tests {
         tokio::task::LocalSet::new().run_until(f).await
     }
 
+    /// Drives [`keep_injecting`] with fake sessions: `setup` takes the
+    /// next outcome from `outcomes`, a session logs what it injects and is
+    /// "lost" when it receives `Action::Left`.
+    struct InjRig {
+        cmds: mpsc::UnboundedSender<InjCmd>,
+        outcomes: mpsc::UnboundedSender<Result<u32>>,
+        injected: Arc<Mutex<Vec<(u32, Action)>>>,
+        setups: Arc<Mutex<u32>>,
+        done: tokio::task::JoinHandle<()>,
+        ready: tokio::sync::oneshot::Receiver<Result<bool>>,
+    }
+
+    fn start_injecting() -> InjRig {
+        let (cmds, mut cmds_rx) = mpsc::unbounded_channel();
+        let (outcomes, outcomes_rx) = mpsc::unbounded_channel::<Result<u32>>();
+        let (ready_tx, ready) = tokio::sync::oneshot::channel();
+        let injected = Arc::new(Mutex::new(Vec::new()));
+        let setups = Arc::new(Mutex::new(0));
+        let (inj, n) = (injected.clone(), setups.clone());
+        let done = tokio::task::spawn_local(async move {
+            let mut outcomes_rx = outcomes_rx;
+            keep_injecting(
+                ready_tx,
+                &mut cmds_rx,
+                async || {
+                    *n.lock().unwrap() += 1;
+                    let r = outcomes_rx.recv().await.unwrap_or_else(|| Err(anyhow!("portal gone")));
+                    r.map(|id| (id, true))
+                },
+                async |id: u32, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| loop {
+                    match cmds.recv().await {
+                        None => return InjEnd::Quit,
+                        Some(InjCmd::Inject(Action::Left)) => return InjEnd::Lost,
+                        Some(InjCmd::Inject(a)) => inj.lock().unwrap().push((id, a)),
+                        Some(InjCmd::SetClipboard(_)) => {}
+                    }
+                },
+            )
+            .await
+        });
+        InjRig { cmds, outcomes, injected, setups, done, ready }
+    }
+
+    fn key(usage: u32) -> InjCmd {
+        InjCmd::Inject(Action::Key { usage, down: true })
+    }
+
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn injection_session_is_recreated_after_an_ei_disconnect() {
+        local(async {
+            let mut rig = start_injecting();
+            rig.outcomes.send(Ok(1)).unwrap();
+            assert!((&mut rig.ready).await.unwrap().unwrap());
+            rig.cmds.send(key(4)).unwrap();
+            settle().await;
+            // EI disconnect.
+            rig.cmds.send(InjCmd::Inject(Action::Left)).unwrap();
+            settle().await;
+            // Input during the outage is dropped, not replayed later.
+            rig.cmds.send(key(5)).unwrap();
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 1);
+            // The first re-creation fails (portal restarting), the next
+            // one works.
+            rig.outcomes.send(Err(anyhow!("no portal"))).unwrap();
+            tokio::time::sleep(RETRY_MIN).await;
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 2);
+            rig.outcomes.send(Ok(2)).unwrap();
+            tokio::time::sleep(RETRY_MIN * 2).await;
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 3);
+            rig.cmds.send(key(6)).unwrap();
+            settle().await;
+            assert_eq!(
+                *rig.injected.lock().unwrap(),
+                [(1, Action::Key { usage: 4, down: true }), (2, Action::Key { usage: 6, down: true })]
+            );
+            // Dropping the backend ends the thread.
+            drop(rig.cmds);
+            rig.done.await.unwrap();
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn injection_stops_when_the_dialog_is_refused_on_recreation() {
+        local(async {
+            let mut rig = start_injecting();
+            rig.outcomes.send(Ok(1)).unwrap();
+            assert!((&mut rig.ready).await.unwrap().unwrap());
+            rig.cmds.send(InjCmd::Inject(Action::Left)).unwrap();
+            rig.outcomes.send(Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled).into())).unwrap();
+            tokio::time::sleep(RETRY_MIN * 2).await;
+            settle().await;
+            assert!(rig.done.is_finished());
+            assert_eq!(*rig.setups.lock().unwrap(), 2);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_injection_failure_is_reported_and_not_retried() {
+        local(async {
+            let mut rig = start_injecting();
+            rig.outcomes.send(Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled).into())).unwrap();
+            let e = (&mut rig.ready).await.unwrap().unwrap_err();
+            assert!(is_refusal(&e));
+            settle().await;
+            assert!(rig.done.is_finished());
+        })
+        .await
+    }
+
+    /// The premise of [`session_bus`], on a private bus: a zbus connection
+    /// dies with the portal thread whose runtime created it, while a
+    /// connection that another portal thread created for itself keeps
+    /// working after that thread is gone. Skipped without `dbus-daemon`.
+    #[test]
+    fn bus_connection_belongs_to_the_portal_thread_that_built_it() {
+        let Ok(mut daemon) = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("dbus-daemon not available, skipping");
+            return;
+        };
+        let mut addr = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(daemon.stdout.take().unwrap()), &mut addr).unwrap();
+        let addr = addr.trim().to_string();
+        let connect = {
+            let addr = addr.clone();
+            move || {
+                let addr = addr.clone();
+                async move {
+                    ashpd::zbus::connection::Builder::address(addr.as_str()).build().await.map_err(anyhow::Error::from)
+                }
+            }
+        };
+        let get_id = |c: ashpd::zbus::Connection| async move {
+            let p = ashpd::zbus::fdo::DBusProxy::new(&c).await?;
+            tokio::time::timeout(Duration::from_secs(2), p.get_id()).await?.map_err(anyhow::Error::from)
+        };
+        let block = |rx: tokio::sync::oneshot::Receiver<Result<ashpd::zbus::Connection>>| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(rx).unwrap()
+        };
+
+        // Thread A builds a connection and exits, like the injector thread
+        // after a refused dialog.
+        let c = connect.clone();
+        let from_a = block(spawn_portal_thread("bus-a", move |ready| async move {
+            let _ = ready.send(c().await);
+        }))
+        .unwrap();
+        // Thread B keeps running and uses its own connection, and A's.
+        let c = connect.clone();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let ready = spawn_portal_thread("bus-b", move |ready| async move {
+            let own = c().await;
+            let _ = ready.send(Ok(()));
+            let own = match own {
+                Ok(own) => get_id(own).await,
+                Err(e) => Err(e),
+            };
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = res_tx.send((own.is_ok(), get_id(from_a).await.is_ok()));
+        });
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(ready).unwrap().unwrap();
+        let (own_ok, shared_ok) = res_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        assert!(own_ok, "a connection built on the running portal thread must work");
+        assert!(!shared_ok, "zbus changed: a connection outlives the runtime that built it");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn capture_ends_and_session_is_recreated_when_the_ei_stream_closes() {
         local(async {
             let (mut rig, first) = Rig::start();
             rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
             first.send(activated()).unwrap();
             assert_eq!(rig.next().await, LocalEvent::EdgeHit { side: Side::Right, x: 1920, y: 500 });
             first.send(CapEvent::Input(LocalEvent::Motion { dx: 1.0, dy: 0.0 })).unwrap();
@@ -1358,6 +1685,7 @@ mod tests {
         local(async {
             let (mut rig, first) = Rig::start();
             rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
             first.send(activated()).unwrap();
             assert!(matches!(rig.next().await, LocalEvent::EdgeHit { .. }));
             first.send(CapEvent::Disabled).unwrap();
