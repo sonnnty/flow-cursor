@@ -2,12 +2,12 @@
 
 use flow_itest::*;
 use flow_net::endpoint::{client_config, TransportOpts, SNI};
-use flow_net::frame::{read_frame, write_frame};
+use flow_net::frame::{read_frame, write_frame, write_raw};
 use flow_net::tls::ServerPin;
 use flow_net::Identity;
 use flow_proto::{
-    FromHub, Hello, LinkMsg, OsKind, RelayUp, StreamKind, ToHub, ALPN_HUB, ALPN_P2P, MAX_CONTROL_FRAME,
-    PROTOCOL_VERSION,
+    FromHub, Hello, LinkDatagram, LinkMsg, OsKind, RelayDatagramDown, RelayDatagramUp, RelayDown, RelayUp, ToHub,
+    ALPN_HUB, ALPN_P2P, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
 };
 use std::time::Duration;
 
@@ -147,58 +147,100 @@ async fn p2p_dial_rejects_wrong_server_fingerprint() {
     hub.shutdown().await;
 }
 
+/// Waits a little for anything else on `rx` and returns it.
+async fn rest<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> Vec<T> {
+    let mut out = Vec::new();
+    while let Ok(Some(x)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+        out.push(x);
+    }
+    out
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_stamps_authenticated_sender_identity() {
     init_logs();
     let hub = start_hub().await;
     let token = hub.join_token();
+    let a = RawNode::join(&hub, &token, "agent-a").await;
+    let b = RawNode::join(&hub, &token, "agent-b").await;
+    let c = RawNode::join(&hub, &token, "agent-c").await;
+    let (ida, idb, idc) = (a.id, b.id, c.id);
+    assert!(ida != idb && idb != idc && ida != idc);
+    let (_a_send, mut at_a) = a.relay().await;
+    let (_b_send, mut at_b) = b.relay().await;
+    let mut dg_at_a = a.datagrams();
+    let mut dg_at_b = b.datagrams();
+    let (mut c_send, _at_c) = c.relay().await;
+    let probe = |to| RelayUp { to, msg: LinkMsg::Ack { session: 0, upto: 0 } };
+    assert_eq!(relay_probe(&mut c_send, &probe(ida), &mut at_a).await.from, idc);
+    assert_eq!(relay_probe(&mut c_send, &probe(idb), &mut at_b).await.from, idc);
 
-    let a = start_agent(&hub, AgentSpec::new(&token)).await;
-    let b = start_agent(&hub, AgentSpec::new(&token)).await;
-    assert!(a.agent.wait(T, |s| s.connected && s.node_id.is_some()).await);
-    assert!(b.agent.wait(T, |s| s.connected && s.node_id.is_some()).await);
-
-    let ida = a.agent.status().node_id.unwrap();
-    let _idb = b.agent.status().node_id.unwrap();
-
-    // Connect an agent C directly to the hub to test raw relay frames
-    let id_c = Identity::generate("c").unwrap();
-    let cc_c = client_config(&id_c, ALPN_HUB, ServerPin::Exact(hub.fingerprint()), TransportOpts::HUB).unwrap();
-    let ep_c = flow_net::endpoint::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
-    let conn_c = ep_c.connect_with(cc_c, hub.quic_addr, SNI).unwrap().await.unwrap();
-    let (mut ctl_s, mut ctl_r) = conn_c.open_bi().await.unwrap();
-
-    let hello_c = Hello {
-        protocol_version: PROTOCOL_VERSION,
-        agent_version: "0.1.0".into(),
-        hostname: "agent-c".into(),
-        os: OsKind::Linux,
-        join_token: Some(token),
-        p2p_port: 0,
-        p2p_addrs: vec![],
-        monitors: monitor(1920, 1080),
-        caps: flow_proto::Capabilities { capture: true, inject: true, clipboard: true },
-    };
-    write_frame(&mut ctl_s, &ToHub::Hello(hello_c)).await.unwrap();
-    let welcome_c = match read_frame::<_, FromHub>(&mut ctl_r, MAX_CONTROL_FRAME).await.unwrap() {
-        Some(FromHub::Welcome(w)) => w,
-        other => panic!("expected welcome, got {other:?}"),
-    };
-    let idc = welcome_c.node_id;
-
-    // Open relay stream on C
-    let (mut relay_s, _relay_r) = conn_c.open_bi().await.unwrap();
-    write_frame(&mut relay_s, &StreamKind::Relay).await.unwrap();
-
-    // C sends a RelayUp message to A
+    // A relayed frame from C reaches A stamped with C's authenticated id.
     let msg = LinkMsg::Ack { session: 1234, upto: 10 };
-    write_frame(&mut relay_s, &RelayUp { to: ida, msg: msg.clone() }).await.unwrap();
+    write_frame(&mut c_send, &RelayUp { to: ida, msg: msg.clone() }).await.unwrap();
+    let got = loop {
+        let d = tokio::time::timeout(T, at_a.recv()).await.expect("relay frame reaches A").unwrap();
+        if d.msg != probe(ida).msg {
+            break d;
+        }
+    };
+    assert_eq!(got, RelayDown { from: idc, msg });
 
-    // Verify: C's relay message received by A is stamped with from: idc (authenticated ID of C)
-    // The hub does not allow C to forge from: idb or any other node.
-    let (code, state_json) = http(hub.http_addr.unwrap(), "GET", "/api/state", Some(ADMIN), None).await;
-    assert_eq!(code, 200);
-    assert!(state_json.contains(&format!("\"id\":{}", idc.0)));
+    // Forgery 1: C sends a hub→agent frame claiming to come from B. RelayUp
+    // has no sender field, so the hub reads B's id as the destination and
+    // still stamps the frame with C's id.
+    let forged = LinkMsg::Ack { session: 666, upto: 1 };
+    write_raw(&mut c_send, &flow_proto::encode(&RelayDown { from: idb, msg: forged.clone() })).await.unwrap();
+    let got = tokio::time::timeout(T, async {
+        loop {
+            let d = at_b.recv().await.unwrap();
+            if d.msg == forged {
+                return d;
+            }
+        }
+    })
+    .await
+    .expect("the forged frame is routed as a plain RelayUp to B");
+    assert_eq!(got.from, idc, "the hub must stamp the connection's identity, not the payload's");
+
+    // Forgery 2 (datagrams): the same trick on the relay datagram path.
+    let forged_dg = LinkDatagram::Ping { session: 666, nonce: 1 };
+    let honest_dg = LinkDatagram::Ping { session: 1234, nonce: 2 };
+    for _ in 0..3 {
+        c.conn.send_datagram(flow_proto::encode(&RelayDatagramDown { from: idb, dg: forged_dg }).into()).unwrap();
+        c.conn.send_datagram(flow_proto::encode(&RelayDatagramUp { to: ida, dg: honest_dg }).into()).unwrap();
+    }
+
+    // Forgery 3: a RelayUp to A with B's id appended as a "sender" field.
+    // The hub rejects the frame (trailing bytes) and ends C's relay stream.
+    let mut payload = flow_proto::encode(&RelayUp { to: ida, msg: LinkMsg::Ack { session: 667, upto: 1 } });
+    payload.extend(flow_proto::encode(&idb));
+    write_raw(&mut c_send, &payload).await.unwrap();
+
+    // C can open a new relay stream and keeps being stamped as C.
+    let (mut c_send2, _at_c2) = c.relay().await;
+    let marker = RelayUp { to: ida, msg: LinkMsg::Ack { session: 999, upto: 0 } };
+    let mut seen_at_a = vec![relay_probe(&mut c_send2, &marker, &mut at_a).await];
+    seen_at_a.extend(rest(&mut at_a).await);
+
+    // A never saw anything attributed to B, and never saw the forged frames.
+    for d in &seen_at_a {
+        assert_eq!(d.from, idc, "frame at A not stamped as C: {d:?}");
+        assert!(!matches!(d.msg, LinkMsg::Ack { session: 666 | 667, .. }), "forged frame reached A: {d:?}");
+    }
+    let dgs_at_a = rest(&mut dg_at_a).await;
+    assert!(dgs_at_a.iter().any(|d| d.dg == honest_dg), "honest relay datagram must reach A: {dgs_at_a:?}");
+    for d in &dgs_at_a {
+        assert_eq!(*d, RelayDatagramDown { from: idc, dg: honest_dg });
+    }
+    let dgs_at_b = rest(&mut dg_at_b).await;
+    assert!(dgs_at_b.iter().any(|d| d.dg == forged_dg), "forged datagram is routed to B: {dgs_at_b:?}");
+    for d in &dgs_at_b {
+        assert_eq!(*d, RelayDatagramDown { from: idc, dg: forged_dg });
+    }
+    for d in rest(&mut at_b).await {
+        assert_eq!(d.from, idc, "frame at B not stamped as C: {d:?}");
+    }
 
     hub.shutdown().await;
 }
