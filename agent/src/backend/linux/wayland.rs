@@ -569,21 +569,97 @@ async fn run_dbus_injector(
 // capture: InputCapture
 // ---------------------------------------------------------------------------
 
+/// First delay before re-creating a portal session that ended; doubled on
+/// every failed attempt up to [`RETRY_MAX`].
+const RETRY_MIN: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+/// Upper bound for portal calls that never show a dialog (barriers, zones,
+/// enable/disable, release, close): a portal that does not answer must not
+/// park the capture loop.
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn bounded<T, E: Into<anyhow::Error>>(what: &str, f: impl Future<Output = Result<T, E>>) -> Result<T> {
+    match tokio::time::timeout(CALL_TIMEOUT, f).await {
+        Ok(r) => r.map_err(Into::into),
+        Err(_) => Err(anyhow!("{what}: no answer from the portal within {CALL_TIMEOUT:?}")),
+    }
+}
+
+/// Exponential backoff for re-creating portal sessions.
+struct Backoff(Duration);
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff(RETRY_MIN)
+    }
+}
+
+impl Backoff {
+    fn next(&mut self) -> Duration {
+        let d = self.0;
+        self.0 = (d * 2).min(RETRY_MAX);
+        d
+    }
+
+    fn reset(&mut self) {
+        self.0 = RETRY_MIN;
+    }
+}
+
+/// True when a portal request failed because the user refused (cancelled)
+/// the permission dialog. Such sessions are not re-requested automatically:
+/// the dialog would pop up again and again.
+fn is_refusal(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<ashpd::Error>(),
+            Some(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled))
+                | Some(ashpd::Error::Portal(ashpd::PortalError::Cancelled(_)))
+        )
+    })
+}
+
+/// What happened on an open capture session.
+#[derive(Debug)]
+enum CapEvent {
+    /// A pointer barrier fired; capture is active until released.
+    Activated { activation_id: Option<u32>, barrier: Option<u32>, pos: (f64, f64) },
+    Deactivated,
+    /// The compositor disabled the session (GNOME 46 cannot re-enable it).
+    Disabled,
+    ZonesChanged,
+    /// Captured input, already converted.
+    Input(LocalEvent),
+}
+
+/// The InputCapture operations the capture loop needs. [`PortalCapture`]
+/// talks to the real portal; tests drive [`run_capture`] with a fake.
+trait CapturePortal {
+    /// Creates a new session (asks for permission when the portal wants to)
+    /// and connects its EI stream; returns the zones as monitors. Closes the
+    /// previous session first, if any.
+    async fn open(&mut self) -> Result<Vec<Monitor>>;
+    /// Disables and closes the current session, if any.
+    async fn close(&mut self);
+    /// Sets pointer barriers for `edges`; returns barrier id → side.
+    async fn set_barriers(&mut self, edges: &[Edge]) -> Result<HashMap<u32, Side>>;
+    async fn enable(&mut self) -> Result<()>;
+    async fn release(&mut self, activation_id: Option<u32>, pos: Option<(f64, f64)>) -> Result<()>;
+    async fn zones(&mut self) -> Result<Vec<Monitor>>;
+    /// Next event of the open session, `None` once the session is gone (EI
+    /// stream closed or failed, portal signals ended). Must be cancel-safe.
+    async fn next_event(&mut self) -> Option<CapEvent>;
+}
+
 async fn start_capture(tx: EventTx, monitors: Arc<Mutex<Vec<Monitor>>>) -> Result<mpsc::UnboundedSender<CapCmd>> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let ready = spawn_portal_thread("portal-capture", move |ready| async move {
-        let ic = match InputCapture::new().await.context("InputCapture portal") {
-            Ok(ic) => ic,
-            Err(e) => {
-                let _ = ready.send(Err(e));
-                return;
-            }
-        };
-        match CaptureSession::create(&ic).await {
-            Ok(cs) => {
-                *monitors.lock().expect("poisoned") = zones_to_monitors(&cs.zones);
+        let mut portal = PortalCapture::default();
+        match portal.open().await {
+            Ok(m) => {
+                *monitors.lock().expect("poisoned") = m;
                 let _ = ready.send(Ok(()));
-                run_capture(ic, cs, cmd_rx, tx, monitors).await;
+                run_capture(portal, cmd_rx, tx, monitors).await;
             }
             Err(e) => {
                 let _ = ready.send(Err(e));
@@ -594,22 +670,59 @@ async fn start_capture(tx: EventTx, monitors: Arc<Mutex<Vec<Monitor>>>) -> Resul
     Ok(cmd_tx)
 }
 
-struct CaptureSession {
+/// Portal objects of one live InputCapture session.
+struct LiveCapture {
+    ic: InputCapture,
     session: Session<InputCapture>,
     ctx: ei::Context,
     events: reis::tokio::EiConvertEventStream,
     zones: Zones,
+    activated: LocalBoxStream<'static, Activated>,
+    deactivated: LocalBoxStream<'static, Deactivated>,
+    disabled: LocalBoxStream<'static, Disabled>,
+    zones_changed: LocalBoxStream<'static, ZonesChanged>,
 }
 
-impl CaptureSession {
-    async fn create(ic: &InputCapture) -> Result<Self> {
+/// [`CapturePortal`] on xdg-desktop-portal.
+#[derive(Default)]
+struct PortalCapture {
+    live: Option<LiveCapture>,
+    scroll_acc: (f32, f32),
+}
+
+/// Subscribes to a portal signal. ashpd's `receive_*` streams borrow the
+/// portal proxy, which would make [`LiveCapture`] self-referential; the
+/// zbus signal stream of the (owned, `'static`) proxy does not.
+async fn portal_signal<T>(proxy: &ashpd::zbus::Proxy<'static>, name: &'static str) -> Result<LocalBoxStream<'static, T>>
+where
+    T: for<'de> serde::Deserialize<'de> + ashpd::wire::Type + 'static,
+{
+    let s = proxy.receive_signal(name).await.with_context(|| format!("subscribing to InputCapture.{name}"))?;
+    Ok(s.filter_map(|m| std::future::ready(m.body().deserialize::<T>().ok())).boxed_local())
+}
+
+impl PortalCapture {
+    fn live(&mut self) -> Result<&mut LiveCapture> {
+        self.live.as_mut().ok_or_else(|| anyhow!("no InputCapture session"))
+    }
+}
+
+impl CapturePortal for PortalCapture {
+    async fn open(&mut self) -> Result<Vec<Monitor>> {
+        self.close().await;
+        let ic = InputCapture::new().await.context("InputCapture portal")?;
+        // Subscribe before creating the session so no signal is missed.
+        let activated = portal_signal(&ic, "Activated").await?;
+        let deactivated = portal_signal(&ic, "Deactivated").await?;
+        let disabled = portal_signal(&ic, "Disabled").await?;
+        let zones_changed = portal_signal(&ic, "ZonesChanged").await?;
         info!("asking for input capture permission");
         let (session, caps) = ic
             .create_session(None, IcCreate::default().set_capabilities(IcCaps::KEYBOARD | IcCaps::POINTER))
             .await
             .context("creating InputCapture session")?;
         debug!(?caps, "InputCapture session");
-        let fd = ic.connect_to_eis(&session, Default::default()).await.context("InputCapture.ConnectToEIS")?;
+        let fd = bounded("InputCapture.ConnectToEIS", ic.connect_to_eis(&session, Default::default())).await?;
         let stream = UnixStream::from(fd);
         stream.set_nonblocking(true)?;
         let ctx = ei::Context::new(stream)?;
@@ -617,8 +730,101 @@ impl CaptureSession {
             .handshake_tokio("flowcursor-capture", ei::handshake::ContextType::Receiver)
             .await
             .map_err(|e| anyhow!("EI handshake: {e:?}"))?;
-        let zones = ic.zones(&session, Default::default()).await?.response()?;
-        Ok(CaptureSession { session, ctx, events, zones })
+        let zones = bounded("InputCapture.GetZones", ic.zones(&session, Default::default())).await?.response()?;
+        let mons = zones_to_monitors(&zones);
+        self.scroll_acc = (0.0, 0.0);
+        self.live =
+            Some(LiveCapture { ic, session, ctx, events, zones, activated, deactivated, disabled, zones_changed });
+        Ok(mons)
+    }
+
+    async fn close(&mut self) {
+        if let Some(l) = self.live.take() {
+            let _ = bounded("InputCapture.Disable", l.ic.disable(&l.session, Default::default())).await;
+            let _ = bounded("Session.Close", l.session.close()).await;
+        }
+    }
+
+    async fn set_barriers(&mut self, edges: &[Edge]) -> Result<HashMap<u32, Side>> {
+        let l = self.live()?;
+        let mut map = HashMap::new();
+        let barriers: Vec<Barrier> = edges
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let id = BarrierID::new(i as u32 + 1)?;
+                map.insert(i as u32 + 1, e.side);
+                Some(Barrier::new(id, barrier_for(e)))
+            })
+            .collect();
+        let resp = bounded(
+            "InputCapture.SetPointerBarriers",
+            l.ic.set_pointer_barriers(&l.session, &barriers, l.zones.zone_set(), Default::default()),
+        )
+        .await?
+        .response()?;
+        let failed = resp.failed_barriers();
+        if !failed.is_empty() {
+            warn!(?failed, "the compositor refused some pointer barriers (they must lie on outer screen edges)");
+        }
+        info!(barriers = barriers.len() - failed.len(), "pointer barriers set");
+        Ok(map)
+    }
+
+    async fn enable(&mut self) -> Result<()> {
+        let l = self.live()?;
+        bounded("InputCapture.Enable", l.ic.enable(&l.session, Default::default())).await
+    }
+
+    async fn release(&mut self, activation_id: Option<u32>, pos: Option<(f64, f64)>) -> Result<()> {
+        let l = self.live()?;
+        let opts = ReleaseOptions::default().set_activation_id(activation_id).set_cursor_position(pos);
+        bounded("InputCapture.Release", l.ic.release(&l.session, opts)).await
+    }
+
+    async fn zones(&mut self) -> Result<Vec<Monitor>> {
+        let l = self.live()?;
+        l.zones = bounded("InputCapture.GetZones", l.ic.zones(&l.session, Default::default())).await?.response()?;
+        Ok(zones_to_monitors(&l.zones))
+    }
+
+    async fn next_event(&mut self) -> Option<CapEvent> {
+        let l = self.live.as_mut()?;
+        loop {
+            tokio::select! {
+                a = l.activated.next() => {
+                    let a = a?;
+                    let barrier = a.barrier_id().and_then(|b| match b {
+                        ashpd::desktop::input_capture::ActivatedBarrier::Barrier(id) => Some(id.get()),
+                        _ => None,
+                    });
+                    let pos = a.cursor_position().map(|(x, y)| (x as f64, y as f64)).unwrap_or((0.0, 0.0));
+                    self.scroll_acc = (0.0, 0.0);
+                    return Some(CapEvent::Activated { activation_id: a.activation_id(), barrier, pos });
+                }
+                d = l.deactivated.next() => { d?; return Some(CapEvent::Deactivated); }
+                d = l.disabled.next() => { d?; return Some(CapEvent::Disabled); }
+                z = l.zones_changed.next() => { z?; return Some(CapEvent::ZonesChanged); }
+                ev = l.events.next() => match ev? {
+                    Ok(EiEvent::SeatAdded(s)) => {
+                        s.seat.bind_capabilities(
+                            DeviceCapability::Pointer | DeviceCapability::PointerAbsolute | DeviceCapability::Keyboard
+                                | DeviceCapability::Scroll | DeviceCapability::Button,
+                        );
+                        let _ = l.ctx.flush();
+                    }
+                    Ok(ev) => {
+                        if let Some(le) = ei_to_local(&ev, &mut self.scroll_acc) {
+                            return Some(CapEvent::Input(le));
+                        }
+                    }
+                    Err(e) => {
+                        warn!("EI capture stream error: {e:?}");
+                        return None;
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -652,152 +858,220 @@ fn inside(side: Side, x: f64, y: f64) -> (f64, f64) {
     }
 }
 
-async fn apply_barriers(ic: &InputCapture, cs: &CaptureSession, edges: &[Edge]) -> Result<HashMap<u32, Side>> {
-    let mut map = HashMap::new();
-    let barriers: Vec<Barrier> = edges
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| {
-            let id = BarrierID::new(i as u32 + 1)?;
-            map.insert(i as u32 + 1, e.side);
-            Some(Barrier::new(id, barrier_for(e)))
-        })
-        .collect();
-    let resp =
-        ic.set_pointer_barriers(&cs.session, &barriers, cs.zones.zone_set(), Default::default()).await?.response()?;
-    let failed = resp.failed_barriers();
-    if !failed.is_empty() {
-        warn!(?failed, "the compositor refused some pointer barriers (they must lie on outer screen edges)");
-    }
-    info!(barriers = barriers.len() - failed.len(), "pointer barriers set");
-    Ok(map)
+/// State of the capture loop around one [`CapturePortal`].
+struct Capture<P> {
+    portal: P,
+    tx: EventTx,
+    monitors: Arc<Mutex<Vec<Monitor>>>,
+    edges: Vec<Edge>,
+    ids: HashMap<u32, Side>,
+    /// The portal has a live session.
+    open: bool,
+    enabled: bool,
+    /// Disabled by the compositor: GNOME 46 cannot re-enable a session, so
+    /// the next barrier update creates a new one.
+    stale: bool,
+    /// (activation id, side, cursor position) while captured.
+    active: Option<(Option<u32>, Side, (f64, f64))>,
+    released_by_us: bool,
+    backoff: Backoff,
+    /// When to re-create a lost session.
+    retry_at: Option<Instant>,
 }
 
-async fn run_capture(
-    ic: InputCapture,
-    mut cs: CaptureSession,
+/// Runs the capture loop until the backend is dropped. The portal must have
+/// an open session. When the session dies (EI stream closed, portal gone)
+/// an active capture ends with [`LocalEvent::CaptureEnded`] and the session
+/// is re-created with backoff; commands keep being processed meanwhile.
+async fn run_capture<P: CapturePortal>(
+    portal: P,
     mut cmds: mpsc::UnboundedReceiver<CapCmd>,
     tx: EventTx,
     monitors: Arc<Mutex<Vec<Monitor>>>,
 ) {
-    let (Ok(activated), Ok(deactivated), Ok(disabled), Ok(zones_changed)) = (
-        ic.receive_activated().await,
-        ic.receive_deactivated().await,
-        ic.receive_disabled().await,
-        ic.receive_zones_changed().await,
-    ) else {
-        warn!("cannot subscribe to InputCapture signals");
-        return;
+    let mut c = Capture {
+        portal,
+        tx,
+        monitors,
+        edges: Vec::new(),
+        ids: HashMap::new(),
+        open: true,
+        enabled: false,
+        stale: false,
+        active: None,
+        released_by_us: false,
+        backoff: Backoff::default(),
+        retry_at: None,
     };
-    let (mut activated, mut deactivated, mut disabled, mut zones_changed) =
-        (activated.boxed(), deactivated.boxed(), disabled.boxed(), zones_changed.boxed());
-    let mut edges: Vec<Edge> = Vec::new();
-    let mut ids: HashMap<u32, Side> = HashMap::new();
-    let mut enabled = false;
-    // (activation id, side, cursor position) while captured.
-    let mut active: Option<(Option<u32>, Side, (f64, f64))> = None;
-    let mut released_by_us = false;
-    let mut scroll_acc = (0.0f32, 0.0f32);
     loop {
+        let retry_at = c.retry_at;
         tokio::select! {
             cmd = cmds.recv() => match cmd {
-                None => return,
-                Some(CapCmd::SetEdges(new)) => {
-                    if new == edges && enabled {
-                        continue;
-                    }
-                    edges = new;
-                    if enabled {
-                        // GNOME 46 cannot re-enable a disabled session: start a new one.
-                        let _ = ic.disable(&cs.session, Default::default()).await;
-                        let _ = cs.session.close().await;
-                        match CaptureSession::create(&ic).await {
-                            Ok(n) => cs = n,
-                            Err(e) => { warn!("recreating the capture session failed: {e:#}"); enabled = false; continue; }
-                        }
-                        *monitors.lock().expect("poisoned") = zones_to_monitors(&cs.zones);
-                    }
-                    if edges.is_empty() {
-                        enabled = false;
-                        continue;
-                    }
-                    match apply_barriers(&ic, &cs, &edges).await {
-                        Ok(m) => ids = m,
-                        Err(e) => { warn!("setting pointer barriers failed: {e:#}"); continue; }
-                    }
-                    match ic.enable(&cs.session, Default::default()).await {
-                        Ok(()) => enabled = true,
-                        Err(e) => warn!("enabling input capture failed: {e}"),
-                    }
+                None => {
+                    c.portal.close().await;
+                    return;
                 }
-                Some(CapCmd::Release(warp)) => {
-                    if let Some((aid, side, (x, y))) = active.take() {
-                        let pos = warp.map(|(x, y)| (x as f64, y as f64)).unwrap_or_else(|| inside(side, x, y));
-                        released_by_us = true;
-                        let opts = ReleaseOptions::default().set_activation_id(aid).set_cursor_position(pos);
-                        if let Err(e) = ic.release(&cs.session, opts).await {
-                            warn!("releasing input capture failed: {e}");
-                        }
-                    }
-                }
+                Some(CapCmd::SetEdges(new)) => c.set_edges(new).await,
+                Some(CapCmd::Release(warp)) => c.release(warp).await,
             },
-            Some(a) = activated.next() => {
-                let side = a.barrier_id().and_then(|b| match b {
-                    ashpd::desktop::input_capture::ActivatedBarrier::Barrier(id) => ids.get(&id.get()).copied(),
-                    _ => None,
-                });
-                let (x, y) = a.cursor_position().map(|(x, y)| (x as f64, y as f64)).unwrap_or((0.0, 0.0));
-                let Some(side) = side else {
+            ev = c.portal.next_event(), if c.open => match ev {
+                Some(ev) => c.on_event(ev).await,
+                None => c.lost("the EI capture stream closed").await,
+            },
+            _ = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now)), if retry_at.is_some() => {
+                c.retry_at = None;
+                c.reopen().await;
+            }
+        }
+    }
+}
+
+impl<P: CapturePortal> Capture<P> {
+    async fn set_edges(&mut self, new: Vec<Edge>) {
+        if new == self.edges && self.enabled {
+            return;
+        }
+        self.edges = new;
+        if !self.open {
+            // Applied when the session is back.
+            return;
+        }
+        if self.enabled || self.stale {
+            // GNOME 46 cannot re-enable a disabled session: start a new one.
+            match self.portal.open().await {
+                Ok(m) => {
+                    self.enabled = false;
+                    self.stale = false;
+                    *self.monitors.lock().expect("poisoned") = m;
+                }
+                Err(e) => {
+                    self.open = false;
+                    self.open_failed(e, "re-creating the capture session failed");
+                    return;
+                }
+            }
+        }
+        self.apply_edges().await;
+    }
+
+    /// Sets the barriers for the current edges and enables capture.
+    async fn apply_edges(&mut self) {
+        self.enabled = false;
+        if self.edges.is_empty() {
+            return;
+        }
+        match self.portal.set_barriers(&self.edges).await {
+            Ok(m) => self.ids = m,
+            Err(e) => {
+                warn!("setting pointer barriers failed: {e:#}");
+                return;
+            }
+        }
+        match self.portal.enable().await {
+            Ok(()) => self.enabled = true,
+            Err(e) => warn!("enabling input capture failed: {e:#}"),
+        }
+    }
+
+    async fn release(&mut self, warp: Option<(i32, i32)>) {
+        if let Some((aid, side, (x, y))) = self.active.take() {
+            let pos = warp.map(|(x, y)| (x as f64, y as f64)).unwrap_or_else(|| inside(side, x, y));
+            self.released_by_us = true;
+            if let Err(e) = self.portal.release(aid, Some(pos)).await {
+                warn!("releasing input capture failed: {e:#}");
+            }
+        }
+    }
+
+    async fn on_event(&mut self, ev: CapEvent) {
+        match ev {
+            CapEvent::Activated { activation_id, barrier, pos: (x, y) } => {
+                let Some(side) = barrier.and_then(|b| self.ids.get(&b).copied()) else {
                     // Activated without one of our barriers: give control back.
-                    let opts = ReleaseOptions::default().set_activation_id(a.activation_id());
-                    let _ = ic.release(&cs.session, opts).await;
-                    continue;
+                    let _ = self.portal.release(activation_id, None).await;
+                    return;
                 };
-                active = Some((a.activation_id(), side, (x, y)));
-                released_by_us = false;
-                scroll_acc = (0.0, 0.0);
-                let _ = tx.send(LocalEvent::EdgeHit { side, x: x.round() as i32, y: y.round() as i32 });
+                self.active = Some((activation_id, side, (x, y)));
+                self.released_by_us = false;
+                let _ = self.tx.send(LocalEvent::EdgeHit { side, x: x.round() as i32, y: y.round() as i32 });
             }
-            Some(_) = deactivated.next() => {
-                if active.take().is_some() && !released_by_us {
-                    let _ = tx.send(LocalEvent::CaptureEnded);
+            CapEvent::Deactivated => {
+                if self.active.take().is_some() && !self.released_by_us {
+                    let _ = self.tx.send(LocalEvent::CaptureEnded);
                 }
             }
-            Some(_) = disabled.next() => {
-                warn!("input capture was disabled by the compositor; it is re-enabled on the next layout change");
-                enabled = false;
-                if active.take().is_some() {
-                    let _ = tx.send(LocalEvent::CaptureEnded);
-                }
+            CapEvent::Disabled => {
+                warn!("input capture was disabled by the compositor; a new session is created on the next layout change");
+                self.enabled = false;
+                self.stale = true;
+                self.end_active();
             }
-            Some(_) = zones_changed.next() => {
-                if let Ok(z) = ic.zones(&cs.session, Default::default()).await.and_then(|r| r.response()) {
-                    cs.zones = z;
-                    let m = zones_to_monitors(&cs.zones);
-                    *monitors.lock().expect("poisoned") = m.clone();
-                    let _ = tx.send(LocalEvent::MonitorsChanged(m));
+            CapEvent::ZonesChanged => match self.portal.zones().await {
+                Ok(m) => {
+                    *self.monitors.lock().expect("poisoned") = m.clone();
+                    let _ = self.tx.send(LocalEvent::MonitorsChanged(m));
                 }
-            }
-            ev = cs.events.next() => match ev {
-                Some(Ok(ev)) => {
-                    if let EiEvent::SeatAdded(s) = &ev {
-                        s.seat.bind_capabilities(
-                            DeviceCapability::Pointer | DeviceCapability::PointerAbsolute | DeviceCapability::Keyboard
-                                | DeviceCapability::Scroll | DeviceCapability::Button,
-                        );
-                        let _ = cs.ctx.flush();
-                        continue;
-                    }
-                    if active.is_none() {
-                        continue;
-                    }
-                    if let Some(le) = ei_to_local(&ev, &mut scroll_acc) {
-                        let _ = tx.send(le);
-                    }
-                }
-                Some(Err(e)) => { warn!("EI capture stream error: {e:?}"); enabled = false; }
-                None => { warn!("EI capture stream closed"); enabled = false; std::future::pending::<()>().await; }
+                Err(e) => warn!("reading the capture zones failed: {e:#}"),
             },
+            CapEvent::Input(le) => {
+                if self.active.is_some() {
+                    let _ = self.tx.send(le);
+                }
+            }
+        }
+    }
+
+    fn end_active(&mut self) {
+        if self.active.take().is_some() {
+            let _ = self.tx.send(LocalEvent::CaptureEnded);
+        }
+    }
+
+    /// The session is gone: give the local devices back and schedule a new
+    /// session.
+    async fn lost(&mut self, why: &str) {
+        warn!("input capture session lost ({why}); re-creating it");
+        self.open = false;
+        self.enabled = false;
+        self.stale = false;
+        self.ids.clear();
+        self.end_active();
+        self.portal.close().await;
+        self.schedule_retry();
+    }
+
+    fn schedule_retry(&mut self) {
+        let d = self.backoff.next();
+        debug!(delay = ?d, "next capture session attempt");
+        self.retry_at = Some(Instant::now() + d);
+    }
+
+    fn open_failed(&mut self, e: anyhow::Error, what: &str) {
+        if is_refusal(&e) {
+            warn!(
+                "input capture permission refused in the GNOME dialog: this machine cannot control other machines \
+                 until flow-agent is restarted (it can still be controlled)"
+            );
+        } else {
+            warn!("{what}: {e:#}");
+            self.schedule_retry();
+        }
+    }
+
+    async fn reopen(&mut self) {
+        match self.portal.open().await {
+            Ok(m) => {
+                info!("input capture session re-created");
+                self.open = true;
+                self.backoff.reset();
+                let changed = *self.monitors.lock().expect("poisoned") != m;
+                *self.monitors.lock().expect("poisoned") = m.clone();
+                if changed {
+                    let _ = self.tx.send(LocalEvent::MonitorsChanged(m));
+                }
+                self.apply_edges().await;
+            }
+            Err(e) => self.open_failed(e, "re-creating the capture session failed"),
         }
     }
 }
