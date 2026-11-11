@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 flow-ipc.workspace = true
+flow-version.workspace = true
 anyhow.workspace = true
 png.workspace = true
 # Status window. glow (OpenGL) instead of wgpu: about half the binary size

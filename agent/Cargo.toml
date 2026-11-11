@@ -14,6 +14,7 @@ default = []
 
 [dependencies]
 flow-proto.workspace = true
+flow-version.workspace = true
 flow-keymap.workspace = true
 flow-layout.workspace = true
 flow-net.workspace = true

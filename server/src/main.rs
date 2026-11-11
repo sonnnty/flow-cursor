@@ -8,7 +8,7 @@ use tracing_subscriber::{prelude::*, reload, EnvFilter};
 
 /// FlowCursor hub: run it on the home server (Docker, host networking).
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(version = flow_version::FULL, about)]
 struct Args {
     /// State directory (identity, nodes, layout, settings).
     #[arg(long, env = "FLOW_DATA", default_value = "/data")]
@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
                 Err(e) => warn!("invalid log level {lvl:?}: {e}"),
             }));
     }
+    info!("flow-server {} running", flow_version::FULL);
     info!("hub fingerprint: {}", hub.fingerprint());
     info!("join token (give this to `flow-agent join`): {}", hub.join_token());
     if hub.hub.admin_token_source == AdminTokenSource::Persisted {

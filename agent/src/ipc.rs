@@ -137,7 +137,8 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
         .unwrap_or_else(|| settings.emergency_hotkey.clone());
 
     Snapshot {
-        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        agent_version: flow_version::FULL.to_string(),
+        platform: flow_version::PLATFORM.to_string(),
         pid: std::process::id(),
         backend: backend.name().to_string(),
         config_file: ctx.info.config_file.display().to_string(),

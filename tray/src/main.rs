@@ -9,18 +9,24 @@
 //!   flow-tray --window        only the status window
 //!   flow-tray --quit          ask the running tray to exit
 //!   --no-start-agent          (Windows) never start flow-agent from the tray
+//!   flow-tray --version       print the build identity
 
 use flow_tray::instance::{self, TRAY_LOCK, WINDOW_LOCK};
 
-const USAGE: &str = "usage: flow-tray [--show | --window | --quit] [--no-start-agent]";
+const USAGE: &str = "usage: flow-tray [--show | --window | --quit | --version] [--no-start-agent]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |f: &str| args.iter().any(|a| a == f);
-    if let Some(a) = args.iter().find(|a| !matches!(a.as_str(), "--show" | "--window" | "--quit" | "--no-start-agent"))
+    if let Some(a) =
+        args.iter().find(|a| !matches!(a.as_str(), "--show" | "--window" | "--quit" | "--version" | "--no-start-agent"))
     {
         eprintln!("unknown argument {a}\n{USAGE}");
         std::process::exit(2);
+    }
+    if has("--version") {
+        println!("flow-tray {}", flow_version::FULL);
+        return;
     }
     if has("--quit") {
         quit_running_tray();

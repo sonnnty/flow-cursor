@@ -349,7 +349,8 @@ fn details(ui: &mut egui::Ui, s: &Snapshot) {
                 yes_no(s.can_clipboard)
             ),
         );
-        row(ui, "Agent", format!("{} (pid {}, backend {})", s.agent_version, s.pid, s.backend));
+        row(ui, "Agent", format!("{} {} (pid {}, backend {})", s.agent_version, s.platform, s.pid, s.backend));
+        row(ui, "Status window", flow_version::FULL);
         row(ui, "Config file", RichText::new(&s.config_file).monospace());
         row(
             ui,

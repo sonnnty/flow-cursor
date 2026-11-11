@@ -93,7 +93,10 @@ struct Envelope<T> {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
+    /// Full build identity (`0.2.0+142.g1a2b3c4d5e`, see `flow-version`).
     pub agent_version: String,
+    /// `linux-x86_64`, `windows-x86_64`.
+    pub platform: String,
     pub pid: u32,
     /// Input backend in use (wayland, x11, windows, sim).
     pub backend: String,

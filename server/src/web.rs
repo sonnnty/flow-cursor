@@ -221,7 +221,7 @@ async fn get_state(State(hub): State<Arc<Hub>>) -> Json<StateView> {
         .collect();
     pairs.sort_by_key(|p| (p.source, p.target));
     Json(StateView {
-        hub: HubInfo { fingerprint: hub.fingerprint().to_hex(), version: env!("CARGO_PKG_VERSION"), join_token },
+        hub: HubInfo { fingerprint: hub.fingerprint().to_hex(), version: flow_version::FULL, join_token },
         now: unix_now(),
         nodes,
         focus: st.focus_entries(),

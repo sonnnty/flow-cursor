@@ -1316,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "flow-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -1328,6 +1328,7 @@ dependencies = [
  "flow-layout",
  "flow-net",
  "flow-proto",
+ "flow-version",
  "futures-util",
  "hostname",
  "if-addrs",
@@ -1347,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "flow-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1365,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "flow-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix 1.1.6",
  "serde",
@@ -1375,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "flow-itest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "flow-agent",
@@ -1393,11 +1394,11 @@ dependencies = [
 
 [[package]]
 name = "flow-keymap"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "flow-layout"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flow-proto",
  "serde",
@@ -1405,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "flow-net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "data-encoding",
@@ -1426,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "flow-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "postcard",
  "serde",
@@ -1436,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "flow-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1446,6 +1447,7 @@ dependencies = [
  "flow-layout",
  "flow-net",
  "flow-proto",
+ "flow-version",
  "hostname",
  "rand 0.8.8",
  "serde",
@@ -1458,12 +1460,13 @@ dependencies = [
 
 [[package]]
 name = "flow-tray"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
  "embed-resource",
  "flow-ipc",
+ "flow-version",
  "ksni",
  "png 0.17.16",
  "rustix 1.1.6",
@@ -1471,6 +1474,10 @@ dependencies = [
  "windows-sys 0.61.2",
  "winit",
 ]
+
+[[package]]
+name = "flow-version"
+version = "0.2.0"
 
 [[package]]
 name = "flume"

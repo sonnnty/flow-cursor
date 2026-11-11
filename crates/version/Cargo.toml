@@ -1,0 +1,9 @@
+[package]
+name = "flow-version"
+description = "FlowCursor build identity: workspace version, build id, commit and platform of this binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]

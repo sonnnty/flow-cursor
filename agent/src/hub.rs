@@ -230,7 +230,7 @@ impl HubClient {
         let (mut send, mut recv) = conn.open_bi().await?;
         let hello = Hello {
             protocol_version: PROTOCOL_VERSION,
-            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            agent_version: flow_version::FULL.to_string(),
             join_token: token.clone(),
             hostname: hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "unknown".into()),
             os: OsKind::current(),

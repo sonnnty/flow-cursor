@@ -89,7 +89,7 @@ async fn handle_conn(hub: Arc<Hub>, conn: Connection) -> Result<()> {
         let welcome = Welcome {
             node_id: node,
             name: rec.name.clone(),
-            hub_version: env!("CARGO_PKG_VERSION").to_string(),
+            hub_version: flow_version::FULL.to_string(),
             settings: st.settings_for(node),
             layout: st.p.layout(),
             peers: st.peers_for(node),

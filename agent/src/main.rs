@@ -23,7 +23,7 @@ use tracing_subscriber::{prelude::*, reload, EnvFilter};
 /// FlowCursor agent: share mouse, keyboard and clipboard with the other
 /// machines registered at your FlowCursor hub.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(version = flow_version::FULL, about)]
 struct Cli {
     /// Configuration file (TOML).
     #[arg(long, global = true, env = "FLOW_AGENT_CONFIG")]
@@ -172,6 +172,7 @@ async fn main() -> Result<()> {
         Cmd::Status => {
             let dir = cfg.state_dir();
             let st = AgentState::load(&dir)?;
+            println!("version:          {} ({})", flow_version::FULL, flow_version::PLATFORM);
             println!("config file:      {}", cfg_path.display());
             println!("state directory:  {}", dir.display());
             println!("hub:              {}", cfg.hub.as_deref().unwrap_or("(mDNS discovery)"));
@@ -240,7 +241,7 @@ async fn main() -> Result<()> {
                 bail!("{}", BindError::AlreadyRunning(endpoint));
             }
             let kind = backend::parse_kind(b.as_deref().or(cfg.backend.as_deref()))?;
-            info!(?kind, config = %cfg_path.display(), "starting flow-agent {}", env!("CARGO_PKG_VERSION"));
+            info!(?kind, config = %cfg_path.display(), "starting flow-agent {}", flow_version::FULL);
             let (be, rx) = backend::create(kind, &BackendOptions { state_dir: cfg.state_dir() })
                 .await
                 .context("starting the input backend")?;
