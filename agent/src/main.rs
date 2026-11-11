@@ -356,8 +356,12 @@ async fn serve_ipc(endpoint: &std::path::Path, ctx: IpcContext, restarted: bool)
 /// `exec` in place (same pid, so systemd keeps tracking it). Windows: a new
 /// detached process, then this one exits.
 fn restart_process(paused: bool) -> Result<()> {
-    let exe = current_exe()?;
-    let mut cmd = std::process::Command::new(&exe);
+    restart_exe(&current_exe()?, paused)
+}
+
+/// [`restart_process`] with the executable to start.
+fn restart_exe(exe: &std::path::Path, paused: bool) -> Result<()> {
+    let mut cmd = std::process::Command::new(exe);
     cmd.args(std::env::args_os().skip(1)).env(ENV_RESTARTED, "1");
     if paused {
         cmd.env(ENV_PAUSED, "1");
@@ -381,6 +385,7 @@ fn restart_process(paused: bool) -> Result<()> {
 /// process), so stored portal permissions are reused as on any restart.
 /// Only a changed systemd unit needs systemd itself to restart the service.
 fn restart_after_update(r: flow_agent::update::RestartRequest, paused: bool) -> Result<()> {
+    let exe = r.exe.clone();
     use flow_agent::update::state::ServiceKind;
     if r.service == ServiceKind::Systemd && r.unit_changed {
         info!("the systemd unit changed: restarting the service through systemd");
@@ -392,7 +397,7 @@ fn restart_after_update(r: flow_agent::update::RestartRequest, paused: bool) -> 
         }
         warn!("systemctl failed; restarting in place with the old unit");
     }
-    restart_process(paused)
+    restart_exe(&exe, paused)
 }
 
 /// The running executable. On Linux an upgrade may have replaced it: the

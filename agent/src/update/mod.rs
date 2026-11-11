@@ -60,12 +60,15 @@ pub enum UpdateEvent {
 }
 
 /// What the agent binary has to do after an update was installed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestartRequest {
     pub service: ServiceKind,
     /// The systemd unit file changed: `daemon-reload` and a service restart
     /// instead of re-executing in place.
     pub unit_changed: bool,
+    /// The installed agent executable to start (on Windows the running one
+    /// was renamed aside).
+    pub exe: PathBuf,
 }
 
 /// Starts the rollback guard: `(guard executable, state dir, service)`.
@@ -188,7 +191,16 @@ pub fn spawn(
         install::for_this_process(exe)
     });
     let guard = opts.guard.clone().unwrap_or_else(|| Arc::new(guard::launch_process));
-    let persisted = state::read(&state_dir);
+    let mut persisted = state::read(&state_dir);
+    // A tray build recorded by an older update than the version running now
+    // (installed by hand since): no tray should restart for it.
+    if persisted.trial.is_none() && persisted.tray_build.as_ref().is_some_and(|b| *b != opts.current.full()) {
+        if let Ok(mut l) = state::lock(&state_dir) {
+            l.state.tray_build = None;
+            let _ = l.save();
+        }
+        persisted.tray_build = None;
+    }
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (status_tx, status_rx) = watch::channel(UpdateStatus {
         failed: persisted.failed.clone(),
@@ -496,7 +508,7 @@ impl Updater {
             // The new version starts its own guard if none runs.
             warn!("starting the update guard: {e:#}");
         }
-        Ok(RestartRequest { service: plan.service, unit_changed })
+        Ok(RestartRequest { service: plan.service, unit_changed, exe: plan.agent_exe })
     }
 
     fn status(&self) -> UpdateStatus {

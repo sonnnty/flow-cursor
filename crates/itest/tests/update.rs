@@ -143,7 +143,10 @@ async fn agent_of_another_protocol_updates_in_update_only_mode_then_confirms() {
 
     // Policy auto (the default): download, verify, install, restart.
     let req = next_restart(&mut a, T).await.expect("restart request after installing");
-    assert_eq!(req, RestartRequest { service: ServiceKind::Plain, unit_changed: true });
+    assert_eq!(
+        req,
+        RestartRequest { service: ServiceKind::Plain, unit_changed: true, exe: home.join(".local/bin/flow-agent") }
+    );
     let bin = home.join(".local/bin");
     assert_eq!(read(bin.join("flow-agent")), "new agent");
     assert_eq!(read(bin.join("flow-tray")), "new tray");
