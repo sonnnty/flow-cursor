@@ -155,6 +155,14 @@ systemctl --user enable --now flow-agent
 2. **Input Capture** — ให้เครื่องนี้ไปควบคุมเครื่องอื่น InputCapture v1 ของ GNOME 46 ไม่มี restore token
    จึงอาจถามทุกครั้งที่ agent เริ่ม/เมื่อ layout ของขอบจอเปลี่ยน (GNOME 46 เปิดใช้ session เดิมซ้ำไม่ได้ ต้องสร้าง session ใหม่)
 
+สองสิทธิ์นี้แยกกัน (แต่ละ session มี D-Bus connection ของตัวเอง):
+* กด **Cancel/Deny** ที่หน้าต่าง Remote Desktop → เครื่องนี้ยังไปควบคุมเครื่องอื่นได้ตามปกติ แต่เครื่องอื่นคุมเครื่องนี้ไม่ได้
+  (log: `remote control permission (RemoteDesktop portal) was refused ...`) และกลับกันสำหรับ Input Capture
+  (log: `input capture permission (InputCapture portal) was refused ...`) — agent จะไม่ถามซ้ำเอง ให้ restart service เพื่อให้ถามใหม่
+* ถ้า session หลุดระหว่างใช้งาน (EI/EIS ตัดการเชื่อมต่อ, xdg-desktop-portal restart) agent จะคืนเมาส์/คีย์บอร์ดให้เครื่องนี้ทันที
+  แล้วสร้าง session ใหม่เอง (รอ 1 วินาที เพิ่มเป็นสองเท่าทุกครั้งที่ล้มเหลว สูงสุด 60 วินาที) ไม่ต้อง restart agent;
+  Remote Desktop ใช้ restore token จึงปกติไม่ถามซ้ำ ส่วน Input Capture อาจถามใหม่ (GNOME 46)
+
 ### 3) คลิปบอร์ดบน GNOME
 GNOME ไม่รองรับ `wlr-data-control` โปรแกรมเบื้องหลังจึงอ่าน/เขียนคลิปบอร์ด Wayland ตรงๆ ไม่ได้ agent จึงใช้ตามลำดับ:
 1. **Clipboard portal** ผูกกับ RemoteDesktop session (xdg-desktop-portal ≥ 1.17, GNOME ≥ 45) — วิธีหลัก ได้ทั้งข้อความและ PNG
@@ -294,6 +302,7 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
 | `this agent was removed from the hub` | ถูก revoke ใน dashboard — ต้อง `flow-agent join` ใหม่ |
 | path เป็น `relay` ตลอด | firewall บล็อก UDP 7879 ระหว่างเครื่อง หรือที่อยู่ที่ประกาศผิด (ตั้ง `p2p_advertise`) |
 | เมาส์ไม่ข้ามจอ | layout ใน dashboard ต้องให้ขอบเครื่องชิดกัน, เครื่องปลายทางต้อง online และ enabled; Wayland ต้องอนุญาต Input Capture |
+| log `... permission (... portal) was refused` | กดปฏิเสธหน้าต่างของ GNOME ไปแล้ว — `systemctl --user restart flow-agent` แล้วกด Allow |
 | ปุ่มค้าง | กด emergency hotkey; ฝั่งที่ถูกคุมจะปล่อยเองภายใน 2.5 วินาทีถ้าต้นทางหายไป |
 | GNOME ไม่ถามสิทธิ์อีก / อยากรีเซ็ต | `flow-agent forget-portal` แล้ว `systemctl --user restart flow-agent` |
 | log ละเอียด | Settings → log level = `debug` (หรือ `flow_net=trace`) |
