@@ -10,6 +10,7 @@ pub mod hub;
 pub mod ipc;
 pub mod logbuf;
 pub mod netcheck;
+pub mod park;
 pub mod problems;
 
 pub use crate::core::{start, start_with, AgentHandle, AgentObserver, AgentStatus, LogHook, StartOptions};

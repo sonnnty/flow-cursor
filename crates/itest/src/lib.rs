@@ -83,6 +83,9 @@ pub struct AgentSpec {
     pub state_dir: Option<PathBuf>,
     /// Initial interface addresses.
     pub addrs: Vec<IpAddr>,
+    /// Adjusts the simulated backend before the agent starts (e.g. cursor
+    /// support, which the agent reports in its Hello).
+    pub prepare: Option<fn(&SimControl)>,
 }
 
 impl AgentSpec {
@@ -94,6 +97,7 @@ impl AgentSpec {
             advertise: vec![],
             state_dir: None,
             addrs: vec![ip("10.10.15.10")],
+            prepare: None,
         }
     }
 }
@@ -110,6 +114,9 @@ pub async fn start_agent(hub: &HubHandle, spec: AgentSpec) -> TestAgent {
         ..Default::default()
     };
     let (backend, sim, rx) = SimBackend::with_control(spec.monitors);
+    if let Some(f) = spec.prepare {
+        f(&sim);
+    }
     let net = StaticAddrs::new(spec.addrs);
     let opts = StartOptions { addrs: Arc::new(net.clone()), net_check_interval: NET_CHECK, ..Default::default() };
     let agent = flow_agent::start_with(cfg, backend, rx, opts).await.expect("agent starts");
@@ -218,7 +225,7 @@ impl RawNode {
             p2p_port: 0,
             p2p_addrs: vec![],
             monitors: monitor(1920, 1080),
-            caps: Capabilities { capture: true, inject: true, clipboard: true },
+            caps: Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() },
         };
         write_frame(&mut ctl, &ToHub::Hello(hello)).await.unwrap();
         let id = match read_frame::<_, FromHub>(&mut ctl_r, MAX_CONTROL_FRAME).await.unwrap() {

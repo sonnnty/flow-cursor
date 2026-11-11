@@ -10,7 +10,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use flow_proto::{Capabilities, FocusEntry, FromHub, HubSettings, Monitor, NodeId, OsKind, PathKind};
+use flow_proto::{Capabilities, CursorPark, FocusEntry, FromHub, HubSettings, Monitor, NodeId, OsKind, PathKind};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -125,9 +125,14 @@ struct NodeView {
     /// Per-node overrides (null = inherit the global setting).
     allowed_networks: Option<Vec<String>>,
     crossing_key: Option<String>,
+    cursor_park: Option<CursorPark>,
     /// Values in effect for this node.
     effective_allowed_networks: Vec<String>,
     effective_crossing_key: String,
+    effective_cursor_park: CursorPark,
+    /// What the node actually does: the effective cursor setting reduced
+    /// to what its backend supports (`caps.cursor`).
+    applied_cursor_park: CursorPark,
     mouse_speed: f32,
     x: i32,
     y: i32,
@@ -185,8 +190,11 @@ async fn get_state(State(hub): State<Arc<Hub>>) -> Json<StateView> {
                     local_addrs: o.map(|o| o.local_addrs.clone()).unwrap_or_default(),
                     allowed_networks: n.allowed_networks.clone(),
                     crossing_key: n.crossing_key.clone(),
+                    cursor_park: n.cursor_park,
                     effective_allowed_networks: eff.allowed_networks,
                     effective_crossing_key: eff.crossing_key,
+                    effective_cursor_park: eff.cursor_park,
+                    applied_cursor_park: eff.cursor_park.nearest(n.caps.cursor),
                     mouse_speed: n.mouse_speed,
                     x: n.x,
                     y: n.y,
@@ -355,6 +363,9 @@ struct NodePatch {
     /// `null` = inherit, string = own key ("" = none for this node).
     #[serde(default, deserialize_with = "double_option")]
     crossing_key: Option<Option<String>>,
+    /// `null` = inherit, `"edge"` / `"center"` / `"center_hide"` = own.
+    #[serde(default, deserialize_with = "double_option")]
+    cursor_park: Option<Option<CursorPark>>,
 }
 
 async fn patch_node(
@@ -387,12 +398,15 @@ async fn patch_node(
     }
     let node = NodeId(id);
     let n = st.p.nodes.get_mut(&id).ok_or_else(|| ApiError::not_found("no such node"))?;
-    let settings_changed = networks.is_some() || crossing.is_some();
+    let settings_changed = networks.is_some() || crossing.is_some() || p.cursor_park.is_some();
     if let Some(v) = networks {
         n.allowed_networks = v;
     }
     if let Some(v) = crossing {
         n.crossing_key = v;
+    }
+    if let Some(v) = p.cursor_park {
+        n.cursor_park = v;
     }
     if let Some(name) = p.name {
         n.name = name.trim().to_string();
@@ -524,5 +538,10 @@ mod tests {
         let p: NodePatch = serde_json::from_str(r#"{"allowed_networks":["10.0.0.0/8"],"crossing_key":""}"#).unwrap();
         assert_eq!(p.allowed_networks, Some(Some(vec!["10.0.0.0/8".to_string()])));
         assert_eq!(p.crossing_key, Some(Some(String::new())));
+        let p: NodePatch = serde_json::from_str(r#"{"cursor_park":null}"#).unwrap();
+        assert_eq!(p.cursor_park, Some(None));
+        let p: NodePatch = serde_json::from_str(r#"{"cursor_park":"center"}"#).unwrap();
+        assert_eq!(p.cursor_park, Some(Some(CursorPark::Center)));
+        assert!(serde_json::from_str::<NodePatch>(r#"{"cursor_park":"corner"}"#).is_err());
     }
 }

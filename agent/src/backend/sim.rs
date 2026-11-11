@@ -1,11 +1,12 @@
 //! Simulated backend: no OS access. Tests (and `--backend sim`) drive it
 //! through [`SimControl`]: emit local events, observe injected actions,
-//! capture state, pointer warps and the clipboard.
+//! capture state, pointer warps, the local cursor and the clipboard.
 
 use super::{Backend, EventRx, EventTx, LocalEvent};
+use crate::park::Park;
 use flow_layout::Edge;
 use flow_net::link::Action;
-use flow_proto::{Capabilities, ClipContent, Monitor, Rect};
+use flow_proto::{Capabilities, ClipContent, CursorSupport, Monitor, Rect};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -32,6 +33,17 @@ pub struct SimState {
     pub crossing_key: Option<flow_keymap::Combo>,
     /// Number of `end_capture` calls (refused crossings included).
     pub end_captures: usize,
+    /// What the simulated backend can do with its cursor (reported in its
+    /// capabilities; set before the agent starts). Default: everything.
+    pub cursor_support: CursorSupport,
+    /// The local cursor is hidden. Modelled like hiding that outlives the
+    /// process (e.g. replaced system cursors): only `end_capture` or
+    /// `restore_cursor` shows it again.
+    pub cursor_hidden: bool,
+    /// Every `park_cursor` request.
+    pub parks: Vec<Park>,
+    /// Number of `restore_cursor` calls.
+    pub restores: usize,
 }
 
 pub struct SimBackend {
@@ -54,7 +66,8 @@ impl SimBackend {
 
     pub fn with_control(monitors: Vec<Monitor>) -> (Arc<dyn Backend>, SimControl, EventRx) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let state = Arc::new(Mutex::new(SimState { monitors, ..Default::default() }));
+        let state =
+            Arc::new(Mutex::new(SimState { monitors, cursor_support: CursorSupport::FULL, ..Default::default() }));
         let b = Arc::new(SimBackend { state: state.clone(), tx: tx.clone() });
         (b, SimControl { state, tx }, rx)
     }
@@ -99,6 +112,7 @@ impl SimControl {
     pub fn push_edge(&self, side: flow_layout::Side, x: i32, y: i32) {
         {
             let mut s = self.state.lock().unwrap();
+            s.pointer = (x, y);
             if s.wayland_like {
                 s.capturing = true;
             }
@@ -129,6 +143,22 @@ impl SimControl {
     pub fn end_captures(&self) -> usize {
         self.state.lock().unwrap().end_captures
     }
+    /// Where the local cursor is (last warp, park or injected position).
+    pub fn pointer(&self) -> (i32, i32) {
+        self.state.lock().unwrap().pointer
+    }
+    pub fn cursor_hidden(&self) -> bool {
+        self.state.lock().unwrap().cursor_hidden
+    }
+    pub fn parks(&self) -> Vec<Park> {
+        self.state.lock().unwrap().parks.clone()
+    }
+    /// Simulates a backend that cannot move or hide its cursor (GNOME)
+    /// or only some of it. Takes effect for capabilities reported later,
+    /// i.e. call it before the agent starts.
+    pub fn set_cursor_support(&self, s: CursorSupport) {
+        self.state.lock().unwrap().cursor_support = s;
+    }
 }
 
 impl Backend for SimBackend {
@@ -136,7 +166,7 @@ impl Backend for SimBackend {
         "sim"
     }
     fn caps(&self) -> Capabilities {
-        Capabilities { capture: true, inject: true, clipboard: true }
+        Capabilities { capture: true, inject: true, clipboard: true, cursor: self.state.lock().unwrap().cursor_support }
     }
     fn monitors(&self) -> Vec<Monitor> {
         self.state.lock().unwrap().monitors.clone()
@@ -151,10 +181,24 @@ impl Backend for SimBackend {
         let mut s = self.state.lock().unwrap();
         s.capturing = false;
         s.end_captures += 1;
+        s.cursor_hidden = false;
         if let Some(w) = warp {
             s.warps.push(w);
             s.pointer = w;
         }
+    }
+    fn park_cursor(&self, park: Park) {
+        let mut s = self.state.lock().unwrap();
+        s.parks.push(park);
+        s.pointer = park.at;
+        if park.hide {
+            s.cursor_hidden = true;
+        }
+    }
+    fn restore_cursor(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.restores += 1;
+        s.cursor_hidden = false;
     }
     fn inject(&self, action: &Action) {
         let mut s = self.state.lock().unwrap();

@@ -150,18 +150,20 @@
   </div>
   <div class="col">
     <div class="card tight" style="max-height:60%">
-      <h2>Network and crossing</h2>
+      <h2>Network, crossing and cursor</h2>
       <div class="scroll"><div class="grid">
         <label for="s-nets">Allowed networks</label><div><textarea id="s-nets" rows="2" cols="34" placeholder="empty = everywhere (no restriction)"></textarea>
           <div class="hint">CIDR blocks, one per line (IPv4 or IPv6), e.g. <code>10.10.15.0/24</code>. A machine shares mouse, keyboard and clipboard only while one of <b>its own</b> network interfaces has an address inside a block; otherwise it is <b>away</b> (stays connected, shown in the dashboard). A VPN address (e.g. 10.8.0.5) is not inside the home block, so the VPN alone never counts as home.</div></div>
         <label>Crossing key</label><div><span id="s-cross"></span>
           <div class="hint">Hold this key (or combo) while the pointer reaches an edge to switch machines; without it the pointer stays at the edge (useful for games). Applies when leaving a machine's screen, also on the way back. Empty = cross freely.</div></div>
+        <label for="s-park">Cursor while controlling another machine</label><div><select id="s-park"></select>
+          <div class="hint">While its mouse drives another machine. Coming back over an edge, the cursor enters where the pointer crossed; any other way back shows it where it is. GNOME on Wayland can only keep it at the edge.</div></div>
       </div></div>
     </div>
     <div class="card grow">
       <h2>Per-machine settings</h2>
-      <p class="hint" style="margin:0 0 6px">Each machine inherits the global allowed networks and crossing key, or uses its own. Rename, enable/disable, mouse speed and removal (credential revocation) are on the Overview tab.</p>
-      <div class="scroll"><table><thead><tr><th>Machine</th><th>Allowed networks</th><th>Crossing key</th><th></th></tr></thead><tbody id="overrides"></tbody></table></div>
+      <p class="hint" style="margin:0 0 6px">Each machine inherits the global allowed networks, crossing key and cursor behaviour, or uses its own. Rename, enable/disable, mouse speed and removal (credential revocation) are on the Overview tab.</p>
+      <div class="scroll"><table><thead><tr><th>Machine</th><th>Allowed networks</th><th>Crossing key</th><th>Cursor</th><th></th></tr></thead><tbody id="overrides"></tbody></table></div>
     </div>
   </div>
   <div class="row footer"><button class="btn primary" id="savesettings">Save settings</button><button class="btn" id="reloadsettings">Reload</button></div>
@@ -400,11 +402,26 @@ function netsFrom(area) {
 }
 
 // ---- settings ----
+const PARK = { edge: "Stay at the edge", center: "Move to the centre", center_hide: "Move to the centre and hide" };
+function parkOptions(select) { for (const [v, t] of Object.entries(PARK)) select.append(el("option", { value: v }, t)); }
+parkOptions($("s-park"));
+// What a machine's backend allows, and what it does when that falls short
+// of its setting (the hub computes `applied_cursor_park` with the same rule
+// as the agent).
+function cursorNote(n) {
+  const c = (n.caps && n.caps.cursor) || {};
+  if (c.center && c.hide) return "";
+  let can = c.center ? "can move but not hide its cursor" : "can only keep its cursor at the edge";
+  if (n.os === "linux" && !c.center) can += " (GNOME on Wayland)";
+  if (!n.online) can += ", as last reported";
+  return n.applied_cursor_park !== n.effective_cursor_park ? `⚠ ${can} → ${PARK[n.applied_cursor_park].toLowerCase()}` : can;
+}
 let crossField = null;
 async function loadSettings() {
   const s = await api("GET", "/settings");
   $("s-nets").value = (s.allowed_networks || []).join("\n"); $("s-nets").classList.remove("invalid");
   crossField = keyField(s.crossing_key); $("s-cross").replaceChildren(crossField.el);
+  $("s-park").value = s.cursor_park || "edge";
   renderOverrides(s);
   $("s-hotkey").value = s.emergency_hotkey;
   $("s-clip").checked = s.clipboard.enabled; $("s-cliptext").checked = s.clipboard.text; $("s-clipimg").checked = s.clipboard.images;
@@ -420,6 +437,7 @@ $("savesettings").addEventListener("click", async () => {
     edge: { switch_delay_ms: n("s-delay"), double_bump: $("s-dbl").checked, double_bump_window_ms: n("s-dblwin"), dead_corner_px: n("s-corner") },
     path_policy: $("s-policy").value, probe_interval_ms: n("s-probe"), log_level: $("s-log").value.trim(),
     allowed_networks: netsFrom($("s-nets")), crossing_key: crossField ? crossField.input.value.trim() : "",
+    cursor_park: $("s-park").value,
   };
   if (s.allowed_networks === null) return;
   try { await api("PUT", "/settings", s); toast("Settings saved and pushed to agents"); await loadSettings(); } catch (e) { toast(e.message, true); }
@@ -439,6 +457,10 @@ async function renderOverrides(global) {
     const keyMode = el("select", {}, el("option", { value: "inherit" }, `inherit (${gKey})`), el("option", { value: "own" }, "own key"));
     keyMode.value = n.crossing_key == null ? "inherit" : "own";
     const key = keyField(n.crossing_key || "");
+    const park = el("select", {}, el("option", { value: "inherit" }, `inherit (${PARK[global.cursor_park || "edge"].toLowerCase()})`));
+    parkOptions(park);
+    park.value = n.cursor_park == null ? "inherit" : n.cursor_park;
+    const note = cursorNote(n);
     // style.display, not `hidden`: the key field is a flex row and CSS display wins over the attribute.
     const sync = () => { nets.style.display = netMode.value === "own" ? "" : "none"; key.el.style.display = keyMode.value === "own" ? "" : "none"; };
     netMode.addEventListener("change", sync); keyMode.addEventListener("change", sync); sync();
@@ -447,6 +469,7 @@ async function renderOverrides(global) {
       const body = {};
       if (netMode.value === "own") { const l = netsFrom(nets); if (l === null) return; body.allowed_networks = l; } else body.allowed_networks = null;
       body.crossing_key = keyMode.value === "own" ? key.input.value.trim() : null;
+      body.cursor_park = park.value === "inherit" ? null : park.value;
       try { await api("PATCH", "/nodes/" + n.id, body); toast("Saved for " + n.name); renderOverrides(global); } catch (e) { toast(e.message, true); }
     });
     const status = el("span", { class: "badge " + ({ online: "ok", away: "warn" }[n.status] || "mute") }, n.status);
@@ -454,9 +477,10 @@ async function renderOverrides(global) {
       el("td", {}, n.name, " ", status, el("div", { class: "hint" }, statusWhy(n))),
       el("td", {}, el("div", { class: "row" }, netMode), nets),
       el("td", {}, el("div", { class: "row" }, keyMode), key.el),
+      el("td", {}, park, note ? el("div", { class: "hint" }, note) : ""),
       el("td", {}, save)));
   }
-  if (!st.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 4, class: "hint" }, "No machines yet.")));
+  if (!st.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 5, class: "hint" }, "No machines yet.")));
 }
 $("reloadsettings").addEventListener("click", () => loadSettings().catch(e => toast(e.message, true)));
 

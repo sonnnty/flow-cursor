@@ -224,6 +224,7 @@ fn authenticate(hub: &Hub, fp: &Fingerprint, hello: &Hello) -> Result<NodeId, St
             last_seen: unix_now(),
             allowed_networks: None,
             crossing_key: None,
+            cursor_park: None,
         },
     );
     st.save();

@@ -2,6 +2,7 @@
 //! agent core only sees [`LocalEvent`]s coming in and calls the trait to
 //! capture, inject and set the clipboard.
 
+use crate::park::Park;
 use anyhow::{bail, Result};
 use flow_layout::{Edge, Side};
 use flow_net::link::Action;
@@ -75,9 +76,27 @@ pub trait Backend: Send + Sync + 'static {
     /// Edges of this machine that lead to another machine (local coords).
     fn set_edges(&self, edges: Vec<Edge>);
     /// Start capturing: local input is swallowed and reported as events.
+    /// The local cursor stays where it is (at the edge) until
+    /// [`Backend::park_cursor`] says otherwise.
     fn begin_capture(&self);
     /// Stop capturing; optionally place the local pointer at (`x`,`y`).
+    /// Always makes the cursor visible again if `park_cursor` hid it,
+    /// also when `warp` is None (it then stays where it is).
     fn end_capture(&self, warp: Option<(i32, i32)>);
+    /// Right after `begin_capture` for a crossing out of this machine:
+    /// move the local cursor to `park.at` and hide it if `park.hide`.
+    /// The core only asks for what `caps().cursor` reports as supported.
+    fn park_cursor(&self, park: Park) {
+        let _ = park;
+    }
+    /// Called once when the agent starts: undo cursor hiding that a
+    /// previous run may have left behind (it crashed or was killed while
+    /// controlling another machine). The real backends hide the cursor in
+    /// ways that end with the process (Windows: a window of ours, X11:
+    /// XFixes hiding is per client), so they have nothing to undo; the
+    /// hook keeps that guarantee explicit for any backend that keeps state
+    /// in the system.
+    fn restore_cursor(&self) {}
     /// Inject an action received from a controlling machine.
     fn inject(&self, action: &Action);
     fn set_clipboard(&self, content: &ClipContent);
