@@ -33,12 +33,15 @@ pub struct HubConfig {
     pub name: String,
 }
 
+/// Callback that applies a new log filter.
+pub type LogLevelHook = Box<dyn Fn(&str) + Send + Sync>;
+
 pub struct Hub {
     pub identity: Identity,
     pub state: Mutex<HubState>,
     pub admin_token: String,
     /// Log filter reload hook (set by the binary).
-    pub on_log_level: Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>,
+    pub on_log_level: Mutex<Option<LogLevelHook>>,
 }
 
 impl Hub {
