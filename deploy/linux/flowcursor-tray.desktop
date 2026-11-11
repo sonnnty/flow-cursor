@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FlowCursor tray icon
+Comment=Shows the state of the FlowCursor agent in the top bar
+Exec=@BINDIR@/flow-tray
+Icon=flowcursor
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=2

@@ -78,7 +78,11 @@ pub fn open_window() {
     }
     // A stale request would raise the new window twice.
     let _ = take_focus_request();
-    if let Err(e) = crate::actions::spawn_self(&["--window"]) {
-        eprintln!("flow-tray: starting the status window: {e}");
+    match crate::actions::spawn_self(&["--window"]) {
+        // Reap it when it closes (no zombie per opened window).
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => eprintln!("flow-tray: starting the status window: {e}"),
     }
 }

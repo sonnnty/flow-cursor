@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds every FlowCursor artifact with Docker only (no local Rust needed):
-#   build/out/linux/    flow-agent (x86_64, glibc >= 2.35), .deb, install.sh, systemd user unit
+#   build/out/linux/    flow-agent, flow-tray (x86_64, glibc >= 2.35), .deb, install.sh,
+#                       systemd user unit, desktop entries, icons
 #   build/out/windows/  FlowCursor-setup-<version>.exe (NSIS), flow-agent.exe, flow-tray.exe,
 #                       install.ps1 / uninstall.ps1 (scripted / elevated installs)
 #   build/out/server/   flow-server binary + compose.yaml
