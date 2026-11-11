@@ -186,6 +186,12 @@ impl Backend for WaylandBackend {
     fn keep_edges_stable(&self) -> bool {
         true
     }
+    /// Barriers activate capture on contact; GNOME never says which keys
+    /// were already held, so the core holds the pointer at the edge and
+    /// watches the captured keys (see `crate::cross`).
+    fn edge_hit_captures(&self) -> bool {
+        self.cap.is_some()
+    }
     fn set_clipboard(&self, content: &ClipContent) {
         if self.portal_clip {
             if let Some(i) = &self.inj {
