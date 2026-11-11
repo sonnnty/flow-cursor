@@ -61,6 +61,8 @@ VIAddVersionKey "LegalCopyright" "MIT License"
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 !include "Sections.nsh"
+!include "StrFunc.nsh"
+${StrStr}
 !include "FileFunc.nsh"
 !include "nsDialogs.nsh"
 !include "WinMessages.nsh"
@@ -210,10 +212,15 @@ Section "Start ${APP} when I sign in" SecAutostart
   ; The tray starts at sign-in and starts the agent. An agent installed to
   ; run elevated by install.ps1 -Elevated (scheduled task) must not get a
   ; second, unelevated copy from the tray.
+  ; Exit code and output both: some schtasks implementations (Wine)
+  ; answer 0 for a task that does not exist.
   StrCpy $0 ""
-  nsExec::Exec 'schtasks /Query /TN "FlowCursor Agent"'
+  nsExec::ExecToStack 'schtasks /Query /TN "FlowCursor Agent"'
   Pop $1
+  Pop $2
+  ${StrStr} $3 $2 "FlowCursor Agent"
   ${If} $1 == 0
+  ${AndIf} $3 != ""
     StrCpy $0 " --no-start-agent"
   ${EndIf}
   WriteRegStr HKCU "${RUNKEY}" "${APP}" '"$INSTDIR\flow-tray.exe"$0'
