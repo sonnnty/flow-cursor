@@ -7,6 +7,7 @@
 
 pub mod conn;
 pub mod state;
+pub mod updates;
 pub mod web;
 
 use anyhow::{Context, Result};
@@ -32,6 +33,9 @@ pub struct HubConfig {
     pub admin_token: Option<String>,
     pub mdns: bool,
     pub name: String,
+    /// Directory with the agent builds this hub offers for self-update
+    /// (see [`updates`]); None or missing = no updates offered.
+    pub agent_builds: Option<PathBuf>,
 }
 
 /// Callback that applies a new log filter.
@@ -133,6 +137,9 @@ pub async fn start(cfg: HubConfig) -> Result<HubHandle> {
             pairs: Default::default(),
             last_clip: None,
             next_conn_id: 1,
+            updating: Default::default(),
+            legacy: Default::default(),
+            builds: cfg.agent_builds.as_deref().and_then(updates::load_logged),
         }),
         admin_token,
         admin_token_source,
@@ -200,6 +207,7 @@ mod tests {
             admin_token: t.map(Into::into),
             mdns: false,
             name: "t".into(),
+            agent_builds: None,
         };
         let stored = ("stored".to_string(), AdminTokenSource::Persisted);
         assert_eq!(cfg(None).effective_admin_token("stored"), stored);

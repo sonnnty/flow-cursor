@@ -6,8 +6,8 @@ use flow_net::frame::{read_frame, write_frame, write_raw};
 use flow_net::tls::ServerPin;
 use flow_net::Identity;
 use flow_proto::{
-    FromHub, Hello, LinkDatagram, LinkMsg, OsKind, RelayDatagramDown, RelayDatagramUp, RelayDown, RelayUp, ToHub,
-    ALPN_HUB, ALPN_P2P, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
+    HelloReply, LinkDatagram, LinkMsg, RelayDatagramDown, RelayDatagramUp, RelayDown, RelayUp, SessionMode,
+    UpdateFromHub, ALPN_HUB, ALPN_P2P, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
 };
 use std::time::Duration;
 
@@ -24,64 +24,105 @@ async fn unknown_agent_without_token_rejected_by_hub() {
     let conn = ep.connect_with(cc, hub.quic_addr, SNI).unwrap().await.unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
 
-    let hello = Hello {
-        protocol_version: PROTOCOL_VERSION,
-        agent_version: "0.1.0".into(),
-        hostname: "attacker-box".into(),
-        os: OsKind::Linux,
-        join_token: None, // No join token!
-        p2p_port: 0,
-        p2p_addrs: vec![],
-        monitors: monitor(1920, 1080),
-        caps: flow_proto::Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() },
-    };
-    write_frame(&mut send, &ToHub::Hello(hello)).await.unwrap();
+    // No join token!
+    write_frame(&mut send, &hello_frame(PROTOCOL_VERSION, None, "attacker-box")).await.unwrap();
 
-    let resp = read_frame::<_, FromHub>(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+    let resp = read_frame::<_, HelloReply>(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
     match resp {
-        Some(FromHub::Reject { reason }) => {
+        Some(HelloReply::Rejected { reason }) => {
             assert!(reason.contains("no valid join token"), "expected reject reason, got {reason}");
         }
-        other => panic!("expected FromHub::Reject, got {other:?}"),
+        other => panic!("expected HelloReply::Rejected, got {other:?}"),
     }
 
     // Hub must close the connection
     let err = conn.closed().await;
     assert!(format!("{err}").contains("no valid join token"));
+    // Also in update-only mode: an unknown certificate needs a token.
+    let id = Identity::generate("attacker2").unwrap();
+    let cc = client_config(&id, ALPN_HUB, ServerPin::Exact(hub.fingerprint()), TransportOpts::HUB).unwrap();
+    let conn = ep.connect_with(cc, hub.quic_addr, SNI).unwrap().await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(&mut send, &hello_frame(PROTOCOL_VERSION + 1, None, "attacker-box")).await.unwrap();
+    let resp = read_frame::<_, HelloReply>(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+    assert!(matches!(resp, Some(HelloReply::Rejected { .. })), "{resp:?}");
     hub.shutdown().await;
 }
 
+/// The protocol-3 control messages, as agents from before the update
+/// handshake encode them (only what this test needs).
+#[derive(serde::Serialize)]
+enum ToHubV3 {
+    Hello { protocol_version: u32, agent_version: String, join_token: Option<String>, hostname: String },
+}
+
+#[derive(serde::Deserialize, Debug)]
+enum FromHubV3 {
+    #[allow(dead_code)]
+    Welcome(u32),
+    Reject {
+        reason: String,
+    },
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hub_rejects_protocol_version_mismatch() {
+async fn other_protocols_get_update_only_and_legacy_agents_a_clear_reject() {
     init_logs();
     let hub = start_hub().await;
     let token = hub.join_token();
-    let id = Identity::generate("version-mismatch").unwrap();
-
-    let cc = client_config(&id, ALPN_HUB, ServerPin::Exact(hub.fingerprint()), TransportOpts::HUB).unwrap();
     let ep = flow_net::endpoint::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
-    let conn = ep.connect_with(cc, hub.quic_addr, SNI).unwrap().await.unwrap();
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-
-    let hello = Hello {
-        protocol_version: PROTOCOL_VERSION + 999, // Incompatible protocol version
-        agent_version: "99.0.0".into(),
-        hostname: "future-box".into(),
-        os: OsKind::Linux,
-        join_token: Some(token),
-        p2p_port: 0,
-        p2p_addrs: vec![],
-        monitors: monitor(1920, 1080),
-        caps: flow_proto::Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() },
+    let connect = |name: &str| {
+        let id = Identity::generate(name).unwrap();
+        let cc = client_config(&id, ALPN_HUB, ServerPin::Exact(hub.fingerprint()), TransportOpts::HUB).unwrap();
+        ep.connect_with(cc, hub.quic_addr, SNI).unwrap()
     };
-    write_frame(&mut send, &ToHub::Hello(hello)).await.unwrap();
 
-    let resp = read_frame::<_, FromHub>(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
-    match resp {
-        Some(FromHub::Reject { reason }) => {
-            assert!(reason.contains("protocol version mismatch"), "expected version mismatch, got {reason}");
+    // An agent of another protocol (4+) enrols and gets an update-only
+    // session: the frozen reply, then only update frames.
+    let conn = connect("future-box").await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(&mut send, &hello_frame(PROTOCOL_VERSION + 999, Some(&token), "future-box")).await.unwrap();
+    let resp = read_frame::<_, HelloReply>(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+    let node = match resp {
+        Some(HelloReply::Accepted(a)) => {
+            assert!(matches!(a.mode, SessionMode::UpdateOnly { .. }), "{a:?}");
+            assert_eq!(a.hub_protocol, PROTOCOL_VERSION);
+            a.node_id
         }
-        other => panic!("expected FromHub::Reject, got {other:?}"),
+        other => panic!("expected update-only Accepted, got {other:?}"),
+    };
+    match read_frame::<_, UpdateFromHub>(&mut recv, MAX_CONTROL_FRAME).await.unwrap() {
+        Some(UpdateFromHub::Offer(o)) => assert!(o.release.is_none(), "this hub carries no agent builds"),
+        other => panic!("expected an offer, got {other:?}"),
+    }
+    // Not online for anyone: a full agent does not see it as a peer.
+    let a = start_agent(&hub, AgentSpec::new(&token)).await;
+    assert!(a.agent.wait(T, |s| s.connected).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(a.agent.status().peers.iter().all(|p| p.id != node || !p.online), "{:?}", a.agent.status().peers);
+    let (code, body) = http(hub.http_addr.unwrap(), "GET", "/api/state", Some(ADMIN), None).await;
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let n = v["nodes"].as_array().unwrap().iter().find(|n| n["id"] == node.0).unwrap().clone();
+    assert_eq!(n["status"], "update_only", "{n}");
+
+    // An agent from before the handshake (protocol 3) is told, in its own
+    // reject format, to be updated by hand.
+    let conn = connect("old-box").await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let old = ToHubV3::Hello {
+        protocol_version: 3,
+        agent_version: "0.1.0".into(),
+        join_token: Some(token.clone()),
+        hostname: "old-box".into(),
+    };
+    write_frame(&mut send, &old).await.unwrap();
+    match read_frame::<_, FromHubV3>(&mut recv, MAX_CONTROL_FRAME).await.unwrap() {
+        Some(FromHubV3::Reject { reason }) => {
+            assert!(reason.contains("by hand"), "{reason}");
+            assert!(reason.contains("0.1.0"), "{reason}");
+        }
+        other => panic!("expected the protocol-3 Reject, got {other:?}"),
     }
     hub.shutdown().await;
 }
@@ -256,6 +297,7 @@ async fn empty_admin_token_falls_back_to_the_persisted_one() {
         admin_token: Some(String::new()),
         mdns: false,
         name: "itest".into(),
+        agent_builds: None,
     })
     .await
     .unwrap();

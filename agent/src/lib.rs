@@ -12,5 +12,6 @@ pub mod logbuf;
 pub mod netcheck;
 pub mod park;
 pub mod problems;
+pub mod update;
 
 pub use crate::core::{start, start_with, AgentHandle, AgentObserver, AgentStatus, LogHook, StartOptions};

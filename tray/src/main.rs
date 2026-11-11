@@ -9,18 +9,24 @@
 //!   flow-tray --window        only the status window
 //!   flow-tray --quit          ask the running tray to exit
 //!   --no-start-agent          (Windows) never start flow-agent from the tray
+//!   flow-tray --version       print the build identity
 
 use flow_tray::instance::{self, TRAY_LOCK, WINDOW_LOCK};
 
-const USAGE: &str = "usage: flow-tray [--show | --window | --quit] [--no-start-agent]";
+const USAGE: &str = "usage: flow-tray [--show | --window | --quit | --version] [--no-start-agent]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |f: &str| args.iter().any(|a| a == f);
-    if let Some(a) = args.iter().find(|a| !matches!(a.as_str(), "--show" | "--window" | "--quit" | "--no-start-agent"))
+    if let Some(a) =
+        args.iter().find(|a| !matches!(a.as_str(), "--show" | "--window" | "--quit" | "--version" | "--no-start-agent"))
     {
         eprintln!("unknown argument {a}\n{USAGE}");
         std::process::exit(2);
+    }
+    if has("--version") {
+        println!("flow-tray {}", flow_version::FULL);
+        return;
     }
     if has("--quit") {
         quit_running_tray();
@@ -30,6 +36,16 @@ fn main() {
         return window();
     }
     let show = has("--show");
+    // Started again after an update: the old process may still be exiting
+    // (Windows) and hold the lock for a moment.
+    if std::env::var_os(flow_tray::ENV_REEXEC).is_some() {
+        for _ in 0..50 {
+            if !instance::is_locked(TRAY_LOCK) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
     let lock = match instance::try_lock(TRAY_LOCK) {
         Ok(Some(l)) => Some(l),
         Ok(None) => {
@@ -48,9 +64,17 @@ fn main() {
     };
     let r = run_tray(show, !has("--no-start-agent"));
     drop(lock);
-    if let Err(e) = r {
-        eprintln!("flow-tray: {e:#}");
-        std::process::exit(1);
+    match r {
+        Ok(None) => {}
+        Ok(Some(build)) => {
+            let e = flow_tray::actions::restart_tray(&build);
+            eprintln!("flow-tray: starting the updated tray: {e}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("flow-tray: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -74,17 +98,17 @@ fn window() {
 }
 
 #[cfg(target_os = "linux")]
-fn run_tray(show: bool, _start_agent: bool) -> anyhow::Result<()> {
+fn run_tray(show: bool, _start_agent: bool) -> anyhow::Result<Option<String>> {
     flow_tray::tray_linux::run(show)
 }
 
 #[cfg(windows)]
-fn run_tray(show: bool, start_agent: bool) -> anyhow::Result<()> {
+fn run_tray(show: bool, start_agent: bool) -> anyhow::Result<Option<String>> {
     flow_tray::tray_windows::run(show, start_agent)
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn run_tray(_show: bool, _start_agent: bool) -> anyhow::Result<()> {
+fn run_tray(_show: bool, _start_agent: bool) -> anyhow::Result<Option<String>> {
     anyhow::bail!("no tray icon on this platform; use flow-tray --window")
 }
 

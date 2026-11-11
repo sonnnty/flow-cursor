@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 flow-proto.workspace = true
+flow-version.workspace = true
 flow-layout.workspace = true
 flow-net.workspace = true
 flow-keymap.workspace = true
@@ -25,4 +26,5 @@ axum.workspace = true
 rand.workspace = true
 data-encoding.workspace = true
 subtle.workspace = true
+sha2.workspace = true
 hostname.workspace = true

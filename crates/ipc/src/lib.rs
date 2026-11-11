@@ -65,6 +65,9 @@ pub enum Command {
     },
     /// Stop the agent.
     Shutdown,
+    /// Install the build the hub carries as soon as this machine is idle
+    /// (any update policy; also retries a build that failed before).
+    UpdateNow,
 }
 
 fn default_log_lines() -> usize {
@@ -93,7 +96,10 @@ struct Envelope<T> {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
+    /// Full build identity (`0.2.0+142.g1a2b3c4d5e`, see `flow-version`).
     pub agent_version: String,
+    /// `linux-x86_64`, `windows-x86_64`.
+    pub platform: String,
     pub pid: u32,
     /// Input backend in use (wayland, x11, windows, sim).
     pub backend: String,
@@ -154,6 +160,37 @@ pub struct Snapshot {
     pub problems: Vec<String>,
     /// Lesser limitations (no clipboard access): listed, no error icon.
     pub warnings: Vec<String>,
+
+    /// Self-update from the hub.
+    pub update: UpdateInfo,
+}
+
+/// Self-update state of the agent.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateInfo {
+    /// `auto`, `notify` or `off` (empty until the hub sent its policy).
+    pub policy: String,
+    /// `current`, `available`, `downloading`, `ready` (waits until this
+    /// machine is idle), `installing` or `unsupported`.
+    pub state: String,
+    /// The hub's build when it differs from this one (`0.2.1+150.gabc`).
+    pub available: Option<String>,
+    /// Download progress in percent.
+    pub progress: Option<u8>,
+    /// Why this agent cannot update itself (`unsupported`).
+    pub detail: Option<String>,
+    /// The last update that failed: `<build>: <reason>`.
+    pub failed: Option<String>,
+    /// That failure put the previous version back.
+    pub failed_rolled_back: bool,
+    /// Connected to a hub of another protocol, only to update (its reason).
+    pub update_only: Option<String>,
+    /// "Update now" can do something.
+    pub can_update_now: bool,
+    /// Build of the `flow-tray` binary the last update or rollback
+    /// installed; a tray of another build restarts itself.
+    pub tray_build: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,12 +332,14 @@ mod tests {
             Command::Join { token: "FC1-abc".into(), hub: Some("192.168.1.10".into()) },
             Command::Join { token: "FC1-abc".into(), hub: None },
             Command::Shutdown,
+            Command::UpdateNow,
         ];
         for c in cmds {
             assert_eq!(parse_request(&line(&c)).unwrap(), c);
         }
         // The documented wire format (other clients may hand-write it).
         assert_eq!(line(&Command::Pause), r#"{"v":1,"cmd":"pause"}"#);
+        assert_eq!(line(&Command::UpdateNow), r#"{"v":1,"cmd":"update_now"}"#);
         assert_eq!(parse_request(r#"{"v":1,"cmd":"logs"}"#).unwrap(), Command::Logs { max: DEFAULT_LOG_LINES });
         assert_eq!(
             parse_request(r#"{"cmd":"join","token":"FC1-x","v":1}"#).unwrap(),

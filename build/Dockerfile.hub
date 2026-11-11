@@ -1,0 +1,17 @@
+# FlowCursor hub image with the agent builds it offers for self-update.
+# Built by build/build.sh from build/out (no compile here):
+#   docker build -f build/Dockerfile.hub -t flow-cursor-server:<tag> build/out
+# The flow-server binary is the one built next to the agents (same build id),
+# so the hub offers exactly the agents of its own build.
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY server/flow-server /usr/local/bin/flow-server
+# manifest.json + linux-x86_64/ + windows-x86_64/ (read-only, served to
+# agents over the authenticated QUIC connection only).
+COPY hub/agent-builds /usr/share/flowcursor/agent-builds
+COPY --chown=65532:65532 hub/data /data
+ENV FLOW_DATA=/data RUST_LOG=info FLOW_AGENT_BUILDS=/usr/share/flowcursor/agent-builds
+VOLUME ["/data"]
+# QUIC for agents (UDP), dashboard (TCP), mDNS (UDP 5353, host network).
+EXPOSE 7878/udp 7880/tcp
+USER nonroot
+ENTRYPOINT ["/usr/local/bin/flow-server"]

@@ -17,15 +17,16 @@
 5. [ติดตั้ง Agent บน Windows 11](#ติดตั้ง-agent-บน-windows-11)
 6. [ไอคอนถาดระบบ (tray) และหน้าต่างสถานะ](#ไอคอนถาดระบบ-tray-และหน้าต่างสถานะ)
 7. [Dashboard และหน้า Settings](#dashboard-และหน้า-settings)
-8. [ใช้งานเฉพาะในเครือข่ายที่อนุญาต (allowed networks)](#ใช้งานเฉพาะในเครือข่ายที่อนุญาต-allowed-networks)
-9. [กดปุ่มค้างเพื่อข้ามจอ (crossing key)](#กดปุ่มค้างเพื่อข้ามจอ-crossing-key)
-10. [เคอร์เซอร์ของเครื่องตัวเองระหว่างคุมเครื่องอื่น](#เคอร์เซอร์ของเครื่องตัวเองระหว่างคุมเครื่องอื่น)
-11. [ไฟล์ตั้งค่าของ Agent](#ไฟล์ตั้งค่าของ-agent)
-12. [Emergency hotkey](#emergency-hotkey)
-13. [Build จากซอร์ส](#build-จากซอร์ส)
-14. [การทดสอบและวัด latency](#การทดสอบและวัด-latency)
-15. [ข้อจำกัดที่รู้อยู่](#ข้อจำกัดที่รู้อยู่)
-16. [แก้ปัญหาเบื้องต้น](#แก้ปัญหาเบื้องต้น)
+8. [อัปเดต agent อัตโนมัติจาก hub](#อัปเดต-agent-อัตโนมัติจาก-hub)
+9. [ใช้งานเฉพาะในเครือข่ายที่อนุญาต (allowed networks)](#ใช้งานเฉพาะในเครือข่ายที่อนุญาต-allowed-networks)
+10. [กดปุ่มค้างเพื่อข้ามจอ (crossing key)](#กดปุ่มค้างเพื่อข้ามจอ-crossing-key)
+11. [เคอร์เซอร์ของเครื่องตัวเองระหว่างคุมเครื่องอื่น](#เคอร์เซอร์ของเครื่องตัวเองระหว่างคุมเครื่องอื่น)
+12. [ไฟล์ตั้งค่าของ Agent](#ไฟล์ตั้งค่าของ-agent)
+13. [Emergency hotkey](#emergency-hotkey)
+14. [Build จากซอร์ส](#build-จากซอร์ส)
+15. [การทดสอบและวัด latency](#การทดสอบและวัด-latency)
+16. [ข้อจำกัดที่รู้อยู่](#ข้อจำกัดที่รู้อยู่)
+17. [แก้ปัญหาเบื้องต้น](#แก้ปัญหาเบื้องต้น)
 
 ---
 
@@ -112,17 +113,21 @@ Agent เป็น process ที่รันตลอดและไม่ม�
 ต้องใช้ `network_mode: host` (QUIC/UDP และ mDNS multicast ข้าม bridge network ของ Docker ไม่ได้)
 
 ```bash
-git clone <repo> flow-cursor && cd flow-cursor/deploy
-FLOW_ADMIN_TOKEN='ตั้งรหัส-dashboard-ยาวๆ' docker compose up -d --build
-docker compose logs flow-server | grep -E "join token|dashboard token|fingerprint"
+git clone <repo> flow-cursor && cd flow-cursor
+build/build.sh                       # hub image + agent ของ build เดียวกัน (สำหรับอัปเดตอัตโนมัติ)
+cd deploy && FLOW_ADMIN_TOKEN='ตั้งรหัส-dashboard-ยาวๆ' docker compose up -d
+docker compose logs flow-server | grep -E "join token|dashboard token|fingerprint|agent builds"
 ```
+(`docker compose up -d --build` ก็ได้ แต่ได้ hub ที่ไม่มี agent builds — agent จะไม่ได้รับอัปเดต ดู [อัปเดต agent อัตโนมัติ](#อัปเดต-agent-อัตโนมัติจาก-hub))
 
 * พอร์ต: **UDP 7878** (agent ↔ hub, QUIC), **TCP 7880** (dashboard), UDP 5353 (mDNS) — เปิด firewall ของ server ด้วย
 * ข้อมูลทั้งหมดอยู่ใน volume `flowcursor-data` (`/data`): `hub.crt`/`hub.key` (identity), `state.json` (เครื่อง, layout, settings, secret)
   **อย่าลบ volume** ไม่เช่นนั้น fingerprint ของ Hub จะเปลี่ยนและทุก agent ต้อง join ใหม่
 * ถ้าไม่ตั้ง `FLOW_ADMIN_TOKEN` หรือตั้งเป็นค่าว่าง (ค่า default ของ `compose.yaml`) Hub จะสุ่ม token, เก็บใน volume และพิมพ์ `dashboard token: …` ไว้ใน log ทุกครั้งที่เริ่ม
   (ถ้าตั้งเองจะไม่พิมพ์)
-* ใช้ image ที่ build ไว้แล้ว: `build/build.sh` สร้าง `flow-cursor-server:flowcursor-mvp` (ดู [Build](#build-จากซอร์ส))
+* image: `build/build.sh` สร้าง `flow-cursor-server:flowcursor-mvp` (หรือ `FLOW_TAG=<tag>`) ซึ่งมี agent Linux/Windows ของ build เดียวกันอยู่ข้างใน
+  (ดู [Build](#build-จากซอร์ส)) — **อัปเดต FlowCursor ทั้งระบบ = build image ใหม่แล้ว `docker compose up -d`**: agent ทุกเครื่องอัปเดตตัวเองตาม
+* ตัวแปร `FLOW_AGENT_BUILDS` = โฟลเดอร์ agent builds ใน image (ค่าเริ่มต้น `/usr/share/flowcursor/agent-builds`)
 * ตัวแปรเพิ่มเติม: `FLOW_QUIC_ADDR`, `FLOW_HTTP_ADDR`, `FLOW_NO_MDNS=1`, `FLOW_NAME`, `RUST_LOG`
 * พิมพ์ join token (ระหว่างที่ hub รันอยู่ก็ได้): `docker compose exec flow-server flow-server --print-token` — image เป็น distroless จึงไม่มี shell
 
@@ -155,7 +160,7 @@ busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/
 ./install.sh                          # ไม่ใส่ token: ใส่ทีหลังในหน้าต่าง FlowCursor (เปิดเองครั้งแรก)
 
 # หรือ .deb (มีทั้ง flow-agent และ flow-tray)
-sudo apt install ./flow-agent_0.1.0_amd64.deb
+sudo apt install ./flow-agent_0.2.0_amd64.deb
 systemctl --user enable --now flow-agent
 flow-tray --show                      # หรือ logout/login: ไอคอนเริ่มเองทุกครั้งที่ login
 ```
@@ -165,6 +170,8 @@ flow-tray --show                      # หรือ logout/login: ไอคอ�
 * `flow-tray` — ไอคอนบนแถบด้านบน เริ่มเองตอน login จาก `~/.config/autostart/flowcursor-tray.desktop`
   (`.deb`: `/etc/xdg/autostart/`), เมนูแอป **FlowCursor** (เปิดหน้าต่างสถานะ) และไอคอนในธีม hicolor
 * ถอนการติดตั้ง: `./uninstall.sh` (เพิ่ม `--purge` เพื่อลบ identity/ข้อมูล) หรือ `sudo apt remove flow-agent`
+* อัปเดต: แบบ `install.sh` agent อัปเดตตัวเองจาก hub ([ดูหัวข้อ](#อัปเดต-agent-อัตโนมัติจาก-hub)); แบบ `.deb` อัปเดตด้วย apt/dpkg
+  (agent จะบอกว่า *installed by package*) — ติดตั้งจาก 0.1.x ครั้งแรกต้องรัน `install.sh` เวอร์ชันนี้ด้วยมือครั้งเดียว
 
 **ไอคอนถาดระบบบน GNOME**: GNOME ไม่มี system tray ในตัว ต้องเปิด extension
 **"AppIndicator and KStatusNotifierItem Support"** — Zorin OS และ Ubuntu เปิดไว้ให้แล้ว
@@ -224,7 +231,8 @@ GNOME ไม่รองรับ `wlr-data-control` โปรแกรมเบ
   แบบไม่ผูกกับ console ใด (ปิดหน้าต่าง terminal แล้ว agent ไม่ตายตาม) และเริ่มใหม่ให้ถ้า agent หยุดไป (ไม่ถี่กว่าทุก 30 วินาที)
 * Log: `%LOCALAPPDATA%\flowcursor\data\agent.log` · config: `%APPDATA%\flowcursor\config\agent.toml`
 
-**อัปเดต**: รันไฟล์ติดตั้งเวอร์ชันใหม่ทับได้เลย — ตัวติดตั้งปิดไอคอนและหยุด agent ที่รันอยู่, แทนที่ไฟล์, แล้วเริ่มใหม่
+**อัปเดต**: ตั้งแต่ 0.2.0 agent อัปเดตตัวเองจาก hub ([ดูหัวข้อ](#อัปเดต-agent-อัตโนมัติจาก-hub)) — เครื่องที่ยังเป็น 0.1.x
+ต้องรัน setup exe เวอร์ชันนี้ทับด้วยมือครั้งเดียว: ตัวติดตั้งปิดไอคอนและหยุด agent ที่รันอยู่, แทนที่ไฟล์, แล้วเริ่มใหม่
 ค่าตั้งและ identity (`%APPDATA%\flowcursor`, `%LOCALAPPDATA%\flowcursor`) ไม่ถูกแตะ จึงไม่ต้อง join ใหม่
 
 **ถอนการติดตั้ง**: Settings → Apps → FlowCursor → Uninstall (หรือ Start menu → FlowCursor → Uninstall) —
@@ -232,7 +240,7 @@ GNOME ไม่รองรับ `wlr-data-control` โปรแกรมเบ
 
 **ติดตั้งแบบไม่มีหน้าจอ / สคริปต์** (เช่นผ่าน remote shell):
 ```powershell
-.\FlowCursor-setup-0.1.0.exe /S /TOKEN=FC1-XXXX-YYYY /HUB=192.168.1.10 /FIREWALL
+.\FlowCursor-setup-0.2.0.exe /S /TOKEN=FC1-XXXX-YYYY /HUB=192.168.1.10 /FIREWALL
 ```
 * `/S` เงียบ, `/TOKEN=` `/HUB=` join ทันที, `/FIREWALL` เพิ่ม firewall rule (ถ้าไม่ได้รันแบบ admin จะมี UAC),
   `/NOAUTOSTART` ไม่เริ่มตอน login, `/NORUN` ไม่เริ่มหลังติดตั้ง, `/D=C:\path` เปลี่ยนที่ติดตั้ง (ต้องอยู่ท้ายสุด)
@@ -265,7 +273,8 @@ Linux: แถบด้านบนของ GNOME ผ่าน AppIndicator) —
 
 **เมนู**: บรรทัดสถานะ (hub เชื่อมต่อหรือไม่, ชื่อเครื่องนี้, การแชร์, focus — กำลังคุม/ถูกคุมโดยใคร, แต่ละเครื่อง: p2p/relay + RTT
 หรือ offline/away, ปัญหาที่พบ), **Open status window**, **Open dashboard** (`http://<hub>:7880` ในเบราว์เซอร์),
-**Pause sharing / Resume sharing**, **Restart agent** (หรือ *Start agent* เมื่อ agent ไม่ทำงาน), **Open log**, **Quit**
+**Pause sharing / Resume sharing**, **Update now to …** (เมื่อ hub มีเวอร์ชันอื่น), **Restart agent** (หรือ *Start agent* เมื่อ agent ไม่ทำงาน), **Open log**, **Quit**
+— บรรทัดสถานะมี `Version:` (เวอร์ชันที่รันอยู่) และ `Update:` (มีเวอร์ชันใหม่ / กำลังโหลด / รอเครื่องว่าง / ล้มเหลวเพราะอะไร)
 
 * **Pause sharing** ทำเหมือน away ทุกอย่าง: ไม่ข้ามขอบจอไปเครื่องอื่น, ไม่ยอมให้ถูกคุม, ไม่แชร์คลิปบอร์ด, dashboard แสดงเครื่องนี้เป็น away
   ถ้ากำลังคุม/ถูกคุมอยู่จะคืนเมาส์และปล่อยปุ่มทันที — **การ pause ไม่ถูกบันทึกถาวร**: คงอยู่ถ้ากด Restart agent
@@ -320,7 +329,121 @@ Windows = named pipe `\\.\pipe\flowcursor-agent-<SID ของผู้ใช้
   ใต้ตัวเลือกเคอร์เซอร์จะบอกถ้า backend ของเครื่องนั้นทำบางตัวเลือกไม่ได้ และจะทำแบบไหนแทน (เช่น GNOME/Wayland)
 * ตรวจรูปแบบก่อนบันทึก: CIDR ผิด (เช่น `10.10.15.0/33`) หรือชื่อปุ่มที่ไม่รู้จัก จะถูกปฏิเสธพร้อมข้อความบอกว่าผิดตรงไหน
 * เปลี่ยนชื่อ/ปิด/ลบเครื่อง และ regenerate join token อยู่ในหน้า Overview
-* Dashboard เป็น HTTP ธรรมดา — ใช้ใน LAN ที่ไว้ใจได้ หรือวาง reverse proxy ที่มี TLS ไว้ด้านหน้า
+* Overview → Machines คอลัมน์ **Version / update**: เวอร์ชันและ platform ของ agent, สถานะอัปเดต (current / available / downloading /
+  ready, waits for idle / installing / manual update / update by hand), ความล้มเหลวล่าสุดพร้อมเหตุผล, policy ที่ใช้อยู่ และปุ่ม **Update now**
+* Settings → **Agent updates** (automatic / notify / off) และ Per-machine settings → **Updates** — ดู [อัปเดต agent อัตโนมัติ](#อัปเดต-agent-อัตโนมัติจาก-hub)
+* Dashboard เป็น HTTP ธรรมดา: token ดักได้ใน LAN — ใช้ใน LAN ที่ไว้ใจได้ หรือวาง reverse proxy ที่มี TLS ไว้ด้านหน้า
+  ([วิธีทำ](#hub-ของคุณเอง-repo-นี้เป็น-public)); dashboard ไม่มีอะไรเกี่ยวกับการส่งไฟล์อัปเดต
+
+## อัปเดต agent อัตโนมัติจาก hub
+
+ตั้งแต่ **0.2.0** ไม่ต้องติดตั้ง agent ใหม่ทีละเครื่องอีก: deploy hub image ใหม่ แล้ว agent ทุกเครื่องอัปเดตตัวเองให้ตรงกับ build ที่อยู่ใน hub นั้น
+
+### เวอร์ชันและ build
+* ทุก build มีเวอร์ชัน `<เวอร์ชัน workspace>+<build id>` เช่น `0.2.0+83.g1a2b3c4d5e`
+  (`<จำนวน commit>.g<commit>` จาก `build/build.sh`; มี `.dirty.<เวลา UTC>` ต่อท้ายถ้า build จากโค้ดที่ยังไม่ commit; `cargo build` ธรรมดาได้ `+dev`)
+* ดูได้ที่ `flow-agent --version` / `flow-tray --version` / `flow-server --version`, `flow-agent status`, เมนู tray และหน้าต่างสถานะ (Version),
+  dashboard (คอลัมน์ **Version / update** ของแต่ละเครื่อง และ header บอก build ของ hub กับ agent builds ที่ hub มี)
+* agent รายงานเวอร์ชันและ platform (`linux-x86_64`, `windows-x86_64`) ทุกครั้งที่เชื่อมต่อ; build ไม่ตรงกับของ hub = ต้องอัปเดต
+  (ทั้งขึ้นและลงเวอร์ชัน — agent ตาม hub เสมอ)
+
+### hub พก agent ไว้ใน image
+`build/build.sh` ใส่ agent ของ **build เดียวกับ hub** ลงใน image ที่ `/usr/share/flowcursor/agent-builds/`:
+* `linux-x86_64/`: `flow-agent`, `flow-tray`, `flow-agent.service`, ไฟล์ `.desktop`, ไอคอน (ไฟล์ที่ `install.sh` ติดตั้ง)
+* `windows-x86_64/`: `flow-agent.exe`, `flow-tray.exe` (ใช้อัปเดต) และ `FlowCursor-setup-<เวอร์ชัน>.exe` (สำหรับติดตั้งเครื่องใหม่)
+* `manifest.json`: เวอร์ชัน, build id, commit, ชื่อไฟล์ ขนาด และ SHA-256 ของทุกไฟล์ (เขียนโดย `flow-server` ที่ build พร้อมกัน จึงตรงกับ hub เสมอ)
+
+hub ตรวจขนาดและ SHA-256 ของทุกไฟล์เทียบ manifest ตอนเริ่ม (platform ที่ไม่ตรงจะไม่ถูกเสนอ และ log บอกเหตุผล)
+ค่าใช้จ่าย: layer ของ agent builds 48.5 MB (agent Linux 12 MB + tray 14 MB, Windows exe 17 MB + setup 5 MB);
+`docker images` รายงาน image 120 MB (เดิม 47 MB) และทั้ง image บีบอัด (gzip) สำหรับส่ง/ดึงราว 36 MB
+(ไม่บีบอัดไฟล์ซ้ำใน image: layer ของ Docker ถูกบีบอัดตอน push/pull อยู่แล้ว)
+คัดลอก setup exe ออกจาก image เพื่อติดตั้งเครื่องใหม่:
+`docker create --name fc flow-cursor-server:<tag> && docker cp fc:/usr/share/flowcursor/agent-builds ./agent-builds && docker rm fc`
+
+### ความปลอดภัย (ทุกปุ่มที่กดผ่านโปรแกรมนี้ — ช่องทางอัปเดตที่คนอื่นป้อนได้ = keylogger)
+* agent โหลดไฟล์อัปเดตจาก **hub ที่ join ไว้เท่านั้น** ผ่านการเชื่อมต่อ QUIC เดิม (ที่อยู่เดิม, fingerprint ของ hub ที่ pin ไว้ตอน join)
+  ไม่มี URL, ไม่มีเซิร์ฟเวอร์อัปเดตกลาง, ไม่เรียก GitHub
+* ชื่อ ขนาด และ SHA-256 ของทุกไฟล์มาจาก "offer" บน control stream ที่ยืนยันตัวตนแล้วเท่านั้น; ขนาดที่ hub ประกาศต้องตรงก่อนเริ่มเขียน,
+  เขียนลง `<ชื่อ>.part` ไม่เกินขนาดนั้น, ตรวจ hash แล้วจึงเปลี่ยนชื่อ; ไฟล์ที่ไม่ตรงถูกทิ้งและบันทึกเป็นอัปเดตที่ล้มเหลว
+* ที่ติดตั้งมาจากตารางคงที่ในโปรแกรม (ไม่ใช่ path จาก network) และแทนทีละไฟล์แบบ atomic (เขียนไฟล์ข้างๆ แล้ว rename ทับ)
+* hub เสิร์ฟเฉพาะไฟล์ที่อยู่ใน manifest ของตัวเอง ตามชื่อใน manifest จากโฟลเดอร์ของ platform นั้น — **dashboard (HTTP) ไม่เสิร์ฟไฟล์อัปเดตเลย**
+
+### Policy (Settings → Agent updates และ Per-machine settings → Updates)
+| ค่า | ทำอะไร |
+| :--- | :--- |
+| `automatic` (ค่าเริ่มต้น) | โหลดและตรวจไฟล์ทันที แล้วติดตั้ง + restart เมื่อเครื่องว่าง |
+| `notify` | tray แสดง "update available" และเมนู/ปุ่ม **Update now to …** — ผู้ใช้เลือกเวลาเอง |
+| `off` | ไม่ทำอะไรเอง (แสดงว่ามีเวอร์ชันใหม่) |
+
+ค่าของเครื่องชนะค่ากลาง และ push ไป agent ทันทีเหมือนค่าอื่น
+**Update now** ใช้ได้ทุก policy: ปุ่มใน dashboard (คอลัมน์ Version / update), เมนู tray / หน้าต่างสถานะ, หรือ `flow-agent update`
+
+### เมื่อไหร่ถึงติดตั้ง และ restart
+* **ไม่ติดตั้งระหว่างใช้งาน**: รอจนเครื่องนี้ไม่ได้คุมเครื่องอื่น ไม่ถูกคุม ไม่ค้างที่ขอบจอ ไม่มีปุ่ม/คลิกค้าง และไม่มี input มา 3 วินาที
+  (ระหว่างนั้นสถานะเป็น *ready, installs when this machine is idle*)
+* แล้วแทนไฟล์และ restart ด้วยเส้นทาง restart เดิมของ agent: Linux = `exec` แทนที่ process เดิม (pid เดิม systemd ไม่เห็นว่าหยุด;
+  ถ้า unit file เปลี่ยนจะ `daemon-reload` + `systemctl --user restart flow-agent`), Windows = process ใหม่แบบ detached แล้วตัวเก่าออก —
+  ทดสอบ e2e ใน Docker: จากเชื่อมต่อถึงรันเวอร์ชันใหม่ราว 2 วินาที; ไอคอน tray เริ่มตัวเองใหม่เป็นเวอร์ชันใหม่ด้วย
+* **GNOME/Wayland**: สิทธิ์ Remote Desktop ใช้ restore token เดิม (ไม่ถามซ้ำ) แต่ **Input Capture ของ GNOME 46 ไม่มี restore token**
+  จึงมีหน้าต่าง "Input capture" ขึ้นหลังอัปเดตทุกครั้ง (เหมือน restart ปกติ) และ agent จะยังไม่ต่อ hub จนกว่าจะกดตอบ
+  — ถ้าไม่อยากให้หน้าต่างโผล่ตอนไม่อยู่หน้าเครื่อง ตั้ง laptop GNOME เป็น `notify` แล้วกด Update now เองตอนอยู่หน้าเครื่อง
+  (เวลารอหน้าต่างนี้ไม่นับเป็นความล้มเหลว ดูด้านล่าง)
+* Linux: แทน `~/.local/bin/flow-agent`, `flow-tray` และ unit/desktop/ไอคอนที่ install.sh ติดตั้ง (เฉพาะไฟล์ที่ยังอยู่และเปลี่ยนจริง —
+  ถ้าลบ autostart ของ tray ไว้ จะไม่ถูกสร้างคืน)
+* Windows: ไฟล์ exe ที่กำลังรันเขียนทับไม่ได้แต่เปลี่ยนชื่อได้ — agent เปลี่ยนชื่อตัวเก่าเป็น `flow-agent.exe.old-xxxxxxxx`
+  แล้ววางตัวใหม่แทน (ตัวเก่าถูกลบตอนเริ่มครั้งถัดไป) และอัปเดตเวอร์ชันใน Settings → Apps
+  เลือกวิธีนี้แทนการรัน setup exe แบบ `/S` เพราะ: ไม่ต้องพึ่งการปิดโปรแกรมของ installer (taskkill) ระหว่างที่ agent ต้องหยุดตัวเอง,
+  setup `/S` จะตั้ง autostart กลับเป็นค่าเริ่มต้นและเปิด tray แบบที่เริ่ม agent ตัวที่สอง (ผิดสำหรับการติดตั้งแบบ `-Elevated`),
+  ใช้ได้ทั้งกับ setup exe และ `install.ps1`, ไม่มีโอกาสเจอ UAC และ rollback ทำได้ด้วยการเปลี่ยนชื่อกลับ
+
+### Rollback
+หลังติดตั้ง agent เก็บสำเนาไฟล์เดิมไว้ (`~/.local/share/flowcursor/update/previous/`, Windows `%LOCALAPPDATA%\flowcursor\data\update\previous\`)
+แล้วเริ่ม **guard** = โปรแกรมเวอร์ชันเก่าจากสำเนานั้น (`flow-agent update-guard`, Linux ใต้ systemd รันเป็น transient user unit จึงไม่ตายตอน restart service)
+ถ้าเวอร์ชันใหม่ **ไม่เริ่มภายใน 30 วินาที**, crash ซ้ำ (เริ่มเกิน 4 ครั้ง), หยุดแล้วไม่กลับมา, หรือ **ไม่ถึง hub (เชื่อมต่อแบบเต็ม) ภายใน 120 วินาที
+หลัง input backend พร้อม** → guard คืนไฟล์เดิม, restart agent เวอร์ชันเก่า และบันทึกความล้มเหลว
+* agent เวอร์ชันเก่ารายงานไปที่ hub: dashboard แสดง `failed <build>: <เหตุผล> (previous version restored)`, tray แสดง *last update failed*
+* **ไม่ลอง build เดิมซ้ำเอง** (ไม่วนลูป) — กด Update now เพื่อลองใหม่, หรือ deploy hub build ใหม่
+* เวลารอหน้าต่างสิทธิ์ของ GNOME (Wayland backend) ไม่นับ; reboot ระหว่างทดลอง: เวอร์ชันใหม่เริ่ม guard ใหม่เอง
+* log ของ guard: `~/.local/share/flowcursor/update/guard.log`; สถานะ: `update-state.json` โฟลเดอร์เดียวกัน
+
+### agent ที่ติดตั้งจาก .deb
+agent ใน `/usr/bin` (จาก `.deb`) **ไม่เขียนทับไฟล์ระบบเอง**: แสดงสถานะ *installed by package, update with apt/dpkg* (tray, dashboard: manual update)
+อัปเดตด้วย `.deb` ใหม่จาก `build/out/linux/`:
+```bash
+sudo apt install ./flow-agent_0.2.0_amd64.deb   # Version ของแพ็กเกจ = <เวอร์ชัน>+<build id> apt จึงรับ build ที่ใหม่กว่าได้
+systemctl --user restart flow-agent && flow-tray --quit; flow-tray &
+```
+
+### ติดตั้งด้วยมือครั้งเดียว (agent ก่อน 0.2.0)
+agent รุ่นก่อน 0.2.0 (protocol 1–3 เช่น 0.1.0 ที่มีตัวเลือกเคอร์เซอร์) **ไม่มีโค้ดอัปเดต** จึงอัปเดตตัวเองไม่ได้:
+hub 0.2.0 ตอบมันด้วยข้อความที่มันเข้าใจ — tray/log ของเครื่องนั้นแสดง
+`hub rejected this agent: … too old to update itself: install FlowCursor 0.2.0 on this machine by hand once …`
+และ dashboard แสดง **update by hand** → ติดตั้ง 0.2.0 ด้วย `install.sh` (Linux) หรือ setup exe (Windows) **ครั้งเดียว** (identity/การ join เดิมยังอยู่)
+หลังจากนั้นทุกเวอร์ชันอัปเดตตัวเองจาก hub
+
+### ความเข้ากันได้ของ protocol
+การทักทาย (handshake) และข้อความอัปเดต **ถูกตรึงรูปแบบไว้ตั้งแต่ protocol 4** (เพิ่มได้แต่ไม่เปลี่ยน; ส่วนที่ไม่รู้จักถูกข้าม):
+* agent protocol เดียวกับ hub → ใช้งานเต็ม
+* agent protocol อื่น (เก่าหรือใหม่กว่า, ≥ 4) → **update-only**: hub รับเชื่อมต่อ แต่ไม่ส่ง input/คลิปบอร์ด/layout ให้ และเครื่องอื่นไม่เห็นเครื่องนี้
+  (dashboard: สถานะ `update-only`, tray: *connected only to update*) — agent โหลดเวอร์ชันของ hub แล้วกลับมาใช้งานเต็ม
+  ถ้า policy เป็น `notify`/`off` เครื่องนั้นใช้ KVM ไม่ได้จนกว่าจะกด Update now (ไอคอน tray เป็นสถานะ error)
+* protocol 1–3 → ข้อความ "ติดตั้งด้วยมือครั้งเดียว" ข้างบน
+
+### hub ของคุณเอง (repo นี้เป็น public)
+* agent อัปเดตจาก **hub ที่ตัวเอง join เท่านั้น** ไม่มีที่อยู่ใดๆ ฝังในโปรแกรม ไม่มีเซิร์ฟเวอร์กลาง — ความเชื่อใจแยกตาม hub:
+  certificate ของ hub ที่ pin ไว้ + SHA-256 จาก manifest ที่ส่งผ่านการเชื่อมต่อนั้น
+* hub แต่ละตัวเสนอ agent ที่ build มาใน image ของตัวเอง: build hub เอง = agent ของคุณอัปเดตเป็น build ของคุณ
+  ```bash
+  FLOW_TAG=myhub build/build.sh        # → image flow-cursor-server:myhub (hub + agent Linux/Windows ของ build นี้)
+  # deploy/compose.yaml: image: flow-cursor-server:myhub แล้ว
+  cd deploy && docker compose up -d
+  ```
+  `docker compose up -d --build` สร้าง hub **ที่ไม่มี agent builds** (`server/Dockerfile`): ใช้งานได้ แต่ agent จะไม่ได้รับอัปเดต
+  (dashboard header: *no agent builds in this hub*)
+* **dashboard เป็น HTTP ธรรมดา**: dashboard token ถูกส่งใน header ทุก request คนใน LAN เดียวกันดักได้ —
+  ถ้า LAN ไม่น่าไว้ใจ ให้ dashboard ฟังเฉพาะ localhost (`FLOW_HTTP_ADDR=127.0.0.1:7880`) แล้ววาง reverse proxy ที่มี TLS ไว้หน้า
+  (เช่น Caddy: `hub.example.lan { reverse_proxy 127.0.0.1:7880 }` หรือ nginx `proxy_pass`) — การอัปเดต agent ไม่ใช้ dashboard
+  จึงไม่ได้รับผลกระทบ (QUIC + TLS 1.3 ที่ pin certificate ไว้)
 
 ## ใช้งานเฉพาะในเครือข่ายที่อนุญาต (allowed networks)
 
@@ -433,7 +556,8 @@ backend = "auto"              # auto | wayland | x11 | windows | sim
 ไฟล์ที่ agent เขียนเอง (ใน `state_dir`, สิทธิ์ 0600): `agent.crt`/`agent.key` (identity), `agent-state.json`
 (node id, fingerprint ของ hub ที่ pin ไว้, ที่อยู่ hub ล่าสุด), `portal-tokens.json` (Linux)
 
-คำสั่ง: `flow-agent run | join <token> [--hub] | status | pause | resume | restart | stop | forget-portal | monitors`
+คำสั่ง: `flow-agent run | join <token> [--hub] | status | pause | resume | restart | stop | update | forget-portal | monitors`
+(`update` = Update now; `status` แสดงเวอร์ชัน, สถานะอัปเดตและความล้มเหลวล่าสุดด้วย)
 (`pause`/`resume`/`restart`/`stop` และ `join` ส่งผ่าน local IPC ไปยัง agent ที่รันอยู่ — ดู [tray](#ไอคอนถาดระบบ-tray-และหน้าต่างสถานะ))
 
 ค่าที่ต้องทำงานได้แม้ไม่มี hub (ที่อยู่ hub, fingerprint, hotkey) อยู่ในไฟล์นี้ ค่าอื่นมาจาก Settings ของ hub
@@ -453,20 +577,25 @@ backend = "auto"              # auto | wayland | x11 | windows | sim
 ต้องมีแค่ Docker:
 
 ```bash
-build/build.sh            # ทุกอย่าง + hub image flow-cursor-server:flowcursor-mvp
+build/build.sh            # ทุกอย่าง + hub image flow-cursor-server:flowcursor-mvp (มี agent builds อยู่ข้างใน)
+FLOW_TAG=myhub build/build.sh   # tag อื่น: flow-cursor-server:myhub
 build/build.sh --no-image # ไม่ build image
 ```
+build id มาจาก git (`<จำนวน commit>.g<commit>`, `.dirty.<เวลา>` ถ้ามีไฟล์ที่ยังไม่ commit) หรือกำหนดเอง `FLOW_BUILD_ID=...`
+ทุกโปรแกรมใน build เดียวกันได้ id เดียวกัน; hub image สร้างจาก `build/out` ด้วย `build/Dockerfile.hub` (distroless, ไม่ compile ซ้ำ)
+และพิมพ์ขนาด image ตอนจบ (ราว 120 MB; layer ของ agent builds 48.5 MB)
 
 ผลลัพธ์ใน `build/out/` (ไม่ commit):
 `linux/` (`flow-agent`, `flow-tray` glibc ≥ 2.35, `.deb`, `install.sh`, `uninstall.sh`, `flow-agent.service`, ไฟล์ `.desktop`, `icons/`),
 `windows/` (**`FlowCursor-setup-<เวอร์ชัน>.exe`** สร้างด้วย NSIS `makensis` ใน container, `flow-agent.exe`/`flow-tray.exe`
 cross-compile ด้วย mingw พร้อมไอคอน/ข้อมูลเวอร์ชันฝังใน exe, `install.ps1`, `uninstall.ps1`),
-`server/` (`flow-server`, `compose.yaml`), `tools/flow-bench`, `SHA256SUMS`
+`server/` (`flow-server`, `compose.yaml`), `hub/agent-builds/` (สิ่งที่ใส่ใน hub image: `manifest.json`, `linux-x86_64/`, `windows-x86_64/`),
+`tools/flow-bench`, `SHA256SUMS`
 
 ไอคอนของแอป (`deploy/icons/`: `.ico` หลายขนาด, PNG, SVG) วาดด้วยโค้ดเดียวกับไอคอนสถานะของ tray —
 สร้างใหม่ด้วย `cargo run -p flow-tray --example gen-icons`
 
-พัฒนาด้วย Rust ในเครื่อง (stable ≥ 1.88; `flow-tray` ต้อง ≥ 1.95 ตาม eframe):
+พัฒนาด้วย Rust ในเครื่อง (stable ≥ 1.89; `flow-tray` ต้อง ≥ 1.95 ตาม eframe):
 ```bash
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 # ตรวจว่าโค้ด Windows compile ได้ (ต้องมี mingw สำหรับ ring — หรือใช้ container ของ build/)
@@ -494,6 +623,15 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
   restart/stop, ข้อความเวอร์ชันผิด/คำสั่งไม่รู้จักได้ error โดยไม่ตัดการเชื่อมต่อ, **สิทธิ์ socket 0600 / โฟลเดอร์ 0700**,
   socket เก่าที่ค้างถูกแทนที่, ไฟล์ที่ไม่ใช่ socket ไม่ถูกลบ, โฟลเดอร์ที่เป็น symlink ถูกปฏิเสธ, agent ตัวที่สองถูกปฏิเสธ, ตรวจ uid ผู้เชื่อมต่อ
   (`crates/ipc`: รูปแบบข้อความ/เวอร์ชัน, `tray`: การเลือกไอคอน/ข้อความในเมนู, ไฟล์ `.ico`)
+* `crates/itest/tests/update.rs`: อัปเดตอัตโนมัติกับ hub จริงที่มี manifest/ไฟล์ทดสอบ, installer Linux ตัวจริงบน home ชั่วคราว:
+  agent protocol อื่นเข้าโหมด update-only (ไม่มี routing) → โหลด → ตรวจ → ติดตั้ง (สิทธิ์ 0755, `@BINDIR@`), เก็บไฟล์เดิม, เริ่ม guard,
+  เวอร์ชันใหม่ยืนยันเมื่อถึง hub; ปฏิเสธ hash ผิด / ขนาดที่ประกาศไม่ตรง / ส่งเกิน / ไฟล์ที่ไม่อยู่ใน offer (ไม่เหลือไฟล์ค้าง);
+  hub เสิร์ฟเฉพาะไฟล์ใน manifest; ไฟล์ถูกแก้หลัง hub เริ่ม → ล้มเหลวและไม่ลองซ้ำ; policy off / notify / auto, Update now จาก dashboard,
+  `.deb` = update with apt; ไม่ติดตั้งระหว่างคุม/ถูกคุม/กดปุ่มค้าง; rollback เมื่อเวอร์ชันใหม่ไม่ถึง hub → คืนไฟล์ → รายงาน → ไม่วนลองซ้ำ
+  (`auth.rs`: agent protocol 3 ได้ข้อความ "ติดตั้งด้วยมือ" ในรูปแบบที่มันอ่านได้)
+* `build/e2e-update.sh` (Docker, หลัง `build/build.sh`): ติดตั้ง build "เก่า" ด้วย `install.sh` จริงใน ubuntu:22.04 ต่อกับ hub image จริง
+  แล้วดูมันอัปเดตตัวเองเป็น build ของ hub (`update`), และ hub ที่มี agent เสีย → guard คืนเวอร์ชันเก่า, รายงาน, ไม่ลองซ้ำ (`rollback`)
+  — ใน container ไม่มี systemd/desktop จึงใช้ backend จำลองและ `systemctl` ตัวแทน
 * `build/ui-smoke.sh` (Docker, ไม่ต้องมีจอ): hub + agent จำลองสองตัว + `flow-tray` กับ StatusNotifierWatcher จำลองบน session bus ส่วนตัว
   + หน้าต่างสถานะบน Xvfb — บันทึกสิ่งที่ tray host เห็น (ชื่อ, สถานะ, tooltip, ขนาดไอคอน, เมนู) และ screenshot
   (ครั้งแรกที่ยังไม่ join, หลัง join ผ่าน IPC, ขณะ pause) ลง `build/out/ui-smoke/`
@@ -521,8 +659,13 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
 * Clipboard: ส่งแบบ eager ไปทุกเครื่องทันทีที่ก็อป (ภายในขนาดที่ตั้ง), รูปภาพแลกเปลี่ยนเป็น PNG; X11 ฝั่งที่เป็นเจ้าของ selection
   ส่งข้อมูลก้อนเดียว (ไม่ใช้ INCR) จำกัดตามขนาด request สูงสุดของ X server (~16 MiB)
 * Dashboard ใช้ HTTP ธรรมดา; Hub เห็น input ที่ relay ภายใน process (เข้ารหัสทีละช่วง ไม่ใช่ end-to-end)
-* Hub และ agent ต้องเป็นเวอร์ชัน protocol เดียวกัน (ตรวจตอนเชื่อมต่อ ถ้าไม่ตรงจะแจ้งให้อัปเดต)
-  — เวอร์ชันที่มี allowed networks / crossing key ใช้ protocol 2, เวอร์ชันที่มีตัวเลือกเคอร์เซอร์ใช้ protocol 3: **อัปเดต hub และทุก agent พร้อมกัน**
+* ใช้งานเต็มต้องเป็น protocol เดียวกัน (0.2.0 = protocol 4) — agent protocol อื่น (≥ 4) อัปเดตตัวเองในโหมด update-only;
+  agent ก่อน 0.2.0 (protocol ≤ 3) ต้องติดตั้ง 0.2.0 ด้วยมือครั้งเดียว ([ดูหัวข้อ](#ติดตั้งด้วยมือครั้งเดียว-agent-ก่อน-020))
+* อัปเดตอัตโนมัติ: ทดสอบด้วย integration test และ e2e ใน Docker (Linux, `install.sh`, ไม่มี systemd จริง/desktop) เท่านั้น —
+  **การแทนไฟล์และ restart บน Windows จริง, การ restart ผ่าน systemd จริง, systemd-run ของ guard และหน้าต่าง Input Capture ของ GNOME หลังอัปเดต
+  ยังไม่ได้ลองบนเครื่องจริง** (Windows: compile/clippy ผ่าน, ตรรกะเดียวกับ Linux ยกเว้นการเปลี่ยนชื่อไฟล์ที่กำลังรัน);
+  การติดตั้งแบบ `-Elevated` (scheduled task) บน Windows: rollback เริ่ม agent เก่าแบบ process ธรรมดา ไม่ใช่ผ่าน task
+* หลังอัปเดตบน GNOME 46/Wayland หน้าต่าง Input Capture ขึ้นทุกครั้ง และ agent ยังไม่ต่อ hub จนกว่าจะตอบ (ใช้ `notify` ถ้าไม่ต้องการ)
 * Crossing key บน **GNOME/Wayland**: ปุ่มที่กดค้างไว้ *ก่อน* เมาส์ถึงขอบ GNOME ไม่บอก agent — ให้กด (หรือปล่อยแล้วกดใหม่)
   ตอนที่เมาส์ดันขอบอยู่; ระหว่างค้างที่ขอบ ปุ่ม/คลิกแรกที่ไม่ใช่ crossing key จะถูกใช้เพื่อคืนเมาส์ (เครื่องตัวเองไม่ได้รับปุ่ม/คลิกนั้น)
   ทั้งสองกรณีเกิดเฉพาะตอนที่เมาส์ดันขอบที่ต่อกับเครื่องอื่นอยู่เท่านั้น
@@ -543,6 +686,12 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
 | :--- | :--- |
 | agent ต่อ hub ไม่ได้: `invalid peer certificate` | fingerprint ไม่ตรง — hub ถูกสร้างใหม่ (volume หาย) หรือ token ผิด hub → `flow-agent join <token ใหม่>` |
 | `hub rejected this agent: invalid join token` | token ถูก regenerate แล้ว — ใช้ token ล่าสุดจาก dashboard |
+| `hub rejected this agent: … too old to update itself` | agent ก่อน 0.2.0 — ติดตั้งเวอร์ชันของ hub ด้วยมือครั้งเดียว ([ดูหัวข้อ](#ติดตั้งด้วยมือครั้งเดียว-agent-ก่อน-020)) |
+| tray: *connected only to update* / dashboard `update-only` | protocol ของ agent ไม่ตรงกับ hub — agent อัปเดตเองถ้า policy เป็น automatic, ไม่อย่างนั้นกด **Update now** |
+| *cannot update itself: installed by package* | ติดตั้งจาก `.deb` — `sudo apt install ./flow-agent_<เวอร์ชัน>_amd64.deb` ([ดูหัวข้อ](#agent-ที่ติดตั้งจาก-deb)) |
+| อัปเดตค้างที่ *ready, installs when this machine is idle* | ยังคุม/ถูกคุมอยู่ หรือมีปุ่มกดค้าง — ปล่อยแล้วรอ 3 วินาที |
+| *last update failed …* | ดูเหตุผลใน dashboard / `flow-agent status` และ `~/.local/share/flowcursor/update/guard.log`; ไม่ลองซ้ำเอง — แก้แล้วกด Update now |
+| dashboard: *no agent builds in this hub* | hub สร้างด้วย `compose --build`/`server/Dockerfile` — ใช้ image จาก `build/build.sh` |
 | `this agent was removed from the hub` | ถูก revoke ใน dashboard — ต้อง `flow-agent join` ใหม่ |
 | path เป็น `relay` ตลอด | firewall บล็อก UDP 7879 ระหว่างเครื่อง หรือที่อยู่ที่ประกาศผิด (ตั้ง `p2p_advertise`) |
 | เมาส์ไม่ข้ามจอ | layout ใน dashboard ต้องให้ขอบเครื่องชิดกัน, เครื่องปลายทางต้อง online (ไม่ใช่ away) และ enabled; Wayland ต้องอนุญาต Input Capture; ถ้าตั้ง crossing key ต้องกดค้าง (บน Wayland กดตอนดันขอบ) |

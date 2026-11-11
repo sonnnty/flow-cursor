@@ -31,6 +31,15 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
     r: &mut R,
     max: usize,
 ) -> Result<Option<T>, FrameError> {
+    match read_raw(r, max).await? {
+        Some(body) => Ok(Some(flow_proto::decode(&body)?)),
+        None => Ok(None),
+    }
+}
+
+/// Reads one frame without decoding it (the caller decides how: the
+/// handshake peeks at it, update frames of unknown kinds are skipped).
+pub async fn read_raw<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> Result<Option<Vec<u8>>, FrameError> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len).await {
         Ok(_) => {}
@@ -43,7 +52,7 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    Ok(Some(flow_proto::decode(&body)?))
+    Ok(Some(body))
 }
 
 #[cfg(test)]

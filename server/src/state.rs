@@ -4,9 +4,10 @@
 
 use anyhow::{Context, Result};
 use flow_layout::LayoutExt;
+use flow_proto::update::{Offer, UpdateFromHub, UpdatePolicy, UpdateReport};
 use flow_proto::{
-    AgentSettings, Capabilities, CursorPark, Fingerprint, FocusEntry, FromHub, HubSettings, Layout, Monitor, NodeId,
-    NodeLayout, OsKind, PathKind, PeerInfo, RelayDown,
+    AgentSettings, BuildId, Capabilities, CursorPark, Fingerprint, FocusEntry, FromHub, HubSettings, Layout, Monitor,
+    NodeId, NodeLayout, OsKind, PathKind, PeerInfo, RelayDown,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -49,6 +50,14 @@ pub struct NodeRecord {
     /// inherit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_park: Option<CursorPark>,
+    /// Own update policy (None = inherit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_policy: Option<UpdatePolicy>,
+    /// Build and platform the agent reported when it last connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<BuildId>,
+    #[serde(default)]
+    pub platform: String,
 }
 
 impl NodeRecord {
@@ -67,6 +76,9 @@ impl NodeRecord {
         }
         if let Some(c) = self.cursor_park {
             s.cursor_park = c;
+        }
+        if let Some(p) = self.update_policy {
+            s.update_policy = p;
         }
         s
     }
@@ -168,6 +180,15 @@ impl Persisted {
     }
 }
 
+/// What a connected agent said about itself (hello, update reports).
+#[derive(Clone, Debug, Default)]
+pub struct AgentMeta {
+    pub build: BuildId,
+    pub platform: String,
+    pub protocol: u32,
+    pub report: Option<UpdateReport>,
+}
+
 /// Channels to one connected agent.
 pub struct Online {
     pub conn_id: u64,
@@ -177,12 +198,33 @@ pub struct Online {
     pub clip: Option<mpsc::UnboundedSender<flow_proto::ClipboardMsg>>,
     pub remote: SocketAddr,
     pub p2p_addrs: Vec<SocketAddr>,
-    pub agent_version: String,
+    pub meta: AgentMeta,
     pub since: u64,
     /// Reported by the agent: not on one of its allowed networks.
     pub away: bool,
     /// The agent's own interface addresses (from its last report).
     pub local_addrs: Vec<IpAddr>,
+}
+
+/// An agent of another protocol, connected only to update itself: it is
+/// not online for anything else (no peers, layout, relay, clipboard).
+pub struct UpdateOnly {
+    pub conn_id: u64,
+    pub conn: flow_net::quinn::Connection,
+    pub tx: mpsc::UnboundedSender<UpdateFromHub>,
+    pub remote: SocketAddr,
+    pub meta: AgentMeta,
+    pub since: u64,
+    pub reason: String,
+}
+
+/// An agent from before the update handshake (protocol 1–3) that tried
+/// to connect: it was told to be updated by hand.
+#[derive(Clone, Debug, Serialize)]
+pub struct LegacyAgent {
+    pub version: String,
+    pub protocol: u32,
+    pub at: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -211,6 +253,12 @@ pub struct HubState {
     pub pairs: HashMap<(NodeId, NodeId), PairStat>,
     pub last_clip: Option<ClipMeta>,
     pub next_conn_id: u64,
+    /// Agents connected in update-only mode.
+    pub updating: HashMap<NodeId, UpdateOnly>,
+    /// Agents too old to update themselves, by node.
+    pub legacy: HashMap<NodeId, LegacyAgent>,
+    /// The agent builds this hub carries (None: none in this image).
+    pub builds: Option<std::sync::Arc<crate::updates::AgentBuilds>>,
 }
 
 impl HubState {
@@ -293,6 +341,42 @@ impl HubState {
         }
     }
 
+    /// What `node` reported about itself, in a full or update-only session.
+    pub fn agent_meta(&self, node: NodeId) -> Option<&AgentMeta> {
+        self.online.get(&node).map(|o| &o.meta).or_else(|| self.updating.get(&node).map(|u| &u.meta))
+    }
+
+    pub fn agent_meta_mut(&mut self, node: NodeId) -> Option<&mut AgentMeta> {
+        match self.online.get_mut(&node) {
+            Some(o) => Some(&mut o.meta),
+            None => self.updating.get_mut(&node).map(|u| &mut u.meta),
+        }
+    }
+
+    /// The update offer for `node`: its effective policy and the build for
+    /// its platform.
+    pub fn offer_for(&self, node: NodeId) -> Offer {
+        let policy = self.settings_for(node).update_policy;
+        let platform = self.agent_meta(node).map(|m| m.platform.clone()).unwrap_or_default();
+        Offer { policy, release: self.builds.as_ref().and_then(|b| b.release(&platform)) }
+    }
+
+    /// Sends an update message to `node` in whichever session it has.
+    pub fn send_update(&self, node: NodeId, msg: UpdateFromHub) {
+        if let Some(o) = self.online.get(&node) {
+            let _ = o.ctl.send(FromHub::Update(msg));
+        } else if let Some(u) = self.updating.get(&node) {
+            let _ = u.tx.send(msg);
+        }
+    }
+
+    /// Pushes the current offer to every connected agent (settings change).
+    pub fn broadcast_offers(&self) {
+        for id in self.online.keys().chain(self.updating.keys()) {
+            self.send_update(*id, UpdateFromHub::Offer(self.offer_for(*id)));
+        }
+    }
+
     /// Drops focus entries that involve `id` as target, telling the
     /// sources to release control.
     pub fn release_focus_on(&mut self, id: NodeId) {
@@ -334,6 +418,9 @@ mod tests {
                 allowed_networks: None,
                 crossing_key: Some("ScrollLock".into()),
                 cursor_park: Some(CursorPark::CenterHide),
+                update_policy: Some(UpdatePolicy::Notify),
+                agent: Some(BuildId::new("0.2.0", "5.gabc")),
+                platform: "linux-x86_64".into(),
             },
         );
         p.save(&dir).unwrap();
@@ -354,6 +441,8 @@ mod tests {
         assert_eq!(eff.crossing_key, "ScrollLock");
         assert_eq!(eff.allowed_networks, global.allowed_networks, "inherited");
         assert_eq!(eff.cursor_park, CursorPark::CenterHide);
+        assert_eq!(eff.update_policy, UpdatePolicy::Notify);
+        assert_eq!(q.nodes[&1].agent.as_ref().unwrap().full(), "0.2.0+5.gabc");
         // The backend reported no cursor support (old agent, GNOME): the
         // closest behaviour is staying at the edge.
         assert_eq!(q.nodes[&1].applied_cursor_park(&global), CursorPark::Edge);

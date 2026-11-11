@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Stand-in for `systemctl --user` in the end-to-end container (no systemd
+# there): runs ~/.local/bin/flow-agent as a plain background process, as
+# the flow-agent user service would. Only what install.sh and the updater
+# call is implemented.
+set -u
+pidfile="$HOME/.flow-agent.pid"
+log="$HOME/agent.log"
+[ "${1:-}" = "--user" ] && shift
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  daemon-reload|enable|disable) exit 0 ;;
+  show-environment) exit 1 ;;
+  stop)
+    [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null
+    rm -f "$pidfile"; exit 0 ;;
+  start|restart)
+    if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+      [ "$cmd" = start ] && exit 0
+      kill "$(cat "$pidfile")"; sleep 1
+    fi
+    setsid "$HOME/.local/bin/flow-agent" run >>"$log" 2>&1 < /dev/null &
+    echo $! > "$pidfile"
+    exit 0 ;;
+  *) echo "systemctl stand-in: unsupported: $cmd $*" >&2; exit 1 ;;
+esac

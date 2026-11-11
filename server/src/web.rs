@@ -2,7 +2,7 @@
 //! protected by a bearer token (`FLOW_ADMIN_TOKEN` or the generated token
 //! printed at startup).
 
-use crate::state::{unix_now, ClipMeta};
+use crate::state::{unix_now, ClipMeta, LegacyAgent};
 use crate::Hub;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -10,6 +10,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use flow_proto::update::{UpdateFromHub, UpdatePhase, UpdatePolicy};
 use flow_proto::{Capabilities, CursorPark, FocusEntry, FromHub, HubSettings, Monitor, NodeId, OsKind, PathKind};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::net::{IpAddr, SocketAddr};
@@ -28,6 +29,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/layout", put(put_layout))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/nodes/{id}", axum::routing::patch(patch_node).delete(delete_node))
+        .route("/nodes/{id}/update", post(update_node))
         .route("/join-token/regenerate", post(regenerate_token))
         .layer(middleware::from_fn_with_state(hub.clone(), auth));
     // The icons are outside /api on purpose: browsers fetch them without the
@@ -97,17 +99,65 @@ async fn auth(State(hub): State<Arc<Hub>>, headers: HeaderMap, req: Request, nex
 struct HubInfo {
     fingerprint: String,
     version: &'static str,
+    protocol: u32,
     join_token: String,
+    /// The agent builds this hub offers (None: none in this image).
+    agent_builds: Option<BuildsView>,
+}
+
+#[derive(Serialize)]
+struct BuildsView {
+    version: String,
+    commit: String,
+    platforms: Vec<ReleaseView>,
+    /// Platforms whose files did not match the manifest (not offered).
+    broken: Vec<(String, String)>,
+}
+
+#[derive(Serialize)]
+struct ReleaseView {
+    platform: String,
+    files: Vec<FileView>,
+}
+
+#[derive(Serialize)]
+struct FileView {
+    name: String,
+    size: u64,
+    sha256: String,
 }
 
 /// Connection state shown in the dashboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum NodeStatus {
     Online,
     /// Connected, but not on one of its allowed networks.
     Away,
+    /// Connected to a hub of another protocol, only to update itself.
+    UpdateOnly,
     Offline,
+}
+
+/// Update state of a node for the dashboard.
+#[derive(Serialize)]
+struct UpdateView {
+    /// current | available | downloading | ready | installing | unsupported
+    state: &'static str,
+    /// The build it moves to (`version+build`).
+    target: Option<String>,
+    done: Option<u64>,
+    total: Option<u64>,
+    detail: Option<String>,
+    failed: Option<FailedView>,
+}
+
+#[derive(Serialize)]
+struct FailedView {
+    target: String,
+    reason: String,
+    rolled_back: bool,
+    at: u64,
 }
 
 #[derive(Serialize)]
@@ -140,7 +190,23 @@ struct NodeView {
     caps: Capabilities,
     remote: Option<SocketAddr>,
     p2p_addrs: Vec<SocketAddr>,
+    /// Build of the agent (`version+build`): live, or from its last connect.
     agent_version: Option<String>,
+    /// `linux-x86_64`, `windows-x86_64` (empty: never reported).
+    platform: String,
+    /// Protocol of the connected agent.
+    protocol: Option<u32>,
+    /// Own update policy (null = inherit) and the one in effect.
+    update_policy: Option<UpdatePolicy>,
+    effective_update_policy: UpdatePolicy,
+    /// The build this hub offers for the node's platform.
+    offered_version: Option<String>,
+    /// What the connected agent reported.
+    update: Option<UpdateView>,
+    /// Why the node is in update-only mode.
+    update_only_reason: Option<String>,
+    /// The agent is too old to update itself (it tried to connect).
+    legacy: Option<LegacyAgent>,
     last_seen: u64,
 }
 
@@ -172,12 +238,44 @@ async fn get_state(State(hub): State<Arc<Hub>>) -> Json<StateView> {
             .values()
             .map(|n| {
                 let o = st.online.get(&n.id);
+                let upd = st.updating.get(&n.id);
+                let meta = st.agent_meta(n.id);
                 let eff = n.effective_settings(&st.p.settings);
-                let status = match o {
-                    Some(o) if o.away => NodeStatus::Away,
-                    Some(_) => NodeStatus::Online,
-                    None => NodeStatus::Offline,
+                let status = match (o, upd) {
+                    (Some(o), _) if o.away => NodeStatus::Away,
+                    (Some(_), _) => NodeStatus::Online,
+                    (None, Some(_)) => NodeStatus::UpdateOnly,
+                    (None, None) => NodeStatus::Offline,
                 };
+                let platform = meta.map(|m| m.platform.clone()).unwrap_or_else(|| n.platform.clone());
+                let offered = st.builds.as_ref().and_then(|b| b.release(&platform)).map(|r| r.id.full());
+                let update = meta.and_then(|m| m.report.as_ref()).map(|r| {
+                    let (target, done, total) = match &r.phase {
+                        UpdatePhase::Downloading { target, done, total } => {
+                            (Some(target.full()), Some(*done), Some(*total))
+                        }
+                        UpdatePhase::Available { target }
+                        | UpdatePhase::Ready { target }
+                        | UpdatePhase::Installing { target } => (Some(target.full()), None, None),
+                        UpdatePhase::Current | UpdatePhase::Unsupported { .. } => (None, None, None),
+                    };
+                    UpdateView {
+                        state: r.phase.name(),
+                        target,
+                        done,
+                        total,
+                        detail: match &r.phase {
+                            UpdatePhase::Unsupported { reason } => Some(reason.clone()),
+                            _ => None,
+                        },
+                        failed: r.failed.as_ref().map(|f| FailedView {
+                            target: f.target.full(),
+                            reason: f.reason.clone(),
+                            rolled_back: f.rolled_back,
+                            at: f.at,
+                        }),
+                    }
+                });
                 NodeView {
                     id: n.id,
                     name: n.name.clone(),
@@ -202,8 +300,16 @@ async fn get_state(State(hub): State<Arc<Hub>>) -> Json<StateView> {
                     caps: n.caps,
                     remote: o.map(|o| o.remote),
                     p2p_addrs: o.map(|o| o.p2p_addrs.clone()).unwrap_or_default(),
-                    agent_version: o.map(|o| o.agent_version.clone()),
-                    last_seen: if o.is_some() { unix_now() } else { n.last_seen },
+                    agent_version: meta.map(|m| m.build.full()).or_else(|| n.agent.as_ref().map(|b| b.full())),
+                    platform,
+                    protocol: meta.map(|m| m.protocol),
+                    update_policy: n.update_policy,
+                    effective_update_policy: eff.update_policy,
+                    offered_version: offered,
+                    update,
+                    update_only_reason: upd.map(|u| u.reason.clone()),
+                    legacy: if meta.is_none() { st.legacy.get(&n.id).cloned() } else { None },
+                    last_seen: if meta.is_some() { unix_now() } else { n.last_seen },
                 }
             })
             .collect();
@@ -220,8 +326,34 @@ async fn get_state(State(hub): State<Arc<Hub>>) -> Json<StateView> {
         })
         .collect();
     pairs.sort_by_key(|p| (p.source, p.target));
+    let agent_builds = st.builds.as_ref().map(|b| BuildsView {
+        version: b.id.full(),
+        commit: b.commit.clone(),
+        platforms: b
+            .releases()
+            .map(|r| ReleaseView {
+                platform: r.platform.clone(),
+                files: r
+                    .files
+                    .iter()
+                    .map(|f| FileView {
+                        name: f.name.clone(),
+                        size: f.size,
+                        sha256: f.sha256.iter().map(|x| format!("{x:02x}")).collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        broken: b.broken.iter().map(|(p, e)| (p.clone(), e.clone())).collect(),
+    });
     Json(StateView {
-        hub: HubInfo { fingerprint: hub.fingerprint().to_hex(), version: env!("CARGO_PKG_VERSION"), join_token },
+        hub: HubInfo {
+            fingerprint: hub.fingerprint().to_hex(),
+            version: flow_version::FULL,
+            protocol: flow_proto::PROTOCOL_VERSION,
+            join_token,
+            agent_builds,
+        },
         now: unix_now(),
         nodes,
         focus: st.focus_entries(),
@@ -331,11 +463,15 @@ async fn put_settings(
     {
         let mut st = hub.lock();
         level_changed = st.p.settings.log_level != s.log_level;
+        let policy_changed = st.p.settings.update_policy != s.update_policy;
         st.p.settings = s.clone();
         st.save();
         st.broadcast_settings();
         // Peers carry each node's effective crossing key.
         st.broadcast_peers();
+        if policy_changed {
+            st.broadcast_offers();
+        }
     }
     if level_changed {
         if let Some(f) = hub.on_log_level.lock().expect("poisoned").as_ref() {
@@ -366,6 +502,9 @@ struct NodePatch {
     /// `null` = inherit, `"edge"` / `"center"` / `"center_hide"` = own.
     #[serde(default, deserialize_with = "double_option")]
     cursor_park: Option<Option<CursorPark>>,
+    /// `null` = inherit, `"auto"` / `"notify"` / `"off"` = own.
+    #[serde(default, deserialize_with = "double_option")]
+    update_policy: Option<Option<UpdatePolicy>>,
 }
 
 async fn patch_node(
@@ -408,6 +547,10 @@ async fn patch_node(
     if let Some(v) = p.cursor_park {
         n.cursor_park = v;
     }
+    let policy_changed = p.update_policy.is_some();
+    if let Some(v) = p.update_policy {
+        n.update_policy = v;
+    }
     if let Some(name) = p.name {
         n.name = name.trim().to_string();
     }
@@ -427,8 +570,11 @@ async fn patch_node(
         }
         st.broadcast_focus();
     }
-    if settings_changed {
+    if settings_changed || policy_changed {
         st.send_to(node, FromHub::Settings(st.settings_for(node)));
+    }
+    if policy_changed {
+        st.send_update(node, UpdateFromHub::Offer(st.offer_for(node)));
     }
     st.broadcast_peers();
     st.broadcast_layout();
@@ -450,6 +596,8 @@ async fn delete_node(State(hub): State<Arc<Hub>>, Path(id): Path<u32>) -> Result
             let _ = o.ctl.send(FromHub::Revoked);
             o.conn
         });
+        let conn = conn.or_else(|| st.updating.remove(&node).map(|u| u.conn));
+        st.legacy.remove(&node);
         st.broadcast_peers();
         st.broadcast_layout();
         st.broadcast_focus();
@@ -462,6 +610,29 @@ async fn delete_node(State(hub): State<Arc<Hub>>, Path(id): Path<u32>) -> Result
         });
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// "Update now": asks the node's agent to install the hub's build as soon
+/// as its machine is idle (whatever its policy).
+async fn update_node(State(hub): State<Arc<Hub>>, Path(id): Path<u32>) -> Result<StatusCode, ApiError> {
+    let node = NodeId(id);
+    let st = hub.lock();
+    if !st.p.nodes.contains_key(&id) {
+        return Err(ApiError::not_found("no such node"));
+    }
+    let Some(meta) = st.agent_meta(node) else {
+        return Err(ApiError(StatusCode::CONFLICT, "the machine is not connected".into()));
+    };
+    let offered = st.builds.as_ref().and_then(|b| b.release(&meta.platform));
+    match offered {
+        None => Err(ApiError(StatusCode::CONFLICT, format!("this hub carries no agent build for {}", meta.platform))),
+        Some(r) if r.id == meta.build => Err(ApiError(StatusCode::CONFLICT, "already up to date".into())),
+        Some(_) => {
+            info!(%node, "update requested from the dashboard");
+            st.send_update(node, UpdateFromHub::UpdateNow);
+            Ok(StatusCode::ACCEPTED)
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -542,6 +713,11 @@ mod tests {
         assert_eq!(p.cursor_park, Some(None));
         let p: NodePatch = serde_json::from_str(r#"{"cursor_park":"center"}"#).unwrap();
         assert_eq!(p.cursor_park, Some(Some(CursorPark::Center)));
+        let p: NodePatch = serde_json::from_str(r#"{"update_policy":"notify"}"#).unwrap();
+        assert_eq!(p.update_policy, Some(Some(UpdatePolicy::Notify)));
+        let p: NodePatch = serde_json::from_str(r#"{"update_policy":null}"#).unwrap();
+        assert_eq!(p.update_policy, Some(None));
+        assert!(serde_json::from_str::<NodePatch>(r#"{"update_policy":"sometimes"}"#).is_err());
         assert!(serde_json::from_str::<NodePatch>(r#"{"cursor_park":"corner"}"#).is_err());
     }
 }

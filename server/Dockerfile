@@ -1,5 +1,8 @@
-# FlowCursor hub image. Build from the repository root:
+# FlowCursor hub image *without* agent builds (agents are not offered
+# updates). Build from the repository root:
 #   docker build -f server/Dockerfile -t flow-cursor-server:latest .
+# build/build.sh builds the full image instead (build/Dockerfile.hub): the
+# hub plus the Linux and Windows agents of the same build.
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .

@@ -1,5 +1,8 @@
 # FlowCursor hub on the home server.
-#   cd deploy && FLOW_ADMIN_TOKEN=change-me docker compose up -d --build
+#   build/build.sh      (from the repository root: hub image with the agent builds)
+#   cd deploy && FLOW_ADMIN_TOKEN=change-me docker compose up -d
+# `docker compose up -d --build` instead builds a hub *without* agent builds
+# (server/Dockerfile): it works, but agents are not offered updates.
 # Host networking is required: agents talk QUIC over UDP 7878 and find the
 # hub with mDNS (multicast does not cross Docker's bridge network).
 services:

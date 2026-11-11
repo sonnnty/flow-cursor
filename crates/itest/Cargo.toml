@@ -17,5 +17,7 @@ flow-layout.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tracing-subscriber.workspace = true
 rand.workspace = true
+sha2.workspace = true

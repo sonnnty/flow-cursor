@@ -4,6 +4,7 @@
 set -euo pipefail
 cd /src
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+BUILD="${FLOW_BUILD_ID:-dev}"
 OUT=build/out
 export CARGO_TARGET_DIR=/src/target/docker
 
@@ -44,7 +45,7 @@ install -d "$PKG/DEBIAN"
 echo /etc/xdg/autostart/flowcursor-tray.desktop > "$PKG/DEBIAN/conffiles"
 cat > "$PKG/DEBIAN/control" <<CTRL
 Package: flow-agent
-Version: $VERSION
+Version: $VERSION+$BUILD
 Section: utils
 Priority: optional
 Architecture: amd64
@@ -81,6 +82,18 @@ install -m755 "$R/flow-server" "$OUT/server/flow-server"
 install -m644 deploy/compose.yaml "$OUT/server/compose.yaml"
 install -m755 "$R/flow-bench" "$OUT/tools/flow-bench"
 
-( cd "$OUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )
+# --- Agent builds for the hub image (self-update) ---------------------------
+# Plain files the updater installs (it ignores names it does not know):
+# Linux = what install.sh installs, Windows = the two exes (replaced in
+# place) plus the setup exe (for new machines; copy it out of the image).
+AB="$OUT/hub/agent-builds"
+install -d "$AB/linux-x86_64" "$AB/windows-x86_64" "$OUT/hub/data"
+install -m755 "$R/flow-agent" "$R/flow-tray" "$AB/linux-x86_64/"
+install -m644 deploy/linux/flow-agent.service deploy/linux/flowcursor.desktop \
+  deploy/linux/flowcursor-tray.desktop deploy/icons/flowcursor-*.png deploy/icons/flowcursor.svg "$AB/linux-x86_64/"
+install -m644 "$W/flow-agent.exe" "$W/flow-tray.exe" "$OUT/windows/FlowCursor-setup-$VERSION.exe" "$AB/windows-x86_64/"
+"$R/flow-server" --write-agent-manifest "$AB"
+
+( cd "$OUT" && find . -type f ! -name SHA256SUMS ! -path './hub/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )
 echo "==> artifacts"
 ls -la "$OUT"/*

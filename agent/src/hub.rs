@@ -3,19 +3,22 @@
 
 use crate::backend::Backend;
 use crate::config::{resolve_hub, AgentConfig, AgentState};
+use crate::update::UpdateEvent;
 use anyhow::{anyhow, bail, Context, Result};
 use flow_net::endpoint::{client_config, TransportOpts, SNI};
-use flow_net::frame::{read_frame, write_frame};
+use flow_net::frame::{read_frame, read_raw, write_frame};
 use flow_net::link::p2p::{LinkReceiver, LinkSink};
 use flow_net::link::{LinkHandle, RelayTransport};
 use flow_net::quinn::{Connection, Endpoint};
 use flow_net::tls::{peer_fingerprint, ServerPin};
 use flow_net::token::JoinToken;
 use flow_net::Identity;
+use flow_proto::hello::Hello;
+use flow_proto::update::{UpdateFromHub, UpdateToHub};
 use flow_proto::{
-    AgentSettings, ClipContent, ClipboardMsg, Fingerprint, FocusEntry, FromHub, Hello, Layout, LinkDatagram, LinkMsg,
-    NodeId, OsKind, PeerInfo, RelayDatagramDown, RelayDatagramUp, RelayDown, RelayUp, StreamKind, ToHub, Welcome,
-    ALPN_HUB, MAX_CLIPBOARD_FRAME, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
+    AgentSettings, BuildId, ClipContent, ClipboardMsg, Fingerprint, FocusEntry, FromHub, HelloFrame, HelloReply,
+    Layout, LinkDatagram, LinkMsg, NodeId, OsKind, PeerInfo, Register, RelayDatagramDown, RelayDatagramUp, RelayDown,
+    RelayUp, SessionMode, StreamKind, ToHub, Welcome, ALPN_HUB, MAX_CLIPBOARD_FRAME, MAX_CONTROL_FRAME,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -29,6 +32,9 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug)]
 pub enum HubEvent {
     Connected(Box<Welcome>),
+    /// Connected, but the hub speaks another protocol: only updating is
+    /// possible (the hub's reason).
+    UpdateOnly(String),
     Disconnected,
     Layout(Layout),
     Peers(Vec<PeerInfo>),
@@ -96,11 +102,19 @@ pub struct HubClient {
     pub backend: Arc<dyn Backend>,
     pub events: mpsc::UnboundedSender<HubEvent>,
     pub p2p_port: u16,
+    /// To the updater.
+    pub updates: mpsc::UnboundedSender<UpdateEvent>,
+    /// Build and protocol this agent announces (tests simulate others).
+    pub build: BuildId,
+    pub platform: String,
+    pub protocol: u32,
 }
 
 pub struct HubChannels {
     pub to_hub: mpsc::UnboundedReceiver<ToHub>,
     pub clip: mpsc::UnboundedReceiver<ClipContent>,
+    /// From the updater.
+    pub update_out: mpsc::UnboundedReceiver<UpdateToHub>,
 }
 
 enum End {
@@ -154,9 +168,12 @@ impl HubClient {
             (delay, backoff) = next_backoff(backoff, attempt);
             self.relay.set(None);
             let _ = self.events.send(HubEvent::Disconnected);
-            // Drop what was queued while disconnected.
+            let _ = self.updates.send(UpdateEvent::Ended);
+            // Drop what was queued while disconnected (the updater reports
+            // its state again at the next connect).
             while ch.to_hub.try_recv().is_ok() {}
             while ch.clip.try_recv().is_ok() {}
+            while ch.update_out.try_recv().is_ok() {}
             tokio::time::sleep(delay).await;
         }
     }
@@ -228,34 +245,41 @@ impl HubClient {
             .with_context(|| format!("connecting to hub at {addr} (wrong address or hub fingerprint?)"))?;
         let hub_fp = peer_fingerprint(&conn).ok_or_else(|| anyhow!("hub sent no certificate"))?;
         let (mut send, mut recv) = conn.open_bi().await?;
-        let hello = Hello {
-            protocol_version: PROTOCOL_VERSION,
-            agent_version: env!("CARGO_PKG_VERSION").to_string(),
-            join_token: token.clone(),
-            hostname: hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "unknown".into()),
+        let register = Register {
             os: OsKind::current(),
             monitors: self.backend.monitors(),
             caps: self.backend.caps(),
             p2p_port: self.p2p_port,
             p2p_addrs: self.cfg.p2p_advertise.clone(),
         };
-        write_frame(&mut send, &ToHub::Hello(hello)).await?;
-        let welcome =
-            match tokio::time::timeout(Duration::from_secs(10), read_frame::<_, FromHub>(&mut recv, MAX_CONTROL_FRAME))
-                .await
-                .map_err(|_| anyhow!("hub did not answer"))??
-            {
-                Some(FromHub::Welcome(w)) => w,
-                Some(FromHub::Reject { reason }) => {
-                    error!("hub rejected this agent: {reason}");
-                    let _ = self.events.send(HubEvent::Rejected(reason));
-                    return Ok(End::Retry(Duration::from_secs(30)));
-                }
-                other => bail!("unexpected hub reply: {other:?}"),
-            };
+        let hello = Hello {
+            protocol_version: self.protocol,
+            agent: self.build.clone(),
+            platform: self.platform.clone(),
+            hostname: hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "unknown".into()),
+            join_token: token.clone(),
+            session: flow_proto::encode(&register),
+            ext: vec![],
+        };
+        write_frame(&mut send, &HelloFrame::Hello(hello)).await?;
+        let accepted = match tokio::time::timeout(
+            Duration::from_secs(10),
+            read_frame::<_, HelloReply>(&mut recv, MAX_CONTROL_FRAME),
+        )
+        .await
+        .map_err(|_| anyhow!("hub did not answer"))??
+        {
+            Some(HelloReply::Accepted(a)) => a,
+            Some(HelloReply::Rejected { reason }) => {
+                error!("hub rejected this agent: {reason}");
+                let _ = self.events.send(HubEvent::Rejected(reason));
+                return Ok(End::Retry(Duration::from_secs(30)));
+            }
+            None => bail!("the hub closed the connection during the handshake"),
+        };
         {
             let mut st = self.state.lock().expect("poisoned");
-            st.node_id = Some(welcome.node_id.0);
+            st.node_id = Some(accepted.node_id.0);
             st.hub_fingerprint = Some(hub_fp.to_hex());
             st.hub_addr = Some(addr.to_string());
             st.pending_join_token = None;
@@ -266,9 +290,21 @@ impl HubClient {
         }
         *session_start = Some(Instant::now());
         if token.is_some() {
-            info!(node = %welcome.node_id, name = %welcome.name, hub_fingerprint = %hub_fp, "joined hub; hub fingerprint pinned");
+            info!(node = %accepted.node_id, name = %accepted.name, hub_fingerprint = %hub_fp, "joined hub; hub fingerprint pinned");
         }
-        info!(node = %welcome.node_id, %addr, "connected to hub");
+        if let SessionMode::UpdateOnly { reason } = accepted.mode {
+            warn!(hub = %accepted.hub, hub_protocol = accepted.hub_protocol, "connected in update-only mode: {reason}");
+            return self.update_only(conn, send, recv, reason, ch).await;
+        }
+        let welcome =
+            match tokio::time::timeout(Duration::from_secs(10), read_frame::<_, FromHub>(&mut recv, MAX_CONTROL_FRAME))
+                .await
+                .map_err(|_| anyhow!("hub did not answer"))??
+            {
+                Some(FromHub::Welcome(w)) => w,
+                other => bail!("unexpected hub reply: {other:?}"),
+            };
+        info!(node = %welcome.node_id, %addr, hub = %accepted.hub, "connected to hub");
 
         // Relay stream.
         let (mut rs, mut rr) = conn.open_bi().await?;
@@ -338,6 +374,7 @@ impl HubClient {
 
         self.relay.set(Some(RelayInner { conn: conn.clone(), tx: relay_tx }));
         let _ = self.events.send(HubEvent::Connected(welcome));
+        let _ = self.updates.send(UpdateEvent::Session { conn: conn.clone(), update_only: None });
 
         let result = loop {
             tokio::select! {
@@ -351,6 +388,7 @@ impl HubClient {
                             FromHub::ReleaseControl => HubEvent::ReleaseControl,
                             FromHub::Ping { nonce } => { let _ = ctl_tx.send(ToHub::Pong { nonce }); continue; }
                             FromHub::Pong { .. } | FromHub::Welcome(_) => continue,
+                            FromHub::Update(u) => { let _ = self.updates.send(UpdateEvent::Msg(u)); continue; }
                             FromHub::Reject { reason } => HubEvent::Rejected(reason),
                             FromHub::Revoked => {
                                 self.on_revoked();
@@ -370,6 +408,7 @@ impl HubClient {
                     debug!(?content, "sending clipboard to hub");
                     let _ = clip_tx.send(ClipboardMsg::Update { from: None, content });
                 },
+                Some(u) = ch.update_out.recv() => { let _ = ctl_tx.send(ToHub::Update(u)); },
                 reason = conn.closed() => break Err(anyhow!("hub connection closed: {reason}")),
             }
         };
@@ -399,6 +438,51 @@ impl HubClient {
 }
 
 impl HubClient {
+    /// A session with a hub of another protocol: only the frozen update
+    /// messages on the control stream, and downloads. Frames this agent
+    /// cannot decode (a later protocol's additions) are skipped.
+    async fn update_only(
+        &self,
+        conn: Connection,
+        mut send: flow_net::quinn::SendStream,
+        mut recv: flow_net::quinn::RecvStream,
+        reason: String,
+        ch: &mut HubChannels,
+    ) -> Result<End> {
+        let _ = self.events.send(HubEvent::UpdateOnly(reason.clone()));
+        let _ = self.updates.send(UpdateEvent::Session { conn: conn.clone(), update_only: Some(reason) });
+        let result = loop {
+            tokio::select! {
+                f = read_raw(&mut recv, MAX_CONTROL_FRAME) => match f {
+                    Ok(Some(raw)) => match flow_proto::decode::<UpdateFromHub>(&raw) {
+                        Ok(m) => { let _ = self.updates.send(UpdateEvent::Msg(m)); }
+                        Err(e) => debug!("skipping an update frame this agent does not understand: {e}"),
+                    },
+                    Ok(None) => break Err(anyhow!("hub closed the connection")),
+                    Err(e) => break Err(anyhow!("hub control stream: {e}")),
+                },
+                Some(u) = ch.update_out.recv() => {
+                    if let Err(e) = write_frame(&mut send, &u).await {
+                        break Err(anyhow!("hub control stream: {e}"));
+                    }
+                },
+                // Nothing else goes to a hub of another protocol.
+                Some(_) = ch.to_hub.recv() => {},
+                Some(_) = ch.clip.recv() => {},
+                reason = conn.closed() => break Err(anyhow!("hub connection closed: {reason}")),
+            }
+        };
+        if let Some(flow_net::quinn::ConnectionError::ApplicationClosed(c)) = conn.close_reason() {
+            if c.error_code == flow_proto::CLOSE_REVOKED.into() {
+                self.on_revoked();
+                return Ok(End::Retry(Duration::from_secs(60)));
+            }
+        }
+        conn.close(0u32.into(), b"bye");
+        info!("disconnected from hub (update-only session)");
+        result
+    }
+
     fn on_revoked(&self) {
         let mut st = self.state.lock().expect("poisoned");
         if st.revoked {

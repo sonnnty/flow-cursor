@@ -10,9 +10,10 @@ use flow_net::link::Action;
 use flow_net::quinn;
 use flow_net::tls::ServerPin;
 use flow_net::Identity;
+use flow_proto::hello::Hello;
 use flow_proto::{
-    Capabilities, FromHub, Hello, Monitor, NodeId, OsKind, Rect, RelayDatagramDown, RelayDown, RelayUp, StreamKind,
-    ToHub, ALPN_HUB, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
+    BuildId, Capabilities, FromHub, HelloFrame, HelloReply, Monitor, NodeId, OsKind, Rect, Register, RelayDatagramDown,
+    RelayDown, RelayUp, StreamKind, ALPN_HUB, MAX_CONTROL_FRAME, PROTOCOL_VERSION,
 };
 use flow_server::{HubConfig, HubHandle};
 use std::net::{IpAddr, SocketAddr};
@@ -42,6 +43,15 @@ pub async fn start_hub() -> HubHandle {
 }
 
 pub async fn start_hub_in(data_dir: PathBuf) -> HubHandle {
+    start_hub_cfg(data_dir, None).await
+}
+
+/// A hub that offers the agent builds in `builds` (see [`agent_builds`]).
+pub async fn start_hub_with_builds(builds: PathBuf) -> HubHandle {
+    start_hub_cfg(temp_dir("hub"), Some(builds)).await
+}
+
+async fn start_hub_cfg(data_dir: PathBuf, agent_builds: Option<PathBuf>) -> HubHandle {
     flow_server::start(HubConfig {
         data_dir,
         quic_addr: "127.0.0.1:0".parse().unwrap(),
@@ -49,9 +59,23 @@ pub async fn start_hub_in(data_dir: PathBuf) -> HubHandle {
         admin_token: Some(ADMIN.into()),
         mdns: false,
         name: "itest".into(),
+        agent_builds,
     })
     .await
     .expect("hub starts")
+}
+
+/// A directory of agent builds like the hub image has: `files` for
+/// linux-x86_64, and the manifest for build `id`.
+pub fn agent_builds(id: &BuildId, files: &[(&str, &[u8])]) -> PathBuf {
+    let d = temp_dir("builds");
+    let p = d.join("linux-x86_64");
+    std::fs::create_dir_all(&p).unwrap();
+    for (name, data) in files {
+        std::fs::write(p.join(name), data).unwrap();
+    }
+    flow_server::updates::write_manifest(&d, id, "").unwrap();
+    d
 }
 
 pub fn monitor(w: i32, h: i32) -> Vec<Monitor> {
@@ -86,6 +110,10 @@ pub struct AgentSpec {
     /// Adjusts the simulated backend before the agent starts (e.g. cursor
     /// support, which the agent reports in its Hello).
     pub prepare: Option<fn(&SimControl)>,
+    /// Build, installer and timings of the updater.
+    pub update: Option<flow_agent::update::UpdateOptions>,
+    /// Protocol announced to the hub (default: this one).
+    pub protocol: Option<u32>,
 }
 
 impl AgentSpec {
@@ -98,6 +126,8 @@ impl AgentSpec {
             state_dir: None,
             addrs: vec![ip("10.10.15.10")],
             prepare: None,
+            update: None,
+            protocol: None,
         }
     }
 }
@@ -118,7 +148,13 @@ pub async fn start_agent(hub: &HubHandle, spec: AgentSpec) -> TestAgent {
         f(&sim);
     }
     let net = StaticAddrs::new(spec.addrs);
-    let opts = StartOptions { addrs: Arc::new(net.clone()), net_check_interval: NET_CHECK, ..Default::default() };
+    let mut opts = StartOptions { addrs: Arc::new(net.clone()), net_check_interval: NET_CHECK, ..Default::default() };
+    if let Some(u) = spec.update {
+        opts.update = u;
+    }
+    if let Some(p) = spec.protocol {
+        opts.protocol = p;
+    }
     let agent = flow_agent::start_with(cfg, backend, rx, opts).await.expect("agent starts");
     TestAgent { agent, sim, state_dir, net }
 }
@@ -196,6 +232,27 @@ pub async fn http(
     (status, body)
 }
 
+/// The first control frame of an agent of `protocol` (a Linux machine with
+/// one 1920x1080 monitor).
+pub fn hello_frame(protocol: u32, token: Option<&str>, hostname: &str) -> HelloFrame {
+    let register = Register {
+        os: OsKind::Linux,
+        monitors: monitor(1920, 1080),
+        caps: Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() },
+        p2p_port: 0,
+        p2p_addrs: vec![],
+    };
+    HelloFrame::Hello(Hello {
+        protocol_version: protocol,
+        agent: BuildId::new("0.2.0", "raw"),
+        platform: "linux-x86_64".into(),
+        hostname: hostname.into(),
+        join_token: token.map(Into::into),
+        session: flow_proto::encode(&register),
+        ext: vec![],
+    })
+}
+
 /// A node that speaks the hub protocol by hand instead of running an agent
 /// core, for tests that need to send what a real agent never would. It is
 /// registered (Hello with the join token, Welcome received), so its frames
@@ -216,18 +273,11 @@ impl RawNode {
         let endpoint = flow_net::endpoint::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
         let conn = endpoint.connect_with(cc, hub.quic_addr, SNI).unwrap().await.unwrap();
         let (mut ctl, mut ctl_r) = conn.open_bi().await.unwrap();
-        let hello = Hello {
-            protocol_version: PROTOCOL_VERSION,
-            agent_version: "0.1.0".into(),
-            hostname: hostname.into(),
-            os: OsKind::Linux,
-            join_token: Some(token.into()),
-            p2p_port: 0,
-            p2p_addrs: vec![],
-            monitors: monitor(1920, 1080),
-            caps: Capabilities { capture: true, inject: true, clipboard: true, ..Default::default() },
-        };
-        write_frame(&mut ctl, &ToHub::Hello(hello)).await.unwrap();
+        write_frame(&mut ctl, &hello_frame(PROTOCOL_VERSION, Some(token), hostname)).await.unwrap();
+        match read_frame::<_, HelloReply>(&mut ctl_r, MAX_CONTROL_FRAME).await.unwrap() {
+            Some(HelloReply::Accepted(_)) => {}
+            other => panic!("expected Accepted, got {other:?}"),
+        }
         let id = match read_frame::<_, FromHub>(&mut ctl_r, MAX_CONTROL_FRAME).await.unwrap() {
             Some(FromHub::Welcome(w)) => w.node_id,
             other => panic!("expected Welcome, got {other:?}"),
