@@ -244,3 +244,29 @@ async fn relay_stamps_authenticated_sender_identity() {
 
     hub.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_admin_token_falls_back_to_the_persisted_one() {
+    init_logs();
+    // What deploy/compose.yaml passes when FLOW_ADMIN_TOKEN is not set.
+    let hub = flow_server::start(flow_server::HubConfig {
+        data_dir: temp_dir("hub-empty-token"),
+        quic_addr: "127.0.0.1:0".parse().unwrap(),
+        http_addr: Some("127.0.0.1:0".parse().unwrap()),
+        admin_token: Some(String::new()),
+        mdns: false,
+        name: "itest".into(),
+    })
+    .await
+    .unwrap();
+    // Persisted means flow-server prints it at startup.
+    assert_eq!(hub.hub.admin_token_source, flow_server::AdminTokenSource::Persisted);
+    let token = hub.hub.admin_token.clone();
+    assert_eq!(token, hub.hub.lock().p.admin_token);
+    assert!(token.len() >= 32);
+    let addr = hub.http_addr.unwrap();
+    assert_eq!(http(addr, "GET", "/api/state", Some(&token), None).await.0, 200);
+    assert_eq!(http(addr, "GET", "/api/state", Some(""), None).await.0, 401);
+    assert_eq!(http(addr, "GET", "/api/state", None, None).await.0, 401);
+    hub.shutdown().await;
+}

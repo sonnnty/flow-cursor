@@ -106,7 +106,8 @@ docker compose logs flow-server | grep -E "join token|dashboard token|fingerprin
 * พอร์ต: **UDP 7878** (agent ↔ hub, QUIC), **TCP 7880** (dashboard), UDP 5353 (mDNS) — เปิด firewall ของ server ด้วย
 * ข้อมูลทั้งหมดอยู่ใน volume `flowcursor-data` (`/data`): `hub.crt`/`hub.key` (identity), `state.json` (เครื่อง, layout, settings, secret)
   **อย่าลบ volume** ไม่เช่นนั้น fingerprint ของ Hub จะเปลี่ยนและทุก agent ต้อง join ใหม่
-* ถ้าไม่ตั้ง `FLOW_ADMIN_TOKEN` Hub จะสุ่ม token, เก็บใน volume และพิมพ์ไว้ใน log
+* ถ้าไม่ตั้ง `FLOW_ADMIN_TOKEN` หรือตั้งเป็นค่าว่าง (ค่า default ของ `compose.yaml`) Hub จะสุ่ม token, เก็บใน volume และพิมพ์ `dashboard token: …` ไว้ใน log ทุกครั้งที่เริ่ม
+  (ถ้าตั้งเองจะไม่พิมพ์)
 * ใช้ image ที่ build ไว้แล้ว: `build/build.sh` สร้าง `flow-cursor-server:flowcursor-mvp` (ดู [Build](#build-จากซอร์ส))
 * ตัวแปรเพิ่มเติม: `FLOW_QUIC_ADDR`, `FLOW_HTTP_ADDR`, `FLOW_NO_MDNS=1`, `FLOW_NAME`, `RUST_LOG`
 * พิมพ์ join token (ระหว่างที่ hub รันอยู่ก็ได้): `docker compose exec flow-server flow-server --print-token` — image เป็น distroless จึงไม่มี shell

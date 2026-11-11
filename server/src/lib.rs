@@ -27,7 +27,8 @@ pub struct HubConfig {
     pub quic_addr: SocketAddr,
     /// Dashboard listen address (None = no dashboard).
     pub http_addr: Option<SocketAddr>,
-    /// Overrides the persisted dashboard token.
+    /// Overrides the persisted dashboard token. Empty or blank counts as
+    /// unset (compose passes `FLOW_ADMIN_TOKEN: ${FLOW_ADMIN_TOKEN:-}`).
     pub admin_token: Option<String>,
     pub mdns: bool,
     pub name: String,
@@ -36,10 +37,32 @@ pub struct HubConfig {
 /// Callback that applies a new log filter.
 pub type LogLevelHook = Box<dyn Fn(&str) + Send + Sync>;
 
+/// Where the dashboard token in use comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminTokenSource {
+    /// `HubConfig::admin_token` (FLOW_ADMIN_TOKEN / --admin-token).
+    Configured,
+    /// The random token stored in the data directory; the operator only
+    /// learns it from the startup log.
+    Persisted,
+}
+
+impl HubConfig {
+    /// The dashboard token to use and where it comes from: the configured
+    /// one unless it is unset, empty or blank, else the persisted one.
+    pub fn effective_admin_token(&self, persisted: &str) -> (String, AdminTokenSource) {
+        match self.admin_token.as_deref().filter(|t| !t.trim().is_empty()) {
+            Some(t) => (t.to_string(), AdminTokenSource::Configured),
+            None => (persisted.to_string(), AdminTokenSource::Persisted),
+        }
+    }
+}
+
 pub struct Hub {
     pub identity: Identity,
     pub state: Mutex<HubState>,
     pub admin_token: String,
+    pub admin_token_source: AdminTokenSource,
     /// Log filter reload hook (set by the binary).
     pub on_log_level: Mutex<Option<LogLevelHook>>,
 }
@@ -99,8 +122,7 @@ pub async fn start(cfg: HubConfig) -> Result<HubHandle> {
     std::fs::create_dir_all(&cfg.data_dir).with_context(|| format!("creating {}", cfg.data_dir.display()))?;
     let identity = Identity::load_or_create(&cfg.data_dir, "hub", &cfg.name)?;
     let persisted = Persisted::load_or_create(&cfg.data_dir)?;
-    let admin_token =
-        cfg.admin_token.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| persisted.admin_token.clone());
+    let (admin_token, admin_token_source) = cfg.effective_admin_token(&persisted.admin_token);
     let hub = Arc::new(Hub {
         identity: identity.clone(),
         state: Mutex::new(HubState {
@@ -113,6 +135,7 @@ pub async fn start(cfg: HubConfig) -> Result<HubHandle> {
             next_conn_id: 1,
         }),
         admin_token,
+        admin_token_source,
         on_log_level: Mutex::new(None),
     });
 
@@ -162,4 +185,29 @@ pub async fn start(cfg: HubConfig) -> Result<HubHandle> {
     };
 
     Ok(HubHandle { hub, quic_addr, http_addr, endpoint, _mdns: mdns, tasks })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_admin_token_counts_as_unset() {
+        let cfg = |t: Option<&str>| HubConfig {
+            data_dir: PathBuf::new(),
+            quic_addr: "127.0.0.1:0".parse().unwrap(),
+            http_addr: None,
+            admin_token: t.map(Into::into),
+            mdns: false,
+            name: "t".into(),
+        };
+        let stored = ("stored".to_string(), AdminTokenSource::Persisted);
+        assert_eq!(cfg(None).effective_admin_token("stored"), stored);
+        assert_eq!(cfg(Some("")).effective_admin_token("stored"), stored);
+        assert_eq!(cfg(Some(" \t")).effective_admin_token("stored"), stored);
+        assert_eq!(
+            cfg(Some("secret")).effective_admin_token("stored"),
+            ("secret".to_string(), AdminTokenSource::Configured)
+        );
+    }
 }
