@@ -10,12 +10,13 @@
 
 use crate::backend::{monitor_at, Backend, EventRx, LocalEvent};
 use crate::config::{AgentConfig, AgentState};
+use crate::cross::{self, EdgeDecision, EdgeHold, HoldStep};
 use crate::edge::EdgeGate;
 use crate::hub::{HubChannels, HubClient, HubEvent, HubRelay, Links};
 use crate::netcheck::{AddrSource, SystemAddrs, NET_CHECK_INTERVAL};
 use anyhow::{Context, Result};
 use flow_keymap::{parse_combo, Combo};
-use flow_layout::{LayoutExt, Move};
+use flow_layout::{clamp_to_screens, LayoutExt, Move, Side};
 use flow_net::endpoint::{bind, server_config, TransportOpts};
 use flow_net::link::p2p::LinkReceiver;
 use flow_net::link::{serve_p2p, spawn_link, Action, LinkConfig, LinkStatus, PeerDirectory, PeerTarget};
@@ -55,6 +56,9 @@ pub struct AgentStatus {
     pub away: bool,
     /// Interface addresses the away decision was made from.
     pub local_addrs: Vec<IpAddr>,
+    /// The pointer is held at an edge waiting for the crossing key
+    /// (backends where hitting the edge captures, i.e. Wayland).
+    pub holding_edge: bool,
 }
 
 pub struct AgentHandle {
@@ -200,7 +204,9 @@ pub async fn start_with(
         mode: Mode::Local,
         sent_keys: BTreeSet::new(),
         sent_buttons: BTreeSet::new(),
-        held_local: HashSet::new(),
+        pressed: HashSet::new(),
+        crossing: None,
+        peer_crossing: HashMap::new(),
         links: links.clone(),
         dir,
         receiver,
@@ -230,7 +236,25 @@ pub async fn start_with(
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
     Local,
-    Remote { target: NodeId, x: f64, y: f64 },
+    /// At an edge, capture active, waiting for the crossing key.
+    Hold(EdgeHold),
+    Remote {
+        target: NodeId,
+        x: f64,
+        y: f64,
+    },
+}
+
+/// Result of trying to cross at a local edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeOutcome {
+    Crossed,
+    /// Everything allows the crossing except the crossing key.
+    NeedKey,
+    /// The edge timing (delay / double bump / corner) says not yet.
+    Wait,
+    /// No reachable machine behind this edge (or away).
+    Refused,
 }
 
 struct Core {
@@ -246,8 +270,14 @@ struct Core {
     /// Keys/buttons forwarded as pressed to the current target.
     sent_keys: BTreeSet<u32>,
     sent_buttons: BTreeSet<Button>,
-    /// Keys physically held while capturing (for the emergency hotkey).
-    held_local: HashSet<u32>,
+    /// Keys known to be physically held: everything seen while capturing
+    /// plus the crossing combo's keys reported outside capture. Used for
+    /// the emergency hotkey and the crossing key.
+    pressed: HashSet<u32>,
+    /// Crossing key of this machine (None = cross freely).
+    crossing: Option<Combo>,
+    /// Crossing keys of peers (gate leaving their screens).
+    peer_crossing: HashMap<NodeId, Combo>,
     links: Links,
     dir: Arc<PeerDirectory>,
     receiver: Arc<LinkReceiver>,
@@ -298,7 +328,7 @@ impl Core {
     fn publish(&self) {
         let controlling = match self.mode {
             Mode::Remote { target, .. } => Some(target),
-            Mode::Local => None,
+            Mode::Local | Mode::Hold(_) => None,
         };
         let me = self.me;
         let online: Vec<NodeId> = {
@@ -316,6 +346,7 @@ impl Core {
             s.online_peers = online;
             s.away = self.away;
             s.local_addrs = self.local_addrs.clone();
+            s.holding_edge = matches!(self.mode, Mode::Hold(_));
         });
     }
 
@@ -367,6 +398,7 @@ impl Core {
                 self.leave_remote(None);
             }
             HubEvent::Revoked => {
+                self.end_hold(None);
                 self.leave_remote(None);
                 self.me = None;
                 self.set_peers(Vec::new());
@@ -406,6 +438,13 @@ impl Core {
             }
         };
         self.gate.cfg = s.edge.clone();
+        if s.crossing_key != self.settings.crossing_key || self.crossing.is_none() {
+            self.crossing = cross::parse_crossing_key(&s.crossing_key);
+            self.backend.set_crossing_key(self.crossing.clone());
+            if let Some(c) = &self.crossing {
+                info!(crossing_key = %s.crossing_key, keys = c.parts.len(), "crossing key required at edges");
+            }
+        }
         let lc = LinkConfig::from_settings(&s);
         for l in self.links.lock().expect("poisoned").values() {
             l.set_config(lc.clone());
@@ -468,6 +507,7 @@ impl Core {
     /// machine (held keys released on the target), whatever controllers
     /// hold here is released, peers can no longer connect directly.
     fn go_away(&mut self) {
+        self.end_hold(None);
         self.leave_remote(None);
         self.receiver.release_everything();
         self.update_dir();
@@ -487,6 +527,8 @@ impl Core {
         let me = self.me;
         let old: HashSet<NodeId> = self.peers.keys().copied().collect();
         self.peers = list.into_iter().filter(|p| Some(p.id) != me).map(|p| (p.id, p)).collect();
+        self.peer_crossing =
+            self.peers.values().filter_map(|p| cross::parse_crossing_key(&p.crossing_key).map(|c| (p.id, c))).collect();
         self.update_dir();
         // Release anything held by sources that disappeared or were disabled.
         for id in old {
@@ -561,20 +603,29 @@ impl Core {
     fn on_local(&mut self, ev: LocalEvent) {
         match ev {
             LocalEvent::EdgeHit { side, x, y } => self.on_edge(side, x, y),
-            LocalEvent::Motion { dx, dy } => self.on_motion(dx, dy),
+            LocalEvent::Motion { dx, dy } => match self.mode {
+                Mode::Hold(mut h) => {
+                    let step = h.on_motion(Instant::now(), dx, dy);
+                    self.mode = Mode::Hold(h);
+                    self.on_hold_step(step);
+                }
+                _ => self.on_motion(dx, dy),
+            },
+            LocalEvent::LocalKey { usage, down } => self.track_key(usage, down),
             LocalEvent::Key { usage, down } => {
+                self.track_key(usage, down);
+                if let Mode::Hold(h) = self.mode {
+                    let step = h.on_key(self.crossing.as_ref(), usage);
+                    self.on_hold_step(step);
+                    return self.publish();
+                }
                 if !matches!(self.mode, Mode::Remote { .. }) {
                     return;
                 }
-                if down {
-                    self.held_local.insert(usage);
-                    if self.combo.is_held(|k| self.held_local.contains(&k)) {
-                        warn!("emergency hotkey pressed, returning control to this machine");
-                        self.leave_remote(None);
-                        return;
-                    }
-                } else {
-                    self.held_local.remove(&usage);
+                if down && self.combo.is_held(|k| self.pressed.contains(&k)) {
+                    warn!("emergency hotkey pressed, returning control to this machine");
+                    self.leave_remote(None);
+                    return;
                 }
                 if down {
                     self.sent_keys.insert(usage);
@@ -584,6 +635,10 @@ impl Core {
                 self.send(InputEvent::Key { usage, down });
             }
             LocalEvent::Button { button, down } => {
+                if matches!(self.mode, Mode::Hold(_)) {
+                    // The user is using this machine; the click is consumed.
+                    self.end_hold(None);
+                }
                 if !matches!(self.mode, Mode::Remote { .. }) {
                     return;
                 }
@@ -594,17 +649,22 @@ impl Core {
                 }
                 self.send(InputEvent::Button { button, down });
             }
-            LocalEvent::Wheel { dx, dy } => {
-                if matches!(self.mode, Mode::Remote { .. }) {
-                    self.send(InputEvent::Wheel { dx, dy });
-                }
-            }
-            LocalEvent::CaptureEnded => {
-                if matches!(self.mode, Mode::Remote { .. }) {
+            LocalEvent::Wheel { dx, dy } => match self.mode {
+                Mode::Remote { .. } => self.send(InputEvent::Wheel { dx, dy }),
+                Mode::Hold(_) => self.end_hold(None),
+                Mode::Local => {}
+            },
+            LocalEvent::CaptureEnded => match self.mode {
+                Mode::Remote { .. } => {
                     warn!("local capture ended by the system, returning control");
                     self.leave_remote(None);
                 }
-            }
+                Mode::Hold(_) => {
+                    self.mode = Mode::Local;
+                    self.forget_keys_after_capture();
+                }
+                Mode::Local => {}
+            },
             LocalEvent::Clipboard(c) => self.on_local_clipboard(c),
             LocalEvent::MonitorsChanged(m) => {
                 info!(monitors = m.len(), "monitor configuration changed");
@@ -638,33 +698,99 @@ impl Core {
         let _ = self.clip_out.send(c);
     }
 
-    fn on_edge(&mut self, side: flow_layout::Side, x: i32, y: i32) {
-        if matches!(self.mode, Mode::Remote { .. }) {
+    fn on_edge(&mut self, side: Side, x: i32, y: i32) {
+        if !matches!(self.mode, Mode::Local) {
             return;
         }
-        let deny = |b: &Arc<dyn Backend>| b.end_capture(None);
-        if self.away {
-            return deny(&self.backend);
+        match self.try_cross(side, x, y) {
+            EdgeOutcome::Crossed => {}
+            EdgeOutcome::NeedKey if self.backend.edge_hit_captures() => {
+                debug!(?side, x, y, "at the edge without the crossing key: holding the pointer there");
+                self.mode = Mode::Hold(EdgeHold::new(side, x as f64, y as f64, Instant::now()));
+            }
+            EdgeOutcome::NeedKey | EdgeOutcome::Wait | EdgeOutcome::Refused => self.backend.end_capture(None),
         }
-        let Some(me) = self.me else { return deny(&self.backend) };
+    }
+
+    /// The pointer pushes against a local edge: switch to the machine
+    /// behind it if everything allows it.
+    fn try_cross(&mut self, side: Side, x: i32, y: i32) -> EdgeOutcome {
+        if self.away {
+            return EdgeOutcome::Refused;
+        }
+        let Some(me) = self.me else { return EdgeOutcome::Refused };
         let Some((to, ex, ey)) = self.layout.crossing_local(me, x as f64, y as f64, side) else {
-            return deny(&self.backend);
+            return EdgeOutcome::Refused;
         };
         if !self.reachable(to) {
-            return deny(&self.backend);
+            return EdgeOutcome::Refused;
         }
         let usable = self.links.lock().expect("poisoned").get(&to).is_some_and(|l| l.status().path != PathKind::Down);
         if !usable {
             debug!(%to, "edge crossing refused: no path to target");
-            return deny(&self.backend);
+            return EdgeOutcome::Refused;
+        }
+        match cross::required_for_edge(self.crossing.as_ref(), &self.pressed, self.backend.edge_hit_captures()) {
+            EdgeDecision::Cross => {}
+            EdgeDecision::Refuse | EdgeDecision::Hold => return EdgeOutcome::NeedKey,
         }
         let mon = monitor_at(&self.backend.monitors(), x, y);
         if !self.gate.hit(Instant::now(), side, x, y, mon) {
-            return deny(&self.backend);
+            return EdgeOutcome::Wait;
         }
         self.gate.reset();
         self.backend.begin_capture();
         self.enter(to, ex, ey);
+        EdgeOutcome::Crossed
+    }
+
+    fn on_hold_step(&mut self, step: HoldStep) {
+        let Mode::Hold(h) = self.mode else { return };
+        match step {
+            HoldStep::Stay => {}
+            HoldStep::Push => match self.try_cross(h.side, h.x.round() as i32, h.y.round() as i32) {
+                EdgeOutcome::Crossed => {
+                    // The capture that the edge started is now the remote
+                    // session; the crossing key's own press was never
+                    // forwarded, so neither is its release.
+                    debug!("crossing key held at the edge: switched");
+                }
+                EdgeOutcome::NeedKey | EdgeOutcome::Wait => {}
+                EdgeOutcome::Refused => self.end_hold(None),
+            },
+            HoldStep::Release(pos) => self.end_hold(pos),
+        }
+    }
+
+    /// Gives the pointer back after a hold (at `warp`, or at the edge).
+    fn end_hold(&mut self, warp: Option<(i32, i32)>) {
+        if !matches!(self.mode, Mode::Hold(_)) {
+            return;
+        }
+        self.mode = Mode::Local;
+        self.gate.reset();
+        self.backend.end_capture(warp);
+        self.forget_keys_after_capture();
+    }
+
+    fn track_key(&mut self, usage: u32, down: bool) {
+        if down {
+            self.pressed.insert(usage);
+        } else {
+            self.pressed.remove(&usage);
+        }
+    }
+
+    /// After capture ends the backend stops reporting most keys, so their
+    /// releases would be missed. Keep only what it keeps reporting: the
+    /// crossing combo on backends that see keys outside capture.
+    fn forget_keys_after_capture(&mut self) {
+        if self.backend.observes_keys() {
+            let crossing = self.crossing.clone();
+            self.pressed.retain(|k| crossing.as_ref().is_some_and(|c| c.contains(*k)));
+        } else {
+            self.pressed.clear();
+        }
     }
 
     fn link(&self, id: NodeId) -> Option<flow_net::link::LinkHandle> {
@@ -714,7 +840,7 @@ impl Core {
         }
         self.release_target();
         self.mode = Mode::Local;
-        self.held_local.clear();
+        self.forget_keys_after_capture();
         self.backend.end_capture(warp);
         let _ = self.to_hub.send(ToHub::FocusChanged { target: None });
         info!("focus → this machine");
@@ -733,15 +859,25 @@ impl Core {
                 }
             }
             Move::Cross { to, x: nx, y: ny, .. } => {
-                if Some(to) == self.me {
+                // Leaving the target's screen needs the target's crossing key
+                // (also on the way back here).
+                let key_ok = cross::key_held(self.peer_crossing.get(&target), &self.pressed);
+                if key_ok && Some(to) == self.me {
                     self.leave_remote(Some((nx.round() as i32, ny.round() as i32)));
-                } else if self.reachable(to) && self.link(to).is_some_and(|l| l.status().path != PathKind::Down) {
+                } else if key_ok
+                    && self.reachable(to)
+                    && self.link(to).is_some_and(|l| l.status().path != PathKind::Down)
+                {
                     self.release_target();
                     self.enter(to, nx, ny);
                 } else {
-                    // Unreachable machine: stay at the edge.
+                    // Stay at the edge (sliding along it), like a screen
+                    // border without a neighbour.
+                    let (cx, cy) =
+                        self.layout.node(target).map(|n| clamp_to_screens(n, x + sdx, y + sdy)).unwrap_or((x, y));
+                    self.mode = Mode::Remote { target, x: cx, y: cy };
                     if let Some(l) = self.link(target) {
-                        l.send_motion(x.round() as i32, y.round() as i32, 0, 0);
+                        l.send_motion(cx.round() as i32, cy.round() as i32, 0, 0);
                     }
                 }
             }
@@ -778,6 +914,12 @@ impl Core {
     }
 
     fn on_tick(&mut self) {
+        if let Mode::Hold(h) = self.mode {
+            if h.expired(Instant::now()) {
+                self.end_hold(None);
+                self.publish();
+            }
+        }
         if let Mode::Remote { target, .. } = self.mode {
             let path = self.link(target).map(|l| l.status().path).unwrap_or(PathKind::Down);
             if path == PathKind::Down {

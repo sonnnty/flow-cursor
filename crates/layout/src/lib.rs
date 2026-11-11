@@ -123,6 +123,17 @@ fn clamp_into(r: &Rect, x: f64, y: f64) -> (f64, f64) {
     (x.clamp(r.x as f64, max_x), y.clamp(r.y as f64, max_y))
 }
 
+/// Clamps a node-local point onto the node's nearest monitor (used to keep
+/// a virtual cursor at an edge it may not cross).
+pub fn clamp_to_screens(n: &NodeLayout, x: f64, y: f64) -> (f64, f64) {
+    n.monitors
+        .iter()
+        .map(|m| m.rect)
+        .min_by(|a, b| dist_to_rect(a, x, y).total_cmp(&dist_to_rect(b, x, y)))
+        .map(|r| clamp_into(&r, x, y))
+        .unwrap_or((x, y))
+}
+
 fn dist_to_rect(r: &Rect, x: f64, y: f64) -> f64 {
     let (cx, cy) = clamp_into(r, x, y);
     (cx - x).abs() + (cy - y).abs()

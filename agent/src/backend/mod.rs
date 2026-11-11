@@ -38,6 +38,13 @@ pub enum LocalEvent {
         usage: u32,
         down: bool,
     },
+    /// A key of the crossing combo pressed or released while *not*
+    /// capturing (it reached the local OS normally). Only from backends
+    /// that can see keys outside capture ([`Backend::observes_keys`]).
+    LocalKey {
+        usage: u32,
+        down: bool,
+    },
     Button {
         button: Button,
         down: bool,
@@ -80,6 +87,25 @@ pub trait Backend: Send + Sync + 'static {
     /// instead of clearing them (e.g. while away).
     fn keep_edges_stable(&self) -> bool {
         false
+    }
+    /// True when the backend reports [`LocalEvent::LocalKey`] for the keys
+    /// of the crossing combo while not capturing (Windows hook, X11 raw
+    /// events). Otherwise the core only knows keys seen during capture.
+    fn observes_keys(&self) -> bool {
+        false
+    }
+    /// True when an [`LocalEvent::EdgeHit`] means capture is already active
+    /// (Wayland InputCapture barriers). A refused or held crossing then has
+    /// to give the pointer back with `end_capture`.
+    fn edge_hit_captures(&self) -> bool {
+        false
+    }
+    /// The combo that gates crossing out of this machine (None = cross
+    /// freely). Backends use it to report the combo's keys
+    /// ([`LocalEvent::LocalKey`]) and may pre-filter edge hits with it;
+    /// the decision itself is the core's ([`crate::cross`]).
+    fn set_crossing_key(&self, combo: Option<flow_keymap::Combo>) {
+        let _ = combo;
     }
 }
 

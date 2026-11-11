@@ -25,6 +25,13 @@ pub struct SimState {
     pub pointer: (i32, i32),
     /// Optional observer notified of every injected action (latency bench).
     pub observer: Option<mpsc::UnboundedSender<Action>>,
+    /// Behave like Wayland: an edge hit starts capture, keys are only
+    /// visible while capturing.
+    pub wayland_like: bool,
+    /// Crossing combo set by the core.
+    pub crossing_key: Option<flow_keymap::Combo>,
+    /// Number of `end_capture` calls (refused crossings included).
+    pub end_captures: usize,
 }
 
 pub struct SimBackend {
@@ -83,6 +90,45 @@ impl SimControl {
     pub fn last_warp(&self) -> Option<(i32, i32)> {
         self.state.lock().unwrap().warps.last().copied()
     }
+    /// Switches to Wayland-like behaviour (see [`SimState::wayland_like`]).
+    pub fn set_wayland_like(&self, on: bool) {
+        self.state.lock().unwrap().wayland_like = on;
+    }
+    /// The pointer pushes against an edge (on a Wayland-like backend this
+    /// activates capture first, like a pointer barrier).
+    pub fn push_edge(&self, side: flow_layout::Side, x: i32, y: i32) {
+        {
+            let mut s = self.state.lock().unwrap();
+            if s.wayland_like {
+                s.capturing = true;
+            }
+        }
+        self.emit(LocalEvent::EdgeHit { side, x, y });
+    }
+    /// A physical key press/release, delivered the way the backend would:
+    /// captured while capturing, otherwise reported only for keys of the
+    /// crossing combo and only when not Wayland-like.
+    pub fn key(&self, usage: u32, down: bool) {
+        let ev = {
+            let s = self.state.lock().unwrap();
+            if s.capturing {
+                Some(LocalEvent::Key { usage, down })
+            } else if !s.wayland_like && s.crossing_key.as_ref().is_some_and(|c| c.contains(usage)) {
+                Some(LocalEvent::LocalKey { usage, down })
+            } else {
+                None
+            }
+        };
+        if let Some(ev) = ev {
+            self.emit(ev);
+        }
+    }
+    pub fn crossing_key(&self) -> Option<flow_keymap::Combo> {
+        self.state.lock().unwrap().crossing_key.clone()
+    }
+    pub fn end_captures(&self) -> usize {
+        self.state.lock().unwrap().end_captures
+    }
 }
 
 impl Backend for SimBackend {
@@ -104,6 +150,7 @@ impl Backend for SimBackend {
     fn end_capture(&self, warp: Option<(i32, i32)>) {
         let mut s = self.state.lock().unwrap();
         s.capturing = false;
+        s.end_captures += 1;
         if let Some(w) = warp {
             s.warps.push(w);
             s.pointer = w;
@@ -123,5 +170,14 @@ impl Backend for SimBackend {
     fn set_clipboard(&self, content: &ClipContent) {
         self.state.lock().unwrap().clipboard = Some(content.clone());
         let _ = &self.tx;
+    }
+    fn observes_keys(&self) -> bool {
+        !self.state.lock().unwrap().wayland_like
+    }
+    fn edge_hit_captures(&self) -> bool {
+        self.state.lock().unwrap().wayland_like
+    }
+    fn set_crossing_key(&self, combo: Option<flow_keymap::Combo>) {
+        self.state.lock().unwrap().crossing_key = combo;
     }
 }
