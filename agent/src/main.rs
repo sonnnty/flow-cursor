@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use flow_agent::backend::{self, BackendOptions};
 use flow_agent::config::{default_config_path, AgentConfig, AgentState};
+use flow_agent::logbuf::LogBuffer;
 use flow_net::token::JoinToken;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,7 +53,9 @@ enum Cmd {
     },
 }
 
-fn init_logging(level: &str, file: Option<&std::path::Path>) -> flow_agent::LogHook {
+/// Sets up logging to stdout or `file`, plus an in-memory copy of the last
+/// lines for the status window (`flow-tray`).
+fn init_logging(level: &str, file: Option<&std::path::Path>) -> (flow_agent::LogHook, LogBuffer) {
     let initial = std::env::var("RUST_LOG").unwrap_or_else(|_| level.to_string());
     let (filter, handle) = reload::Layer::new(EnvFilter::try_new(&initial).unwrap_or_else(|_| EnvFilter::new("info")));
     let file_layer = file.and_then(|p| {
@@ -63,9 +66,11 @@ fn init_logging(level: &str, file: Option<&std::path::Path>) -> flow_agent::LogH
         Some(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)))
     });
     let stdout_layer = file.is_none().then(tracing_subscriber::fmt::layer);
-    tracing_subscriber::registry().with(filter).with(stdout_layer).with(file_layer).init();
+    let logs = LogBuffer::default();
+    let mem_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer(logs.clone());
+    tracing_subscriber::registry().with(filter).with(stdout_layer).with(file_layer).with(mem_layer).init();
     let env_set = std::env::var("RUST_LOG").is_ok();
-    Arc::new(move |lvl: &str| {
+    let hook: flow_agent::LogHook = Arc::new(move |lvl: &str| {
         if env_set {
             return;
         }
@@ -76,7 +81,8 @@ fn init_logging(level: &str, file: Option<&std::path::Path>) -> flow_agent::LogH
             }
             Err(e) => warn!("ignoring invalid log level {lvl:?}: {e}"),
         }
-    })
+    });
+    (hook, logs)
 }
 
 #[tokio::main]
@@ -157,7 +163,7 @@ async fn main() -> Result<()> {
         Cmd::Run { backend: b } => {
             // Without a console (Windows autostart) log to a file by default.
             let log_file = cfg.log_file.clone().or_else(|| (!has_console).then(|| cfg.state_dir().join("agent.log")));
-            let hook = init_logging(cfg.log_level.as_deref().unwrap_or("info"), log_file.as_deref());
+            let (hook, _logs) = init_logging(cfg.log_level.as_deref().unwrap_or("info"), log_file.as_deref());
             if let Some(l) = &cfg.log_level {
                 hook(l);
             }

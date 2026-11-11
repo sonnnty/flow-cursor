@@ -111,7 +111,7 @@ pub async fn start_agent(hub: &HubHandle, spec: AgentSpec) -> TestAgent {
     };
     let (backend, sim, rx) = SimBackend::with_control(spec.monitors);
     let net = StaticAddrs::new(spec.addrs);
-    let opts = StartOptions { log_hook: None, addrs: Arc::new(net.clone()), net_check_interval: NET_CHECK };
+    let opts = StartOptions { addrs: Arc::new(net.clone()), net_check_interval: NET_CHECK, ..Default::default() };
     let agent = flow_agent::start_with(cfg, backend, rx, opts).await.expect("agent starts");
     TestAgent { agent, sim, state_dir, net }
 }

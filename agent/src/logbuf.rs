@@ -80,7 +80,14 @@ mod tests {
             b.push(&format!("line {i}\n"));
         }
         let t = b.tail(3);
-        assert_eq!(t, vec![format!("line {}", LOG_LINES + 2), format!("line {}", LOG_LINES + 3), format!("line {}", LOG_LINES + 4)]);
+        assert_eq!(
+            t,
+            vec![
+                format!("line {}", LOG_LINES + 2),
+                format!("line {}", LOG_LINES + 3),
+                format!("line {}", LOG_LINES + 4)
+            ]
+        );
         assert_eq!(b.tail(usize::MAX).len(), LOG_LINES);
         b.push("   \n");
         assert_eq!(b.tail(1)[0], format!("line {}", LOG_LINES + 4), "blank lines are skipped");
@@ -92,7 +99,8 @@ mod tests {
     fn works_as_a_tracing_writer() {
         use tracing_subscriber::prelude::*;
         let b = LogBuffer::default();
-        let sub = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(b.clone()));
+        let sub = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(b.clone()));
         tracing::subscriber::with_default(sub, || tracing::info!(peer = 3, "hello from the test"));
         let t = b.tail(10);
         assert_eq!(t.len(), 1);
