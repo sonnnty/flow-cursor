@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -102,23 +102,56 @@ enum End {
     Retry(Duration),
 }
 
+/// Reconnect backoff: starts here, doubles per failed attempt up to
+/// [`BACKOFF_MAX`].
+const BACKOFF_MIN: Duration = Duration::from_millis(500);
+const BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// A session that lasted this long counts as healthy: when it drops, the
+/// backoff starts small again instead of continuing from where an earlier
+/// outage left it.
+const HEALTHY_SESSION: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attempt {
+    /// The session ended in a way that asks for a fixed delay.
+    Retry(Duration),
+    /// Connecting failed or the session broke; `healthy` = it had been up
+    /// for at least [`HEALTHY_SESSION`].
+    Failed { healthy: bool },
+}
+
+/// (delay before the next attempt, new backoff).
+fn next_backoff(backoff: Duration, a: Attempt) -> (Duration, Duration) {
+    match a {
+        Attempt::Retry(d) => (d, backoff),
+        Attempt::Failed { healthy: true } => (BACKOFF_MIN, BACKOFF_MIN),
+        Attempt::Failed { healthy: false } => {
+            let b = (backoff * 2).min(BACKOFF_MAX);
+            (b, b)
+        }
+    }
+}
+
 impl HubClient {
     pub async fn run(self, mut ch: HubChannels) {
-        let mut backoff = Duration::from_millis(500);
+        let mut backoff = BACKOFF_MIN;
         loop {
-            match self.connect_once(&mut ch).await {
-                Ok(End::Retry(d)) => backoff = d,
+            let mut session_start = None;
+            let attempt = match self.connect_once(&mut ch, &mut session_start).await {
+                Ok(End::Retry(d)) => Attempt::Retry(d),
                 Err(e) => {
                     warn!("hub connection: {e:#}");
-                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                    Attempt::Failed { healthy: session_start.is_some_and(|t: Instant| t.elapsed() >= HEALTHY_SESSION) }
                 }
-            }
+            };
+            let delay;
+            (delay, backoff) = next_backoff(backoff, attempt);
             self.relay.set(None);
             let _ = self.events.send(HubEvent::Disconnected);
             // Drop what was queued while disconnected.
             while ch.to_hub.try_recv().is_ok() {}
             while ch.clip.try_recv().is_ok() {}
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -178,7 +211,8 @@ impl HubClient {
         }
     }
 
-    async fn connect_once(&self, ch: &mut HubChannels) -> Result<End> {
+    /// One connection. `session_start` is set once the hub welcomed us.
+    async fn connect_once(&self, ch: &mut HubChannels, session_start: &mut Option<Instant>) -> Result<End> {
         let (pin, token) = self.pin_and_token()?;
         let addr = self.hub_addr(&pin).await?;
         let cc = client_config(&self.identity, ALPN_HUB, pin, TransportOpts::HUB)?;
@@ -224,6 +258,7 @@ impl HubClient {
                 warn!("saving agent state: {e:#}");
             }
         }
+        *session_start = Some(Instant::now());
         if token.is_some() {
             info!(node = %welcome.node_id, name = %welcome.name, hub_fingerprint = %hub_fp, "joined hub; hub fingerprint pinned");
         }
@@ -400,5 +435,31 @@ pub fn dispatch_relay_dg(receiver: &LinkReceiver, links: &Links, relay: &HubRela
                 relay.send_datagram(d.from, reply);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_and_resets_after_a_healthy_session() {
+        let mut b = BACKOFF_MIN;
+        let mut delays = Vec::new();
+        for _ in 0..7 {
+            let d;
+            (d, b) = next_backoff(b, Attempt::Failed { healthy: false });
+            delays.push(d.as_millis());
+        }
+        assert_eq!(delays, [1000, 2000, 4000, 8000, 10000, 10000, 10000]);
+        // A long healthy session dropped: start small again.
+        let (d, b2) = next_backoff(b, Attempt::Failed { healthy: true });
+        assert_eq!((d, b2), (BACKOFF_MIN, BACKOFF_MIN));
+        // Next failure doubles from the small value, not from 10 s.
+        assert_eq!(next_backoff(b2, Attempt::Failed { healthy: false }).0, Duration::from_secs(1));
+        // A short-lived session that keeps dropping keeps backing off.
+        assert_eq!(next_backoff(b, Attempt::Failed { healthy: false }).0, BACKOFF_MAX);
+        // Explicit retry delays do not touch the backoff.
+        assert_eq!(next_backoff(b2, Attempt::Retry(Duration::from_secs(30))), (Duration::from_secs(30), b2));
     }
 }

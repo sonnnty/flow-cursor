@@ -20,16 +20,17 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 pub mod clip;
+pub mod net;
 pub mod settings;
 
 pub use clip::{ClipContent, ClipKind, ClipboardMsg};
 pub use settings::{AgentSettings, ClipboardSettings, EdgeSettings, HubSettings, PathPolicy};
 
 /// Bumped whenever any message in this crate changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// ALPN for agent ↔ hub connections.
 pub const ALPN_HUB: &[u8] = b"flowcursor-hub/1";
 /// ALPN for agent ↔ agent (P2P) connections.
@@ -200,6 +201,12 @@ pub struct PeerInfo {
     /// Pointer speed multiplier applied to motion sent *to* this node.
     pub mouse_speed: f32,
     pub caps: Capabilities,
+    /// The peer is connected but not on one of its allowed networks: it
+    /// neither controls nor is controlled, and edges to it do not cross.
+    pub away: bool,
+    /// The peer's effective crossing key (empty = none): it must be held to
+    /// move the pointer out of that peer's screen.
+    pub crossing_key: String,
 }
 
 /// Network path currently used for a source → target link.
@@ -287,6 +294,12 @@ pub enum ToHub {
         target: Option<NodeId>,
     },
     PathReports(Vec<PathReport>),
+    /// Result of the agent's allowed-network check and the interface
+    /// addresses it was made from (sent on connect and on every change).
+    NetStatus {
+        away: bool,
+        addrs: Vec<IpAddr>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -38,6 +38,13 @@ pub enum LocalEvent {
         usage: u32,
         down: bool,
     },
+    /// A key of the crossing combo pressed or released while *not*
+    /// capturing (it reached the local OS normally). Only from backends
+    /// that can see keys outside capture ([`Backend::observes_keys`]).
+    LocalKey {
+        usage: u32,
+        down: bool,
+    },
     Button {
         button: Button,
         down: bool,
@@ -74,6 +81,32 @@ pub trait Backend: Send + Sync + 'static {
     /// Inject an action received from a controlling machine.
     fn inject(&self, action: &Action);
     fn set_clipboard(&self, content: &ClipContent);
+    /// True when changing the edges is expensive (Wayland: new barriers
+    /// recreate the capture session and may ask for permission again).
+    /// The core then keeps the edges and refuses crossings at hit time
+    /// instead of clearing them (e.g. while away).
+    fn keep_edges_stable(&self) -> bool {
+        false
+    }
+    /// True when the backend reports [`LocalEvent::LocalKey`] for the keys
+    /// of the crossing combo while not capturing (Windows hook, X11 raw
+    /// events). Otherwise the core only knows keys seen during capture.
+    fn observes_keys(&self) -> bool {
+        false
+    }
+    /// True when an [`LocalEvent::EdgeHit`] means capture is already active
+    /// (Wayland InputCapture barriers). A refused or held crossing then has
+    /// to give the pointer back with `end_capture`.
+    fn edge_hit_captures(&self) -> bool {
+        false
+    }
+    /// The combo that gates crossing out of this machine (None = cross
+    /// freely). Backends use it to report the combo's keys
+    /// ([`LocalEvent::LocalKey`]) and may pre-filter edge hits with it;
+    /// the decision itself is the core's ([`crate::cross`]).
+    fn set_crossing_key(&self, combo: Option<flow_keymap::Combo>) {
+        let _ = combo;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,4 +182,50 @@ pub async fn create(kind: BackendKind, opts: &BackendOptions) -> Result<(Arc<dyn
 /// Monitor containing a local point (for dead-corner checks).
 pub fn monitor_at(mons: &[Monitor], x: i32, y: i32) -> Option<flow_proto::Rect> {
     mons.iter().map(|m| m.rect).find(|r| r.contains(x as f64, y as f64))
+}
+
+/// Backends that see physical keys outside capture keep `held` (the
+/// crossing combo's keys currently down) with every key change, and report
+/// the change as [`LocalEvent::LocalKey`] when it belongs to the combo and
+/// actually changes the state (auto-repeat is dropped). Other keys are
+/// never reported: the core does not need them and they stay private.
+pub fn crossing_key_event(
+    combo: Option<&flow_keymap::Combo>,
+    held: &mut std::collections::HashSet<u32>,
+    usage: u32,
+    down: bool,
+) -> Option<LocalEvent> {
+    if !combo.is_some_and(|c| c.contains(usage)) {
+        return None;
+    }
+    let changed = if down { held.insert(usage) } else { held.remove(&usage) };
+    changed.then_some(LocalEvent::LocalKey { usage, down })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_keymap::keys;
+
+    #[test]
+    fn only_combo_keys_are_reported_once_per_change() {
+        let combo = flow_keymap::parse_combo("Ctrl+Alt").unwrap();
+        let mut held = std::collections::HashSet::new();
+        let ev = |held: &mut _, u, d| crossing_key_event(Some(&combo), held, u, d);
+        assert_eq!(ev(&mut held, keys::A, true), None, "not part of the combo");
+        assert_eq!(
+            ev(&mut held, keys::LEFT_CTRL, true),
+            Some(LocalEvent::LocalKey { usage: keys::LEFT_CTRL, down: true })
+        );
+        assert_eq!(ev(&mut held, keys::LEFT_CTRL, true), None, "auto-repeat");
+        assert!(!crate::cross::key_held(Some(&combo), &held));
+        assert!(ev(&mut held, keys::RIGHT_ALT, true).is_some());
+        assert!(crate::cross::key_held(Some(&combo), &held));
+        assert_eq!(
+            ev(&mut held, keys::LEFT_CTRL, false),
+            Some(LocalEvent::LocalKey { usage: keys::LEFT_CTRL, down: false })
+        );
+        assert_eq!(ev(&mut held, keys::LEFT_CTRL, false), None, "release without press is not reported");
+        assert_eq!(crossing_key_event(None, &mut held, keys::LEFT_CTRL, true), None, "no crossing key configured");
+    }
 }

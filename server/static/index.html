@@ -29,7 +29,11 @@
   code.tok { font-size:13px; padding:4px 8px; background:var(--bg); border-radius:6px; word-break:break-all; user-select:all; }
   #layout { width:100%; height:380px; background:var(--bg); border:1px dashed var(--line); border-radius:8px; touch-action:none; }
   .node rect.mon { fill:var(--card); stroke:var(--mute); stroke-width:1; }
-  .node.offline rect.mon { opacity:.5; }
+  .node.offline rect.mon, .node.away rect.mon { opacity:.5; }
+  .node.away rect.mon { stroke:var(--warn); stroke-dasharray:4 3; }
+  textarea { font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:4px 6px; }
+  input.invalid, textarea.invalid { border-color:var(--bad); }
+  td .row { gap:6px; }
   .node.focus rect.mon { stroke:var(--acc); stroke-width:2; }
   .node text { fill:var(--fg); font-size:12px; pointer-events:none; }
   .node { cursor:grab; }
@@ -91,10 +95,17 @@
       <label for="s-policy">Input path</label><select id="s-policy"><option value="prefer_p2p">Prefer direct (P2P), fall back to relay</option><option value="force_relay">Always relay through the hub</option></select>
       <label for="s-probe">P2P probe interval (ms)</label><input id="s-probe" type="number" min="100" max="60000">
       <label for="s-log">Agent log level</label><div><input id="s-log" size="30"> <span class="hint">tracing filter, e.g. info, debug, flow_net=trace (also applied to the hub)</span></div>
+      <label for="s-nets">Allowed networks</label><div><textarea id="s-nets" rows="2" cols="34" placeholder="empty = everywhere (no restriction)"></textarea>
+        <div class="hint">CIDR blocks, one per line (IPv4 or IPv6), e.g. <code>10.10.15.0/24</code>. A machine shares mouse, keyboard and clipboard only while one of <b>its own</b> network interfaces has an address inside a block; otherwise it is <b>away</b> (stays connected, shown in the dashboard). A VPN address (e.g. 10.8.0.5) is not inside the home block, so the VPN alone never counts as home.</div></div>
+      <label>Crossing key</label><div><span id="s-cross"></span>
+        <div class="hint">Hold this key (or combo) while the pointer reaches an edge to switch machines; without it the pointer stays at the edge (useful for games). Applies when leaving a machine's screen, also on the way back. Empty = cross freely.</div></div>
     </div>
     <div class="row" style="margin-top:12px"><button class="btn primary" id="savesettings">Save settings</button><button class="btn" id="reloadsettings">Reload</button></div>
   </div>
-  <div class="card"><h2>Per-machine settings</h2><p class="hint">Rename, enable/disable, mouse speed and removal (credential revocation) are on the Overview tab in the Machines table.</p></div>
+  <div class="card"><h2>Per-machine settings</h2>
+    <p class="hint">Each machine inherits the global allowed networks and crossing key above, or uses its own. Rename, enable/disable, mouse speed and removal (credential revocation) are on the Overview tab.</p>
+    <table><thead><tr><th>Machine</th><th>Allowed networks</th><th>Crossing key</th><th></th></tr></thead><tbody id="overrides"></tbody></table>
+  </div>
 </section>
 </main>
 </div>
@@ -147,7 +158,8 @@ function renderNodes() {
     speed.addEventListener("change", () => patch(n.id, { mouse_speed: parseFloat(speed.value) }));
     const en = el("input", { type: "checkbox" }); en.checked = n.enabled;
     en.addEventListener("change", () => patch(n.id, { enabled: en.checked }));
-    const status = n.online ? el("span", { class: "badge ok" }, "online") : el("span", { class: "badge mute" }, "offline");
+    const status = el("span", { class: "badge " + ({ online: "ok", away: "warn" }[n.status] || "mute") }, n.status);
+    const why = statusWhy(n);
     const mons = n.monitors.map(m => `${m.rect.w}×${m.rect.h}`).join(" + ") || "–";
     const ctl = focusBy[n.id] ? "→ " + nameOf(focusBy[n.id]) : "";
     const rm = el("button", { class: "btn danger", title: "Remove machine and revoke its credentials" }, "Remove");
@@ -156,9 +168,19 @@ function renderNodes() {
       try { await api("DELETE", "/nodes/" + n.id); toast("Removed " + n.name); refresh(); } catch (e) { toast(e.message, true); }
     });
     const caps = [n.caps.capture ? "capture" : null, n.caps.inject ? "inject" : null, n.caps.clipboard ? "clipboard" : null].filter(Boolean).join(", ");
-    tb.append(el("tr", {}, el("td", {}, name, el("div", { class: "hint" }, n.hostname + (n.remote ? " · " + n.remote : ""))), el("td", {}, status, el("div", { class: "hint" }, caps)), el("td", {}, n.os), el("td", {}, mons), el("td", {}, ctl), el("td", {}, speed), el("td", {}, en), el("td", {}, rm)));
+    tb.append(el("tr", {}, el("td", {}, name, el("div", { class: "hint" }, n.hostname + (n.remote ? " · " + n.remote : ""))), el("td", {}, status, why ? el("div", { class: "hint" }, why) : "", el("div", { class: "hint" }, caps)), el("td", {}, n.os), el("td", {}, mons), el("td", {}, ctl), el("td", {}, speed), el("td", {}, en), el("td", {}, rm)));
   }
   if (!state.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 8, class: "hint" }, "No machines yet. Run flow-agent join <token> on a computer.")));
+}
+// Why a machine is online/away: the addresses its agent reported and the
+// allowlist in effect.
+function statusWhy(n) {
+  const nets = n.effective_allowed_networks || [];
+  const addrs = (n.local_addrs || []).join(", ") || "no addresses";
+  const key = n.effective_crossing_key ? "crossing key: " + n.effective_crossing_key : "";
+  if (n.status === "away") return `not on ${nets.join(", ")} · has ${addrs}` + (key ? " · " + key : "");
+  if (n.status === "online" && nets.length) return `on an allowed network · has ${addrs}` + (key ? " · " + key : "");
+  return key;
 }
 async function patch(id, body) {
   try { await api("PATCH", "/nodes/" + id, body); toast("Saved"); refresh(); } catch (e) { toast(e.message, true); refresh(); }
@@ -197,7 +219,7 @@ function renderLayout() {
   for (const n of nodes) {
     const p = pos[n.id];
     const g = document.createElementNS(SVGNS, "g");
-    g.setAttribute("class", "node" + (n.online ? "" : " offline") + (focused.has(n.id) ? " focus" : ""));
+    g.setAttribute("class", "node" + ({ offline: " offline", away: " away" }[n.status] || "") + (focused.has(n.id) ? " focus" : ""));
     g.setAttribute("transform", `translate(${view.ox + p.x * view.s},${view.oy + p.y * view.s})`);
     const mons = n.monitors.length ? n.monitors : [{ rect: { x: 0, y: 0, w: 1920, h: 1080 }, name: "?" }];
     for (const m of mons) {
@@ -210,7 +232,7 @@ function renderLayout() {
     const b = bbox(n, { x: 0, y: 0 });
     const t = document.createElementNS(SVGNS, "text");
     t.setAttribute("x", (b.x + 8 / view.s) * view.s); t.setAttribute("y", (b.y * view.s) + 16);
-    t.textContent = n.name + (n.online ? "" : " (offline)");
+    t.textContent = n.name + (n.status === "online" ? "" : ` (${n.status})`);
     g.append(t);
     g.addEventListener("pointerdown", (e) => { drag = { id: n.id, sx: e.clientX, sy: e.clientY, px: p.x, py: p.y }; svg.setPointerCapture(e.pointerId); });
     svg.append(g);
@@ -241,9 +263,90 @@ $("savelayout").addEventListener("click", async () => {
 });
 $("resetlayout").addEventListener("click", () => { dirty = false; $("savelayout").disabled = true; $("resetlayout").disabled = true; refresh(); });
 
+// ---- key capture ("press the combo") ----
+const CODE_NAMES = {
+  ControlLeft: "LeftCtrl", ControlRight: "RightCtrl", ShiftLeft: "LeftShift", ShiftRight: "RightShift",
+  AltLeft: "LeftAlt", AltRight: "RightAlt", MetaLeft: "LeftMeta", MetaRight: "RightMeta", OSLeft: "LeftMeta", OSRight: "RightMeta",
+  ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right", BracketLeft: "LeftBracket", BracketRight: "RightBracket",
+  Quote: "Apostrophe", Backquote: "Grave", IntlBackslash: "NonUsBackslash", ContextMenu: "Menu",
+  NumpadDivide: "KpDivide", NumpadMultiply: "KpMultiply", NumpadSubtract: "KpMinus", NumpadAdd: "KpPlus",
+  NumpadEnter: "KpEnter", NumpadDecimal: "KpDecimal", NumpadEqual: "KpEqual", NumpadComma: "KpComma",
+};
+const SAME_NAME = ["CapsLock", "ScrollLock", "NumLock", "Pause", "Escape", "Tab", "Space", "Enter", "Backspace", "Insert", "Delete",
+  "Home", "End", "PageUp", "PageDown", "PrintScreen", "Minus", "Equal", "Backslash", "Semicolon", "Comma", "Period", "Slash"];
+const GENERIC = { LeftCtrl: "Ctrl", RightCtrl: "Ctrl", LeftShift: "Shift", RightShift: "Shift", LeftAlt: "Alt", RightAlt: "Alt", LeftMeta: "Win", RightMeta: "Win" };
+const MOD_ORDER = ["Ctrl", "LeftCtrl", "RightCtrl", "Alt", "LeftAlt", "RightAlt", "Shift", "LeftShift", "RightShift", "Win", "LeftMeta", "RightMeta"];
+function codeName(code) {
+  if (CODE_NAMES[code]) return CODE_NAMES[code];
+  let m;
+  if ((m = /^Key([A-Z])$/.exec(code))) return m[1];
+  if ((m = /^Digit(\d)$/.exec(code))) return m[1];
+  if ((m = /^Numpad(\d)$/.exec(code))) return "Kp" + m[1];
+  if (/^F\d{1,2}$/.test(code)) return code;
+  return SAME_NAME.includes(code) ? code : null;
+}
+function comboText(names, eitherSide) {
+  const out = [];
+  for (const n of names) { const v = eitherSide && GENERIC[n] ? GENERIC[n] : n; if (!out.includes(v)) out.push(v); }
+  const rank = (n) => { const i = MOD_ORDER.indexOf(n); return i < 0 ? 100 : i; };
+  return out.sort((a, b) => rank(a) - rank(b)).join("+");
+}
+// Text input + "Record" (press and release the combo) + "None".
+function keyField(value) {
+  const inp = el("input", { size: 20, placeholder: "none — cross freely" }); inp.value = value || "";
+  const either = el("input", { type: "checkbox" }); either.checked = true;
+  const rec = el("button", { class: "btn", type: "button", title: "Press and release the key or combo" }, "Record");
+  const none = el("button", { class: "btn", type: "button" }, "None");
+  let recording = false, down = new Set(), seen = [];
+  const stop = () => { recording = false; rec.textContent = "Record"; inp.readOnly = false; inp.placeholder = "none — cross freely"; };
+  rec.addEventListener("click", () => {
+    recording = true; down.clear(); seen = []; inp.value = ""; inp.readOnly = true;
+    inp.placeholder = "press the combo…"; rec.textContent = "Recording…"; inp.focus();
+  });
+  inp.addEventListener("keydown", (e) => {
+    if (!recording) return;
+    e.preventDefault();
+    const n = codeName(e.code);
+    if (!n) { toast(`Cannot record ${e.code || e.key}; type its name instead`, true); return; }
+    down.add(e.code); if (!seen.includes(n)) seen.push(n);
+    inp.value = comboText(seen, either.checked);
+  });
+  inp.addEventListener("keyup", (e) => {
+    if (!recording) return;
+    e.preventDefault(); down.delete(e.code);
+    if (down.size === 0 && seen.length) stop();
+  });
+  inp.addEventListener("blur", () => { if (recording) stop(); });
+  either.addEventListener("change", () => { if (seen.length) inp.value = comboText(seen, either.checked); });
+  none.addEventListener("click", () => { stop(); seen = []; inp.value = ""; });
+  return { el: el("span", { class: "row" }, inp, rec, none, el("label", { class: "hint", title: "Record Ctrl instead of LeftCtrl" }, either, " either side")), input: inp };
+}
+
+// ---- allowed networks ----
+function parseNets(text) { return text.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean); }
+function validCidr(s) {
+  const [ip, pre, extra] = s.split("/");
+  if (extra !== undefined || !ip) return false;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  const max = v4 ? 32 : 128;
+  if (v4 ? v4.slice(1).some(o => +o > 255) : !(/^[0-9a-fA-F:.]+$/.test(ip) && ip.includes(":"))) return false;
+  return pre === undefined || (/^\d{1,3}$/.test(pre) && +pre <= max);
+}
+// Marks the field and returns the list, or null when an entry is invalid.
+function netsFrom(area) {
+  const list = parseNets(area.value), bad = list.filter(n => !validCidr(n));
+  area.classList.toggle("invalid", bad.length > 0);
+  if (bad.length) { toast("Not a valid network (CIDR): " + bad.join(", "), true); return null; }
+  return list;
+}
+
 // ---- settings ----
+let crossField = null;
 async function loadSettings() {
   const s = await api("GET", "/settings");
+  $("s-nets").value = (s.allowed_networks || []).join("\n"); $("s-nets").classList.remove("invalid");
+  crossField = keyField(s.crossing_key); $("s-cross").replaceChildren(crossField.el);
+  renderOverrides(s);
   $("s-hotkey").value = s.emergency_hotkey;
   $("s-clip").checked = s.clipboard.enabled; $("s-cliptext").checked = s.clipboard.text; $("s-clipimg").checked = s.clipboard.images;
   $("s-cliptextmax").value = Math.round(s.clipboard.max_text_bytes / 1024); $("s-clipimgmax").value = Math.round(s.clipboard.max_image_bytes / 1024);
@@ -257,9 +360,45 @@ $("savesettings").addEventListener("click", async () => {
     clipboard: { enabled: $("s-clip").checked, text: $("s-cliptext").checked, images: $("s-clipimg").checked, max_text_bytes: n("s-cliptextmax") * 1024, max_image_bytes: n("s-clipimgmax") * 1024 },
     edge: { switch_delay_ms: n("s-delay"), double_bump: $("s-dbl").checked, double_bump_window_ms: n("s-dblwin"), dead_corner_px: n("s-corner") },
     path_policy: $("s-policy").value, probe_interval_ms: n("s-probe"), log_level: $("s-log").value.trim(),
+    allowed_networks: netsFrom($("s-nets")), crossing_key: crossField ? crossField.input.value.trim() : "",
   };
-  try { await api("PUT", "/settings", s); toast("Settings saved and pushed to agents"); } catch (e) { toast(e.message, true); }
+  if (s.allowed_networks === null) return;
+  try { await api("PUT", "/settings", s); toast("Settings saved and pushed to agents"); await loadSettings(); } catch (e) { toast(e.message, true); }
 });
+
+// Per-machine overrides: inherit the global value or use an own one.
+async function renderOverrides(global) {
+  const st = await api("GET", "/state");
+  const tb = $("overrides"); tb.replaceChildren();
+  const gNets = (global.allowed_networks || []).join(", ") || "everywhere";
+  const gKey = global.crossing_key || "none";
+  for (const n of st.nodes) {
+    const netMode = el("select", {}, el("option", { value: "inherit" }, `inherit (${gNets})`), el("option", { value: "own" }, "own list"));
+    netMode.value = n.allowed_networks == null ? "inherit" : "own";
+    const nets = el("textarea", { rows: 2, cols: 24, placeholder: "empty = everywhere" });
+    nets.value = (n.allowed_networks || []).join("\n");
+    const keyMode = el("select", {}, el("option", { value: "inherit" }, `inherit (${gKey})`), el("option", { value: "own" }, "own key"));
+    keyMode.value = n.crossing_key == null ? "inherit" : "own";
+    const key = keyField(n.crossing_key || "");
+    // style.display, not `hidden`: the key field is a flex row and CSS display wins over the attribute.
+    const sync = () => { nets.style.display = netMode.value === "own" ? "" : "none"; key.el.style.display = keyMode.value === "own" ? "" : "none"; };
+    netMode.addEventListener("change", sync); keyMode.addEventListener("change", sync); sync();
+    const save = el("button", { class: "btn primary" }, "Save");
+    save.addEventListener("click", async () => {
+      const body = {};
+      if (netMode.value === "own") { const l = netsFrom(nets); if (l === null) return; body.allowed_networks = l; } else body.allowed_networks = null;
+      body.crossing_key = keyMode.value === "own" ? key.input.value.trim() : null;
+      try { await api("PATCH", "/nodes/" + n.id, body); toast("Saved for " + n.name); renderOverrides(global); } catch (e) { toast(e.message, true); }
+    });
+    const status = el("span", { class: "badge " + ({ online: "ok", away: "warn" }[n.status] || "mute") }, n.status);
+    tb.append(el("tr", {},
+      el("td", {}, n.name, " ", status, el("div", { class: "hint" }, statusWhy(n))),
+      el("td", {}, el("div", { class: "row" }, netMode), nets),
+      el("td", {}, el("div", { class: "row" }, keyMode), key.el),
+      el("td", {}, save)));
+  }
+  if (!st.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 4, class: "hint" }, "No machines yet.")));
+}
 $("reloadsettings").addEventListener("click", () => loadSettings().catch(e => toast(e.message, true)));
 
 // ---- misc ----

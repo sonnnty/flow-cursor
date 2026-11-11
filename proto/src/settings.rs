@@ -70,6 +70,14 @@ pub struct HubSettings {
     pub probe_interval_ms: u32,
     /// `tracing` filter for agents (e.g. "info", "debug", "flow_net=trace").
     pub log_level: String,
+    /// CIDR blocks (IPv4/IPv6) this machine must be on to share input and
+    /// clipboard; empty = no restriction. Decided by each agent from its
+    /// own interface addresses (see [`crate::net`]).
+    pub allowed_networks: Vec<String>,
+    /// Key combo that must be held for the pointer to cross an edge out of
+    /// this machine's screen (`flow-keymap` names, e.g. `"Ctrl"`,
+    /// `"LeftCtrl+LeftAlt"`, `"ScrollLock"`); empty = cross freely.
+    pub crossing_key: String,
 }
 
 pub const DEFAULT_EMERGENCY_HOTKEY: &str = "Ctrl+Alt+Shift+Escape";
@@ -83,11 +91,14 @@ impl Default for HubSettings {
             path_policy: PathPolicy::PreferP2p,
             probe_interval_ms: 2000,
             log_level: "info".to_string(),
+            allowed_networks: Vec::new(),
+            crossing_key: String::new(),
         }
     }
 }
 
-/// What an agent receives. Currently identical to the hub's global settings.
+/// What an agent receives: the hub's global settings with this node's own
+/// overrides (`allowed_networks`, `crossing_key`) already applied.
 pub type AgentSettings = HubSettings;
 
 #[cfg(test)]
@@ -102,6 +113,9 @@ mod tests {
         assert!(s.edge.double_bump);
         assert_eq!(s.edge.double_bump_window_ms, 500);
         assert_eq!(s.emergency_hotkey, DEFAULT_EMERGENCY_HOTKEY);
+        // Settings stored by an older hub keep today's behaviour.
+        assert!(s.allowed_networks.is_empty());
+        assert!(s.crossing_key.is_empty());
         let bin = crate::encode(&s);
         assert_eq!(crate::decode::<HubSettings>(&bin).unwrap(), s);
     }

@@ -29,6 +29,7 @@ rand.workspace = true
 hostname.workspace = true
 directories.workspace = true
 png.workspace = true
+if-addrs.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.14", default-features = false, features = ["tokio", "input_capture", "remote_desktop", "screencast", "clipboard"] }

@@ -121,6 +121,12 @@ async fn main() -> Result<()> {
             println!("pending join:     {}", st.pending_join_token.is_some());
             println!("revoked:          {}", st.revoked);
             println!("portal tokens:    {}", dir.join(flow_agent::config::PORTAL_TOKENS_FILE).exists());
+            // What the allowed-networks check compares against the CIDRs.
+            let addrs: Vec<String> = {
+                use flow_agent::netcheck::AddrSource;
+                flow_agent::netcheck::SystemAddrs.addrs().iter().map(|a| a.to_string()).collect()
+            };
+            println!("interface addrs:  {}", if addrs.is_empty() { "(none)".into() } else { addrs.join(", ") });
             Ok(())
         }
         Cmd::ForgetPortal => {

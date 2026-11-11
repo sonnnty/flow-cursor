@@ -564,6 +564,7 @@ dependencies = [
  "flow-proto",
  "futures-util",
  "hostname",
+ "if-addrs",
  "png",
  "rand 0.8.8",
  "reis",

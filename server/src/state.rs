@@ -5,12 +5,12 @@
 use anyhow::{Context, Result};
 use flow_layout::LayoutExt;
 use flow_proto::{
-    Capabilities, Fingerprint, FocusEntry, FromHub, HubSettings, Layout, Monitor, NodeId, NodeLayout, OsKind, PathKind,
-    PeerInfo, RelayDown,
+    AgentSettings, Capabilities, Fingerprint, FocusEntry, FromHub, HubSettings, Layout, Monitor, NodeId, NodeLayout,
+    OsKind, PathKind, PeerInfo, RelayDown,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -39,11 +39,29 @@ pub struct NodeRecord {
     pub caps: Capabilities,
     pub created: u64,
     pub last_seen: u64,
+    /// Own allowed networks (None = inherit the global setting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_networks: Option<Vec<String>>,
+    /// Own crossing key (None = inherit; Some("") = none for this node).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crossing_key: Option<String>,
 }
 
 impl NodeRecord {
     pub fn fp(&self) -> Option<Fingerprint> {
         Fingerprint::from_hex(&self.fingerprint)
+    }
+
+    /// The global settings with this node's overrides applied.
+    pub fn effective_settings(&self, global: &HubSettings) -> AgentSettings {
+        let mut s = global.clone();
+        if let Some(n) = &self.allowed_networks {
+            s.allowed_networks = n.clone();
+        }
+        if let Some(k) = &self.crossing_key {
+            s.crossing_key = k.clone();
+        }
+        s
     }
 }
 
@@ -148,6 +166,10 @@ pub struct Online {
     pub p2p_addrs: Vec<SocketAddr>,
     pub agent_version: String,
     pub since: u64,
+    /// Reported by the agent: not on one of its allowed networks.
+    pub away: bool,
+    /// The agent's own interface addresses (from its last report).
+    pub local_addrs: Vec<IpAddr>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -189,6 +211,19 @@ impl HubState {
         self.focus.iter().map(|(s, t)| FocusEntry { source: *s, target: *t }).collect()
     }
 
+    /// Settings for `node` (global + its overrides).
+    pub fn settings_for(&self, node: NodeId) -> AgentSettings {
+        match self.p.nodes.get(&node.0) {
+            Some(n) => n.effective_settings(&self.p.settings),
+            None => self.p.settings.clone(),
+        }
+    }
+
+    /// Connected but not on an allowed network.
+    pub fn is_away(&self, node: NodeId) -> bool {
+        self.online.get(&node).is_some_and(|o| o.away)
+    }
+
     /// Peer list as seen by `me`.
     pub fn peers_for(&self, me: NodeId) -> Vec<PeerInfo> {
         self.p
@@ -206,6 +241,8 @@ impl HubState {
                     enabled: n.enabled,
                     mouse_speed: n.mouse_speed,
                     caps: n.caps,
+                    away: online.is_some_and(|o| o.away),
+                    crossing_key: n.effective_settings(&self.p.settings).crossing_key,
                 })
             })
             .collect()
@@ -238,8 +275,8 @@ impl HubState {
     }
 
     pub fn broadcast_settings(&self) {
-        for o in self.online.values() {
-            let _ = o.ctl.send(FromHub::Settings(self.p.settings.clone()));
+        for (id, o) in &self.online {
+            let _ = o.ctl.send(FromHub::Settings(self.settings_for(*id)));
         }
     }
 
@@ -281,6 +318,8 @@ mod tests {
                 caps: Capabilities::default(),
                 created: 0,
                 last_seen: 0,
+                allowed_networks: None,
+                crossing_key: Some("ScrollLock".into()),
             },
         );
         p.save(&dir).unwrap();
@@ -291,6 +330,15 @@ mod tests {
         assert!(q.node_by_fp(&Fingerprint([1; 32])).is_some());
         assert_eq!(q.layout().nodes.len(), 1);
         assert_eq!(q.place_new(&[]), (10, 0));
+        // Overrides survive the round trip and beat the global settings.
+        let global = HubSettings {
+            crossing_key: "Ctrl".into(),
+            allowed_networks: vec!["10.0.0.0/8".into()],
+            ..Default::default()
+        };
+        let eff = q.nodes[&1].effective_settings(&global);
+        assert_eq!(eff.crossing_key, "ScrollLock");
+        assert_eq!(eff.allowed_networks, global.allowed_networks, "inherited");
         std::fs::remove_dir_all(dir).ok();
     }
 }

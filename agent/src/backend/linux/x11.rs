@@ -2,6 +2,10 @@
 //!
 //! * Edge detection: XInput2 raw motion events on the root window, then
 //!   `QueryPointer`; pushing outward on an edge segment → `EdgeHit`.
+//! * Crossing key: XInput2 raw key events on the root window (delivered
+//!   whatever window has the focus, without grabbing anything) keep track
+//!   of the crossing combo's keys; changes are reported as `LocalKey` so
+//!   the core can decide at the edge.
 //! * Capture: active pointer + keyboard grabs on the root window, cursor
 //!   hidden with XFixes and parked in the middle of the primary monitor;
 //!   motion comes from raw (accelerated) XI2 deltas, keys/buttons from the
@@ -12,7 +16,7 @@
 //! Needs only access to `$DISPLAY` (no `input` group, no uinput).
 
 use super::x11clip::{self, X11Clipboard};
-use crate::backend::{Backend, BackendOptions, EventRx, EventTx, LocalEvent};
+use crate::backend::{crossing_key_event, Backend, BackendOptions, EventRx, EventTx, LocalEvent};
 use anyhow::{Context, Result};
 use flow_layout::{Edge, Side};
 use flow_net::link::Action;
@@ -41,6 +45,7 @@ struct Shared {
     edges: Vec<Edge>,
     monitors: Vec<Monitor>,
     capturing: bool,
+    crossing: Option<flow_keymap::Combo>,
 }
 
 pub struct X11Backend {
@@ -59,7 +64,14 @@ pub async fn create(_opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx
     conn.xfixes_query_version(5, 0)?.reply().context("XFixes extension required")?;
     conn.xinput_xi_select_events(
         root,
-        &[xinput::EventMask { deviceid: 1, mask: vec![xinput::XIEventMask::RAW_MOTION] }],
+        &[xinput::EventMask {
+            deviceid: 1,
+            mask: vec![
+                xinput::XIEventMask::RAW_MOTION
+                    | xinput::XIEventMask::RAW_KEY_PRESS
+                    | xinput::XIEventMask::RAW_KEY_RELEASE,
+            ],
+        }],
     )?;
     conn.randr_select_input(root, x11rb::protocol::randr::NotifyMask::SCREEN_CHANGE)?;
     conn.flush()?;
@@ -174,10 +186,24 @@ fn x_button(detail: u32) -> Option<Result<Button, (i32, i32)>> {
 }
 
 fn event_loop(conn: &RustConnection, root: Window, shared: &Mutex<Shared>, tx: &EventTx) -> Result<()> {
+    // Crossing-combo keys currently down (raw events, any focus).
+    let mut combo_held = std::collections::HashSet::new();
     loop {
         let ev = conn.wait_for_event()?;
         let capturing = shared.lock().expect("poisoned").capturing;
         match ev {
+            Event::XinputRawKeyPress(e) | Event::XinputRawKeyRelease(e) => {
+                let down = e.event_type == xinput::RAW_KEY_PRESS_EVENT;
+                let evdev = (e.detail as u16).saturating_sub(8);
+                if let Some(usage) = flow_keymap::evdev_to_hid(evdev) {
+                    let combo = shared.lock().expect("poisoned").crossing.clone();
+                    let ev = crossing_key_event(combo.as_ref(), &mut combo_held, usage, down);
+                    // While capturing the grab reports every key already.
+                    if let (Some(ev), false) = (ev, capturing) {
+                        let _ = tx.send(ev);
+                    }
+                }
+            }
             Event::XinputRawMotion(e) => {
                 let (dx, dy) = raw_delta(&e);
                 if capturing {
@@ -364,6 +390,12 @@ impl Backend for X11Backend {
         if let Some(c) = &self.clip {
             c.set(content);
         }
+    }
+    fn observes_keys(&self) -> bool {
+        true
+    }
+    fn set_crossing_key(&self, combo: Option<flow_keymap::Combo>) {
+        self.shared.lock().expect("poisoned").crossing = combo;
     }
 }
 

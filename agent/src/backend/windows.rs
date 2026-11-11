@@ -9,6 +9,11 @@
 //! * Edge detection: the mouse hook sees the *unclipped* target position,
 //!   so pushing past a screen edge that leads to another machine is
 //!   detected even though the cursor stays on the edge pixel.
+//! * Crossing key: the keyboard hook tracks the crossing combo's keys
+//!   (physical, not injected) and reports them as `LocalKey`; with a
+//!   crossing key configured, the mouse hook / raw input path does not even
+//!   report an edge hit unless the combo is held, so a game that clips the
+//!   cursor (`ClipCursor`) and reads raw input is left completely alone.
 //! * Injection: `SendInput` with **scancodes** (layout independent),
 //!   absolute pointer moves over the virtual desktop.
 //! * Clipboard: separate thread with `AddClipboardFormatListener`; text
@@ -20,7 +25,7 @@
 //! cannot control elevated windows unless the agent itself runs elevated.
 
 use super::dib;
-use crate::backend::{Backend, BackendOptions, EventRx, EventTx, LocalEvent};
+use crate::backend::{crossing_key_event, Backend, BackendOptions, EventRx, EventTx, LocalEvent};
 use anyhow::{anyhow, Result};
 use flow_layout::{Edge, Side};
 use flow_net::link::Action;
@@ -62,6 +67,8 @@ struct Shared {
     clip_hwnd: Mutex<usize>,
     /// Clipboard sequence number after our own last write.
     own_clip_seq: AtomicU32,
+    /// Combo that must be held for an edge hit to count (None = any hit).
+    crossing: Mutex<Option<flow_keymap::Combo>>,
 }
 
 pub struct WindowsBackend {
@@ -77,6 +84,17 @@ struct HookCtx {
     /// Keys held when capture started: their releases pass through.
     held_at_capture: HashSet<u16>,
     was_capturing: bool,
+    /// Crossing-combo keys physically held (usages), whether capturing or not.
+    combo_held: HashSet<u32>,
+}
+
+impl HookCtx {
+    /// The crossing key is configured and not held: edge hits are not
+    /// reported at all.
+    fn edge_blocked(&self) -> bool {
+        let combo = self.shared.crossing.lock().ok().and_then(|c| c.clone());
+        !crate::cross::key_held(combo.as_ref(), &self.combo_held)
+    }
 }
 
 thread_local! {
@@ -99,6 +117,7 @@ pub async fn create(_opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx
         clip_cmds: Mutex::new(VecDeque::new()),
         clip_hwnd: Mutex::new(0),
         own_clip_seq: AtomicU32::new(0),
+        crossing: Mutex::new(None),
     });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     {
@@ -188,6 +207,7 @@ fn input_thread(tx: EventTx, shared: Arc<Shared>, ready: std::sync::mpsc::Sender
                 held: HashSet::new(),
                 held_at_capture: HashSet::new(),
                 was_capturing: false,
+                combo_held: HashSet::new(),
             })
         });
         let kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), hinst, 0);
@@ -228,27 +248,38 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         if !injected {
             let up = k.flags & LLKHF_UP != 0;
             let sc = flow_keymap::win_scancode(k.scanCode, k.flags & LLKHF_EXTENDED != 0);
+            let usage = match (k.vkCode as u16, sc) {
+                // Pause arrives as scancode 0x45 without the extended flag.
+                (VK_PAUSE, _) => Some(flow_keymap::keys::PAUSE),
+                (VK_NUMLOCK, _) => Some(flow_keymap::keys::NUM_LOCK),
+                _ => flow_keymap::scancode_to_hid(sc),
+            };
             let swallow = with_ctx(|ctx| {
                 let capturing = sync_capture(ctx);
+                // Crossing-combo state follows every physical key; the
+                // change is reported only when the key reaches the local OS
+                // (captured keys arrive as `Key` instead).
+                let combo = ctx.shared.crossing.lock().ok().and_then(|c| c.clone());
+                let local_key = usage.and_then(|u| crossing_key_event(combo.as_ref(), &mut ctx.combo_held, u, !up));
                 if !capturing {
                     if up {
                         ctx.held.remove(&sc);
                     } else {
                         ctx.held.insert(sc);
                     }
+                    if let Some(ev) = local_key {
+                        let _ = ctx.tx.send(ev);
+                    }
                     return false;
                 }
                 if up && ctx.held_at_capture.remove(&sc) {
                     // Pressed before we took over: let the local OS see the release.
                     ctx.held.remove(&sc);
+                    if let Some(ev) = local_key {
+                        let _ = ctx.tx.send(ev);
+                    }
                     return false;
                 }
-                let usage = match (k.vkCode as u16, sc) {
-                    // Pause arrives as scancode 0x45 without the extended flag.
-                    (VK_PAUSE, _) => Some(flow_keymap::keys::PAUSE),
-                    (VK_NUMLOCK, _) => Some(flow_keymap::keys::NUM_LOCK),
-                    _ => flow_keymap::scancode_to_hid(sc),
-                };
                 if let Some(usage) = usage {
                     let _ = ctx.tx.send(LocalEvent::Key { usage, down: !up });
                 }
@@ -285,7 +316,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let swallow = with_ctx(|ctx| {
                 let capturing = sync_capture(ctx);
                 if !capturing {
-                    if msg == WM_MOUSEMOVE {
+                    if msg == WM_MOUSEMOVE && !ctx.edge_blocked() {
                         let edges = ctx.shared.edges.lock().map(|e| e.clone()).unwrap_or_default();
                         if let Some((side, x, y)) = edge_hit(&edges, m.pt.x, m.pt.y) {
                             let _ = ctx.tx.send(LocalEvent::EdgeHit { side, x, y });
@@ -346,7 +377,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     with_ctx(|ctx| {
                         if sync_capture(ctx) {
                             let _ = ctx.tx.send(LocalEvent::Motion { dx: dx as f64, dy: dy as f64 });
-                        } else {
+                        } else if !ctx.edge_blocked() {
                             // The pointer may sit on the edge pixel when the
                             // driver clips; check the push direction too.
                             let mut p = POINT { x: 0, y: 0 };
@@ -486,6 +517,14 @@ impl Backend for WindowsBackend {
                 }
             }
             Action::Left => {}
+        }
+    }
+    fn observes_keys(&self) -> bool {
+        true
+    }
+    fn set_crossing_key(&self, combo: Option<flow_keymap::Combo>) {
+        if let Ok(mut c) = self.shared.crossing.lock() {
+            *c = combo;
         }
     }
     fn set_clipboard(&self, content: &ClipContent) {

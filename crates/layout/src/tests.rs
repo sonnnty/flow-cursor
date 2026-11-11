@@ -325,3 +325,15 @@ fn degenerate_and_empty_monitor_geometries() {
     let mv2 = l.move_cursor(B, -10.0, -10.0, 5.0, 5.0);
     assert!(matches!(mv2, Move::Inside { .. }));
 }
+
+#[test]
+fn clamp_to_screens_keeps_the_cursor_at_the_edge() {
+    let n = node(1, 0, 0, vec![mon(0, 0, 1920, 1080), mon(1920, 0, 1280, 1024)]);
+    assert_eq!(clamp_to_screens(&n, 100.0, 100.0), (100.0, 100.0));
+    assert_eq!(clamp_to_screens(&n, 3300.0, 500.0), (3199.0, 500.0));
+    assert_eq!(clamp_to_screens(&n, -5.0, 1200.0), (0.0, 1079.0));
+    // Below the shorter right monitor: nearest point is on that monitor.
+    assert_eq!(clamp_to_screens(&n, 2500.0, 1050.0), (2500.0, 1023.0));
+    let empty = node(2, 0, 0, vec![]);
+    assert_eq!(clamp_to_screens(&empty, 7.0, 8.0), (7.0, 8.0));
+}
