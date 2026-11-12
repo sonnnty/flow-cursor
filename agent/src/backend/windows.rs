@@ -176,6 +176,33 @@ unsafe extern "system" fn monitor_cb(h: HMONITOR, _dc: HDC, _r: *mut RECT, data:
     1
 }
 
+/// Timer of the input window that reads the monitors again after a
+/// display change.
+const DISPLAY_RECHECK_TIMER: usize = 0x464c; // "FL"
+const DISPLAY_RECHECK_MS: u32 = 2000;
+
+/// Reads the monitors and reports them when they changed (runs on the
+/// input thread).
+fn refresh_monitors() {
+    let m = enum_monitors();
+    if m.is_empty() {
+        debug!("no monitors enumerated; keeping the last ones");
+        return;
+    }
+    with_ctx(|ctx| {
+        let changed = match ctx.shared.monitors.lock() {
+            Ok(mut mm) if *mm != m => {
+                *mm = m.clone();
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            let _ = ctx.tx.send(LocalEvent::MonitorsChanged(m));
+        }
+    });
+}
+
 fn enum_monitors() -> Vec<Monitor> {
     let mut v: Vec<Monitor> = Vec::new();
     unsafe {
@@ -428,13 +455,15 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             0
         }
         WM_DISPLAYCHANGE => {
-            let m = enum_monitors();
-            with_ctx(|ctx| {
-                if let Ok(mut mm) = ctx.shared.monitors.lock() {
-                    *mm = m.clone();
-                }
-                let _ = ctx.tx.send(LocalEvent::MonitorsChanged(m));
-            });
+            refresh_monitors();
+            // Plugging a monitor in sends this while Windows is still
+            // arranging the desktop: look once more when it has settled.
+            SetTimer(hwnd, DISPLAY_RECHECK_TIMER, DISPLAY_RECHECK_MS, None);
+            0
+        }
+        WM_TIMER if wparam == DISPLAY_RECHECK_TIMER => {
+            KillTimer(hwnd, DISPLAY_RECHECK_TIMER);
+            refresh_monitors();
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
