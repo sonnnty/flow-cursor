@@ -47,17 +47,20 @@
 //!
 //! **Clipboard** – the portal Clipboard interface on the RemoteDesktop
 //! session (xdg-desktop-portal ≥ 1.17, GNOME ≥ 45), so only while that
-//! session is open. If a session opens without it (or the RemoteDesktop
-//! portal is missing), the X11 CLIPBOARD selection through XWayland is used
-//! from then on (mutter syncs it with the Wayland clipboard), which needs
-//! XWayland to be running.
+//! session is open (see [`super::portalclip`]). Content from another
+//! machine that arrives while no session is open is put on the clipboard
+//! when the next one opens. If a session opens without it (or the
+//! RemoteDesktop portal is missing), the X11 CLIPBOARD selection through
+//! XWayland is used from then on (mutter syncs it with the Wayland
+//! clipboard), which needs XWayland to be running.
 
+use super::portalclip::{self, ClipWork, PortalClip};
 use super::x11clip::{self, X11Clipboard};
-use super::{button_to_evdev, evdev_to_button, PNG_MIME, TEXT_MIMES};
+use super::{button_to_evdev, evdev_to_button};
 use crate::backend::{Backend, BackendOptions, EventRx, EventTx, LocalEvent};
 use crate::config::{load_portal_token, save_portal_token};
 use anyhow::{anyhow, Context, Result};
-use ashpd::desktop::clipboard::{Clipboard, SetSelectionOptions};
+use ashpd::desktop::clipboard::Clipboard;
 use ashpd::desktop::input_capture::{
     Activated, Barrier, BarrierID, BarrierPosition, Capabilities as IcCaps, CreateSessionOptions as IcCreate,
     Deactivated, Disabled, InputCapture, ReleaseOptions, Zones, ZonesChanged,
@@ -83,6 +86,9 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 const RD_TOKEN: &str = "remote_desktop";
+/// How long content from another machine is kept for a session that is
+/// not open yet (opening takes a moment, a dialog maybe longer).
+const REMOTE_CLIP_KEEP: Duration = Duration::from_secs(60);
 
 enum InjCmd {
     Inject(Action),
@@ -104,6 +110,10 @@ struct RdShared {
     /// X11 clipboard through XWayland, when the portal clipboard is missing.
     x11clip: OnceLock<X11Clipboard>,
     x11_tried: AtomicBool,
+    /// Content from another machine that arrived while no session with the
+    /// portal clipboard was open, and when; set when the next one opens
+    /// within [`REMOTE_CLIP_KEEP`].
+    remote_clip: Mutex<Option<(Instant, ClipContent)>>,
     events: EventTx,
 }
 
@@ -115,6 +125,7 @@ impl RdShared {
             clip: AtomicBool::new(false),
             x11clip: OnceLock::new(),
             x11_tried: AtomicBool::new(false),
+            remote_clip: Mutex::new(None),
             events,
         }
     }
@@ -130,6 +141,28 @@ impl RdShared {
 
     fn portal_clip(&self) -> bool {
         self.injecting() && self.clip.load(Ordering::SeqCst)
+    }
+
+    /// The open session lost its portal clipboard.
+    fn lose_clip(&self) {
+        if self.clip.swap(false, Ordering::SeqCst) {
+            let _ = self.events.send(LocalEvent::CapsChanged);
+        }
+    }
+
+    fn keep_remote_clip(&self, c: Option<ClipContent>) {
+        *self.remote_clip.lock().expect("poisoned") = c.map(|c| (Instant::now(), c));
+    }
+
+    /// Remote content kept for the session that just opened, unless it is
+    /// too old to still be what the user expects to paste.
+    fn take_remote_clip(&self) -> Option<ClipContent> {
+        let (at, c) = self.remote_clip.lock().expect("poisoned").take()?;
+        if at.elapsed() > REMOTE_CLIP_KEEP {
+            debug!("clipboard from another machine dropped: too old by the time the session opened");
+            return None;
+        }
+        Some(c)
     }
 
     /// Records whether a session is open; the core re-reads the caps.
@@ -302,11 +335,17 @@ impl Backend for WaylandBackend {
     }
     fn set_clipboard(&self, content: &ClipContent) {
         if self.rd.portal_clip() {
+            self.rd.keep_remote_clip(None);
             if let Some(i) = &self.inj {
                 let _ = i.send(InjCmd::SetClipboard(content.clone()));
             }
         } else if let Some(c) = self.rd.x11clip.get() {
             c.set(content);
+        } else if self.inj.is_some() {
+            // Not open (yet), e.g. still opening after the hub connection
+            // came back: set it once the session is there.
+            info!("clipboard from another machine kept until the remote control session is open");
+            self.rd.keep_remote_clip(Some(content.clone()));
         }
     }
 }
@@ -518,7 +557,7 @@ const IC_REFUSED: &str = "input capture permission (InputCapture portal) was ref
                           controlled";
 
 type EiParts = (ei::Context, reis::event::Connection, reis::tokio::EiConvertEventStream);
-type InjParts = (RemoteDesktop, Session<RemoteDesktop>, Option<Clipboard>, Option<EiParts>);
+type InjParts = (RemoteDesktop, Session<RemoteDesktop>, Option<PortalClip>, Option<EiParts>);
 
 async fn setup_injector(state_dir: &std::path::Path) -> Result<InjParts> {
     let bus = session_bus().await?;
@@ -558,11 +597,28 @@ async fn setup_injector(state_dir: &std::path::Path) -> Result<InjParts> {
             warn!("could not store the portal restore token: {e:#}");
         }
     }
-    let clipboard = if clipboard.is_some() && resp.is_clipboard_enabled() {
-        info!("clipboard via the portal Clipboard interface");
-        clipboard
-    } else {
-        None
+    let clipboard = match clipboard {
+        Some(c) if resp.is_clipboard_enabled() => match portalclip::session_path(&session) {
+            Ok(path) => match PortalClip::subscribe(c, path).await {
+                Ok(c) => {
+                    info!("clipboard via the portal Clipboard interface");
+                    Some(c)
+                }
+                Err(e) => {
+                    warn!("portal clipboard unavailable: {e:#}");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("portal clipboard unavailable: {e:#}");
+                None
+            }
+        },
+        Some(_) => {
+            info!("the portal did not enable the clipboard for this session");
+            None
+        }
+        None => None,
     };
     let eis = match rd.connect_to_eis(&session, Default::default()).await {
         Ok(fd) => {
@@ -620,7 +676,7 @@ async fn run_ei_sender(
     rd: &RdShared,
     _portal: RemoteDesktop,
     session: Session<RemoteDesktop>,
-    clipboard: Option<Clipboard>,
+    mut clip: Option<PortalClip>,
 ) -> InjEnd {
     let tx = rd.events.clone();
     if !rd.wanted() {
@@ -630,15 +686,14 @@ async fn run_ei_sender(
     let mut devs = EiDevices::default();
     let mut sequence = 1u32;
     let mut last_abs: Option<(f32, f32)> = None;
-    let clip = clipboard;
-    let mut owned: Option<ClipContent> = None;
-    let (mut owner_changes, mut transfers) = match &clip {
-        Some(c) => (
-            c.receive_selection_owner_changed::<RemoteDesktop>().await.ok().map(|s| s.boxed()),
-            c.receive_selection_transfer::<RemoteDesktop>().await.ok().map(|s| s.boxed()),
-        ),
-        None => (None, None),
-    };
+    if let Some(c) = clip.as_mut() {
+        if let Some(content) = rd.take_remote_clip() {
+            info!("setting the clipboard from another machine that arrived before the session was open");
+            if let Err(e) = c.set(content).await {
+                warn!("setting the clipboard failed: {e:#}");
+            }
+        }
+    }
     let end = loop {
         tokio::select! {
             ev = events.next() => match ev {
@@ -695,89 +750,42 @@ async fn run_ei_sender(
                     let _ = ctx.flush();
                 }
                 Some(InjCmd::SetClipboard(c)) => {
-                    if let Some(cs) = &clip {
-                        let mimes: Vec<&str> = match &c {
-                            ClipContent::Text(_) => TEXT_MIMES.to_vec(),
-                            ClipContent::Image { .. } => vec![PNG_MIME],
-                        };
-                        owned = Some(c);
-                        let set = cs.set_selection(&session, SetSelectionOptions::default().set_mime_types(&mimes));
-                        if let Err(e) = bounded("Clipboard.SetSelection", set).await {
+                    if let Some(cs) = clip.as_mut() {
+                        if let Err(e) = cs.set(c).await {
                             warn!("setting the clipboard failed: {e:#}");
                         }
                     }
                 }
             },
-            change = next_or_pending(&mut owner_changes) => {
-                let Some((_s, change)) = change else {
-                    // Not polled again once ended.
-                    owner_changes = None;
-                    continue;
-                };
-                if change.session_is_owner() == Some(true) {
-                    continue;
-                }
-                let Some(cs) = &clip else { continue };
-                let mimes = change.mime_types();
-                let pick = if mimes.iter().any(|m| m == PNG_MIME) {
-                    Some(PNG_MIME.to_string())
-                } else {
-                    TEXT_MIMES.iter().find(|t| mimes.iter().any(|m| m == *t)).map(|s| s.to_string())
-                };
-                if let Some(mime) = pick {
-                    match bounded("Clipboard.SelectionRead", cs.selection_read(&session, &mime)).await {
-                        Ok(fd) => {
-                            let tx = tx.clone();
-                            tokio::task::spawn_blocking(move || {
-                                use std::io::Read;
-                                let mut f = std::fs::File::from(std::os::fd::OwnedFd::from(fd));
-                                let mut buf = Vec::new();
-                                if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                                    let c = if mime == PNG_MIME {
-                                        ClipContent::Image { png: buf }
-                                    } else {
-                                        ClipContent::Text(String::from_utf8_lossy(&buf).into_owned())
-                                    };
-                                    let _ = tx.send(LocalEvent::Clipboard(c));
-                                }
-                            });
+            work = next_clip(&mut clip) => match work {
+                ClipWork::Read(mime) => {
+                    if let Some(cs) = &clip {
+                        if let Err(e) = cs.read(&mime, &tx).await {
+                            warn!("clipboard read failed: {e:#}");
                         }
-                        Err(e) => debug!("clipboard read failed: {e}"),
                     }
                 }
-            }
-            transfer = next_or_pending(&mut transfers) => {
-                let Some((_s, mime, serial)) = transfer else {
-                    transfers = None;
-                    continue;
-                };
-                let Some(cs) = &clip else { continue };
-                let data: Option<Vec<u8>> = match &owned {
-                    Some(ClipContent::Text(t)) if TEXT_MIMES.contains(&mime.as_str()) => Some(t.as_bytes().to_vec()),
-                    Some(ClipContent::Image { png }) if mime == PNG_MIME => Some(png.clone()),
-                    _ => None,
-                };
-                let ok = match (data, bounded("Clipboard.SelectionWrite", cs.selection_write(&session, serial)).await) {
-                    // A reader that never drains the pipe must not park this
-                    // loop: stop waiting (the blocking write is abandoned).
-                    (Some(d), Ok(fd)) => bounded("clipboard write", tokio::task::spawn_blocking(move || {
-                        use std::io::Write;
-                        std::fs::File::from(std::os::fd::OwnedFd::from(fd)).write_all(&d).is_ok()
-                    })).await.unwrap_or(false),
-                    _ => false,
-                };
-                let _ = bounded("Clipboard.SelectionWriteDone", cs.selection_write_done(&session, serial, ok)).await;
-            }
+                ClipWork::Transfer { mime, serial } => {
+                    if let Some(cs) = &clip {
+                        cs.transfer(&mime, serial).await;
+                    }
+                }
+                ClipWork::Ended(what) => {
+                    warn!("the portal clipboard signal {what} ended; no clipboard until the session is reopened");
+                    clip = None;
+                    rd.lose_clip();
+                }
+            },
         }
     };
     let _ = bounded("Session.Close", session.close()).await;
     end
 }
 
-/// Next item of an optional stream; never resolves without a stream.
-async fn next_or_pending<S: futures_util::Stream + Unpin>(s: &mut Option<S>) -> Option<S::Item> {
-    match s {
-        Some(s) => s.next().await,
+/// Next work of the session's clipboard; never resolves without one.
+async fn next_clip(c: &mut Option<PortalClip>) -> ClipWork {
+    match c {
+        Some(c) => c.next().await,
         None => std::future::pending().await,
     }
 }
@@ -1685,6 +1693,20 @@ mod tests {
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_clipboard_waits_for_the_session_but_not_forever() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let rd = RdShared::new(tx);
+        let text = |s: &str| ClipContent::Text(s.into());
+        rd.keep_remote_clip(Some(text("one")));
+        rd.keep_remote_clip(Some(text("two")));
+        assert_eq!(rd.take_remote_clip(), Some(text("two")), "the newest content is set once the session opens");
+        assert_eq!(rd.take_remote_clip(), None, "and only once");
+        rd.keep_remote_clip(Some(text("old")));
+        tokio::time::sleep(REMOTE_CLIP_KEEP + Duration::from_secs(1)).await;
+        assert_eq!(rd.take_remote_clip(), None, "too old to overwrite the clipboard");
     }
 
     #[tokio::test(start_paused = true)]
