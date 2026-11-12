@@ -223,7 +223,7 @@ mod tests {
             SessionReport { inject_problem: false, clipboard_warning: true }
         );
         // X11 / Windows: no inject is always a fault, also away.
-        assert_eq!(rep(Always, None, false, true, None).inject_problem, true);
+        assert!(rep(Always, None, false, true, None).inject_problem);
     }
 
     #[test]
