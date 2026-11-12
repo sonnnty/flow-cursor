@@ -149,7 +149,7 @@
       <label for="s-corner">Dead corners (px)</label><input id="s-corner" type="number" min="0" max="2000">
       <label for="s-policy">Input path</label><select id="s-policy"><option value="prefer_p2p">Prefer direct (P2P), fall back to relay</option><option value="force_relay">Always relay through the hub</option></select>
       <label for="s-probe">P2P probe interval (ms)</label><input id="s-probe" type="number" min="100" max="60000">
-      <label for="s-log">Agent log level</label><div><input id="s-log" size="30"> <span class="hint">tracing filter, e.g. info, debug, flow_net=trace (also applied to the hub)</span></div>
+      <label for="s-log">Agent log level</label><div><input id="s-log" size="30"> <span class="hint">tracing filter, e.g. info, debug, flow_net=trace (also applied to the hub). An agent keeps its own level when <code>RUST_LOG</code> or <code>log_level</code> in agent.toml is set.</span></div>
       <label for="s-update">Agent updates</label><div><select id="s-update"></select>
         <div class="hint">When this hub carries another agent build (built into its image): <b>automatic</b> installs it once the machine is idle (not controlling or controlled, no keys held) and restarts; <b>notify</b> shows "update available" and <i>Update now</i> in the tray; <b>off</b> does nothing on its own. <i>Update now</i> on the Overview tab works with every choice.</div></div>
     </div></div>
