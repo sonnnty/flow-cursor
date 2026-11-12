@@ -31,13 +31,26 @@
 //! **Injection** – `org.freedesktop.portal.RemoteDesktop` with
 //! `ConnectToEIS` (EI sender context: absolute/relative pointer, buttons,
 //! scroll, keyboard with evdev keycodes). The portal restore token is
-//! stored (`portal-tokens.json`) so the permission dialog appears only
-//! once. Without EIS (older portals) the D-Bus `Notify*` methods are used.
+//! stored (`portal-tokens.json`, persist mode "until revoked") so the
+//! permission dialog appears only once. Without EIS (older portals) the
+//! D-Bus `Notify*` methods are used.
+//!
+//! While a RemoteDesktop session exists GNOME shows its "someone is
+//! controlling this computer" indicator, so the session is opened only on
+//! demand: at start the backend only checks that the portal is there, and
+//! the core opens and closes the session with
+//! [`Backend::set_controllable`] (open while connected to the hub with
+//! sharing on, see [`crate::controllable`]). Reopening uses the stored
+//! restore token, so no dialog appears again; `caps().inject` is true only
+//! while a session is open. The InputCapture session is not affected: on
+//! GNOME 46 every new one asks for permission again, so it stays open.
 //!
 //! **Clipboard** – the portal Clipboard interface on the RemoteDesktop
-//! session (xdg-desktop-portal ≥ 1.17, GNOME ≥ 45). If unavailable, the X11
-//! CLIPBOARD selection through XWayland is used (mutter syncs it with the
-//! Wayland clipboard), which needs XWayland to be running.
+//! session (xdg-desktop-portal ≥ 1.17, GNOME ≥ 45), so only while that
+//! session is open. If a session opens without it (or the RemoteDesktop
+//! portal is missing), the X11 CLIPBOARD selection through XWayland is used
+//! from then on (mutter syncs it with the Wayland clipboard), which needs
+//! XWayland to be running.
 
 use super::x11clip::{self, X11Clipboard};
 use super::{button_to_evdev, evdev_to_button, PNG_MIME, TEXT_MIMES};
@@ -62,7 +75,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -73,6 +87,78 @@ const RD_TOKEN: &str = "remote_desktop";
 enum InjCmd {
     Inject(Action),
     SetClipboard(ClipContent),
+    /// [`RdShared::want`] changed: open or close the session. Queued
+    /// behind the injections before it, so releases happen first.
+    Sync,
+}
+
+/// The on-demand RemoteDesktop session, shared by the backend and the
+/// injector thread.
+struct RdShared {
+    /// The core wants the session open.
+    want: AtomicBool,
+    /// A session is open (injection works).
+    ready: AtomicBool,
+    /// The open session has the portal clipboard.
+    clip: AtomicBool,
+    /// X11 clipboard through XWayland, when the portal clipboard is missing.
+    x11clip: OnceLock<X11Clipboard>,
+    x11_tried: AtomicBool,
+    events: EventTx,
+}
+
+impl RdShared {
+    fn new(events: EventTx) -> Self {
+        RdShared {
+            want: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            clip: AtomicBool::new(false),
+            x11clip: OnceLock::new(),
+            x11_tried: AtomicBool::new(false),
+            events,
+        }
+    }
+
+    fn wanted(&self) -> bool {
+        self.want.load(Ordering::SeqCst)
+    }
+
+    /// Ready to inject: open, and not on its way to closing.
+    fn injecting(&self) -> bool {
+        self.ready.load(Ordering::SeqCst) && self.wanted()
+    }
+
+    fn portal_clip(&self) -> bool {
+        self.injecting() && self.clip.load(Ordering::SeqCst)
+    }
+
+    /// Records whether a session is open; the core re-reads the caps.
+    fn set_ready(&self, ready: bool, clip: bool) {
+        self.clip.store(clip, Ordering::SeqCst);
+        if self.ready.swap(ready, Ordering::SeqCst) != ready {
+            let _ = self.events.send(LocalEvent::CapsChanged);
+        }
+    }
+
+    /// Starts the XWayland clipboard (once) for a session without the
+    /// portal clipboard, as before sessions were opened on demand.
+    fn x11_fallback(&self) {
+        if self.x11_tried.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if std::env::var_os("DISPLAY").is_none() {
+            warn!("no clipboard access: portal clipboard missing and DISPLAY not set");
+            return;
+        }
+        match x11clip::spawn(self.events.clone()) {
+            Ok(c) => {
+                info!("clipboard: portal clipboard unavailable, using the X11 selection via XWayland");
+                let _ = self.x11clip.set(c);
+                let _ = self.events.send(LocalEvent::CapsChanged);
+            }
+            Err(e) => warn!("no clipboard access (portal clipboard missing and XWayland not reachable): {e:#}"),
+        }
+    }
 }
 
 enum CapCmd {
@@ -82,11 +168,9 @@ enum CapCmd {
 
 pub struct WaylandBackend {
     monitors: Arc<Mutex<Vec<Monitor>>>,
-    caps: Capabilities,
     inj: Option<mpsc::UnboundedSender<InjCmd>>,
+    rd: Arc<RdShared>,
     cap: Option<mpsc::UnboundedSender<CapCmd>>,
-    x11clip: Option<X11Clipboard>,
-    portal_clip: bool,
 }
 
 pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)> {
@@ -95,16 +179,12 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
 
     // The two portal sessions are independent: refusing or losing one
     // leaves the other working.
-    let (inj, portal_clip) = match start_injector(opts.state_dir.clone(), tx.clone()).await {
-        Ok((s, clip)) => (Some(s), clip),
-        Err(e) if is_refusal(&e) => {
-            warn!("{RD_REFUSED}");
-            crate::problems::set(PROBLEM_RD, RD_REFUSED);
-            (None, false)
-        }
+    let rd = Arc::new(RdShared::new(tx.clone()));
+    let inj = match start_injector(opts.state_dir.clone(), rd.clone()).await {
+        Ok(s) => Some(s),
         Err(e) => {
             warn!("RemoteDesktop portal unavailable, this machine cannot be controlled: {e:#}");
-            (None, false)
+            None
         }
     };
     let cap = match start_capture(tx.clone(), monitors.clone()).await {
@@ -123,23 +203,9 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
             None
         }
     };
-    let x11clip = if portal_clip {
-        None
-    } else if std::env::var_os("DISPLAY").is_some() {
-        match x11clip::spawn(tx.clone()) {
-            Ok(c) => {
-                info!("clipboard: portal clipboard unavailable, using the X11 selection via XWayland");
-                Some(c)
-            }
-            Err(e) => {
-                warn!("no clipboard access (portal clipboard missing and XWayland not reachable): {e:#}");
-                None
-            }
-        }
-    } else {
-        warn!("no clipboard access: portal clipboard missing and DISPLAY not set");
-        None
-    };
+    if inj.is_none() {
+        rd.x11_fallback();
+    }
     if monitors.lock().expect("poisoned").is_empty() {
         // No InputCapture zones: ask XWayland, else assume one 1920x1080 screen.
         let m = x11_monitors().unwrap_or_else(|_| {
@@ -150,15 +216,13 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
     if inj.is_none() && cap.is_none() {
         return Err(anyhow!("neither the RemoteDesktop nor the InputCapture portal works in this session"));
     }
-    let caps = Capabilities {
-        capture: cap.is_some(),
-        inject: inj.is_some(),
-        clipboard: portal_clip || x11clip.is_some(),
-        // Neither moving nor hiding the cursor during capture (see above).
-        cursor: Default::default(),
-    };
-    info!(?caps, "Wayland portal backend ready");
-    Ok((Arc::new(WaylandBackend { monitors, caps, inj, cap, x11clip, portal_clip }), rx))
+    let b = WaylandBackend { monitors, inj, rd, cap };
+    info!(
+        caps = ?b.caps(),
+        remote_desktop = b.inj.is_some(),
+        "Wayland portal backend ready (the remote control session opens while connected to the hub)"
+    );
+    Ok((Arc::new(b), rx))
 }
 
 fn x11_monitors() -> Result<Vec<Monitor>> {
@@ -183,7 +247,14 @@ impl Backend for WaylandBackend {
         "wayland"
     }
     fn caps(&self) -> Capabilities {
-        self.caps
+        let inject = self.inj.is_some() && self.rd.injecting();
+        Capabilities {
+            capture: self.cap.is_some(),
+            inject,
+            clipboard: self.rd.portal_clip() || self.rd.x11clip.get().is_some(),
+            // Neither moving nor hiding the cursor during capture (see above).
+            cursor: Default::default(),
+        }
     }
     fn monitors(&self) -> Vec<Monitor> {
         self.monitors.lock().expect("poisoned").clone()
@@ -206,6 +277,12 @@ impl Backend for WaylandBackend {
             let _ = i.send(InjCmd::Inject(*action));
         }
     }
+    fn set_controllable(&self, on: bool) {
+        if let Some(i) = &self.inj {
+            self.rd.want.store(on, Ordering::SeqCst);
+            let _ = i.send(InjCmd::Sync);
+        }
+    }
     fn keep_edges_stable(&self) -> bool {
         true
     }
@@ -216,11 +293,11 @@ impl Backend for WaylandBackend {
         self.cap.is_some()
     }
     fn set_clipboard(&self, content: &ClipContent) {
-        if self.portal_clip {
+        if self.rd.portal_clip() {
             if let Some(i) = &self.inj {
                 let _ = i.send(InjCmd::SetClipboard(content.clone()));
             }
-        } else if let Some(c) = &self.x11clip {
+        } else if let Some(c) = self.rd.x11clip.get() {
             c.set(content);
         }
     }
@@ -282,80 +359,111 @@ enum InjEnd {
     Quit,
     /// The EI connection or the portal session went away.
     Lost,
+    /// Closed because the core no longer wants it ([`RdShared::want`]).
+    Closed,
 }
 
-async fn start_injector(state_dir: PathBuf, tx: EventTx) -> Result<(mpsc::UnboundedSender<InjCmd>, bool)> {
+/// Starts the injector thread. It only checks that the RemoteDesktop
+/// portal is there; sessions are opened when the core asks for them.
+async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>) -> Result<mpsc::UnboundedSender<InjCmd>> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     let ready = spawn_portal_thread("portal-inject", move |ready| async move {
+        let probe = probe_remote_desktop().await;
+        let ok = probe.is_ok();
+        let _ = ready.send(probe);
+        if !ok {
+            return;
+        }
+        let shared = rd.clone();
         keep_injecting(
-            ready,
+            &rd,
             &mut cmd_rx,
             async || {
                 let parts = setup_injector(&state_dir).await?;
                 let clip = parts.2.is_some();
+                if !clip {
+                    shared.x11_fallback();
+                }
                 Ok((parts, clip))
             },
-            async |(rd, session, clipboard, eis): InjParts, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| match eis {
+            async |(portal, session, clipboard, eis): InjParts, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| match eis {
                 Some((ctx, conn, events)) => {
-                    run_ei_sender(ctx, conn, events, cmds, rd, session, clipboard, tx.clone()).await
+                    run_ei_sender(ctx, conn, events, cmds, &shared, portal, session, clipboard).await
                 }
-                None => run_dbus_injector(rd, session, cmds).await,
+                None => run_dbus_injector(&shared, portal, session, cmds).await,
             },
         )
         .await
     });
-    let clip_on = ready.await.map_err(|_| anyhow!("portal thread died"))??;
-    Ok((cmd_tx, clip_on))
+    ready.await.map_err(|_| anyhow!("portal thread died"))??;
+    Ok(cmd_tx)
 }
 
-/// Runs injection sessions until the backend is dropped. The result of the
-/// first `setup` (with whether the portal clipboard is on) goes to `ready`;
-/// if it fails, nothing is retried (`create` reports it). A session that
-/// is lost later (EI disconnect, portal gone) is re-created with backoff;
-/// a refused dialog at that point stops injection.
+/// The RemoteDesktop portal answers (without creating a session, which
+/// would show GNOME's indicator).
+async fn probe_remote_desktop() -> Result<()> {
+    let bus = session_bus().await?;
+    let rd = bounded("RemoteDesktop portal", RemoteDesktop::with_connection(bus)).await?;
+    let devices = bounded("RemoteDesktop.AvailableDeviceTypes", rd.available_device_types()).await?;
+    debug!(?devices, version = rd.version(), "RemoteDesktop portal available");
+    Ok(())
+}
+
+/// Runs injection sessions until the backend is dropped: a session is
+/// opened (`setup`) while [`RdShared::want`] is set and closed when it is
+/// cleared (`run` returns [`InjEnd::Closed`]); input for a closed session
+/// is dropped. A session that is lost (EI disconnect, portal gone) or
+/// fails to open is re-created with backoff while still wanted. A refused
+/// dialog stops injection until the agent restarts (asking again and
+/// again would pop the dialog up every time).
 async fn keep_injecting<S>(
-    ready: tokio::sync::oneshot::Sender<Result<bool>>,
+    rd: &RdShared,
     cmds: &mut mpsc::UnboundedReceiver<InjCmd>,
     mut setup: impl AsyncFnMut() -> Result<(S, bool)>,
     mut run: impl AsyncFnMut(S, &mut mpsc::UnboundedReceiver<InjCmd>) -> InjEnd,
 ) {
-    let mut ready = Some(ready);
     let mut backoff = Backoff::default();
     loop {
+        while !rd.wanted() {
+            if cmds.recv().await.is_none() {
+                return;
+            }
+        }
         let started = Instant::now();
         let end = match setup().await {
             Ok((session, clip)) => {
-                match ready.take() {
-                    Some(r) => {
-                        let _ = r.send(Ok(clip));
-                    }
-                    None => {
-                        info!("remote control session re-created");
-                        crate::problems::clear(PROBLEM_RD);
-                        // Queued while a dialog was open: stale by now.
-                        if drop_stale(cmds) {
-                            return;
-                        }
-                    }
+                // Queued while opening (perhaps behind a dialog): stale.
+                if drop_stale(cmds) {
+                    return;
                 }
-                run(session, cmds).await
+                crate::problems::clear(PROBLEM_RD);
+                if rd.wanted() {
+                    info!(portal_clipboard = clip, "remote control session open");
+                    rd.set_ready(true, clip);
+                }
+                // Closes at once if it is no longer wanted.
+                let end = run(session, cmds).await;
+                rd.set_ready(false, false);
+                end
+            }
+            Err(e) if is_refusal(&e) => {
+                warn!("{RD_REFUSED}");
+                crate::problems::set(PROBLEM_RD, RD_REFUSED);
+                return;
             }
             Err(e) => {
-                if let Some(r) = ready.take() {
-                    let _ = r.send(Err(e));
-                    return;
-                }
-                if is_refusal(&e) {
-                    warn!("{RD_REFUSED} (asked again after the session was lost)");
-                    crate::problems::set(PROBLEM_RD, RD_REFUSED);
-                    return;
-                }
-                warn!("re-creating the remote control session failed: {e:#}");
+                warn!("opening the remote control session failed: {e:#}");
                 InjEnd::Lost
             }
         };
-        if end == InjEnd::Quit {
-            return;
+        match end {
+            InjEnd::Quit => return,
+            InjEnd::Closed => {
+                info!("remote control session closed");
+                backoff.reset();
+                continue;
+            }
+            InjEnd::Lost => {}
         }
         if started.elapsed() > RETRY_MAX {
             backoff.reset();
@@ -369,7 +477,12 @@ async fn keep_injecting<S>(
         loop {
             tokio::select! {
                 _ = &mut until => break,
-                cmd = cmds.recv() => if cmd.is_none() { return },
+                cmd = cmds.recv() => match cmd {
+                    None => return,
+                    // No longer wanted: wait for the next request instead.
+                    Some(_) if !rd.wanted() => break,
+                    Some(_) => {}
+                },
             }
         }
     }
@@ -485,17 +598,27 @@ impl EiDevices {
     }
 }
 
+/// After the last injections before a close, how long the compositor gets
+/// to read them from the EI socket before the session is closed over D-Bus
+/// (a different channel), so the releases are applied first.
+const CLOSE_SETTLE: Duration = Duration::from_millis(100);
+
 #[allow(clippy::too_many_arguments)]
 async fn run_ei_sender(
     ctx: ei::Context,
     conn: reis::event::Connection,
     mut events: reis::tokio::EiConvertEventStream,
     cmds: &mut mpsc::UnboundedReceiver<InjCmd>,
-    _rd: RemoteDesktop,
+    rd: &RdShared,
+    _portal: RemoteDesktop,
     session: Session<RemoteDesktop>,
     clipboard: Option<Clipboard>,
-    tx: EventTx,
 ) -> InjEnd {
+    let tx = rd.events.clone();
+    if !rd.wanted() {
+        let _ = bounded("Session.Close", session.close()).await;
+        return InjEnd::Closed;
+    }
     let mut devs = EiDevices::default();
     let mut sequence = 1u32;
     let mut last_abs: Option<(f32, f32)> = None;
@@ -554,6 +677,11 @@ async fn run_ei_sender(
             },
             cmd = cmds.recv() => match cmd {
                 None => break InjEnd::Quit,
+                Some(InjCmd::Sync) => if !rd.wanted() {
+                    let _ = ctx.flush();
+                    tokio::time::sleep(CLOSE_SETTLE).await;
+                    break InjEnd::Closed;
+                },
                 Some(InjCmd::Inject(a)) => {
                     ei_inject(&devs, &conn, a, &mut last_abs);
                     let _ = ctx.flush();
@@ -695,16 +823,28 @@ fn ei_inject(devs: &EiDevices, conn: &reis::event::Connection, a: Action, last_a
 }
 
 /// Injection through the RemoteDesktop `Notify*` D-Bus calls, for portals
-/// without ConnectToEIS. Runs until the backend is dropped.
+/// without ConnectToEIS. Runs until the backend is dropped or the session
+/// is no longer wanted (the calls are awaited in order, so everything
+/// before the close is applied).
 async fn run_dbus_injector(
+    shared: &RdShared,
     rd: RemoteDesktop,
     session: Session<RemoteDesktop>,
     cmds: &mut mpsc::UnboundedReceiver<InjCmd>,
 ) -> InjEnd {
     // Without a screencast stream only relative motion is available.
     let mut last: Option<(i32, i32)> = None;
+    if !shared.wanted() {
+        let _ = bounded("Session.Close", session.close()).await;
+        return InjEnd::Closed;
+    }
     while let Some(c) = cmds.recv().await {
         let r = match c {
+            InjCmd::Sync if !shared.wanted() => {
+                let _ = bounded("Session.Close", session.close()).await;
+                return InjEnd::Closed;
+            }
+            InjCmd::Sync => Ok(()),
             InjCmd::Inject(Action::Entered { x, y }) => {
                 last = Some((x, y));
                 Ok(())
@@ -1450,50 +1590,87 @@ mod tests {
     }
 
     /// Drives [`keep_injecting`] with fake sessions: `setup` takes the
-    /// next outcome from `outcomes`, a session logs what it injects and is
-    /// "lost" when it receives `Action::Left`.
+    /// next outcome from `outcomes`, a session logs what it injects, is
+    /// "lost" when it receives `Action::Left` and closes like the real
+    /// runners when it is no longer wanted.
     struct InjRig {
+        rd: Arc<RdShared>,
+        events: mpsc::UnboundedReceiver<LocalEvent>,
         cmds: mpsc::UnboundedSender<InjCmd>,
         outcomes: mpsc::UnboundedSender<Result<u32>>,
         injected: Arc<Mutex<Vec<(u32, Action)>>>,
+        /// Sessions closed on request, in order.
+        closed: Arc<Mutex<Vec<u32>>>,
         setups: Arc<Mutex<u32>>,
         done: tokio::task::JoinHandle<()>,
-        ready: tokio::sync::oneshot::Receiver<Result<bool>>,
     }
 
     fn start_injecting() -> InjRig {
+        let (ev_tx, events) = mpsc::unbounded_channel();
+        let rd = Arc::new(RdShared::new(ev_tx));
         let (cmds, mut cmds_rx) = mpsc::unbounded_channel();
         let (outcomes, outcomes_rx) = mpsc::unbounded_channel::<Result<u32>>();
-        let (ready_tx, ready) = tokio::sync::oneshot::channel();
         let injected = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(Mutex::new(Vec::new()));
         let setups = Arc::new(Mutex::new(0));
-        let (inj, n) = (injected.clone(), setups.clone());
+        let (inj, cl, n, shared) = (injected.clone(), closed.clone(), setups.clone(), rd.clone());
         let done = tokio::task::spawn_local(async move {
             let mut outcomes_rx = outcomes_rx;
+            let rd = shared.clone();
             keep_injecting(
-                ready_tx,
+                &rd,
                 &mut cmds_rx,
                 async || {
                     *n.lock().unwrap() += 1;
                     let r = outcomes_rx.recv().await.unwrap_or_else(|| Err(anyhow!("portal gone")));
                     r.map(|id| (id, true))
                 },
-                async |id: u32, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| loop {
-                    match cmds.recv().await {
-                        None => return InjEnd::Quit,
-                        Some(InjCmd::Inject(Action::Left)) => return InjEnd::Lost,
-                        Some(InjCmd::Inject(a)) => inj.lock().unwrap().push((id, a)),
-                        Some(InjCmd::SetClipboard(_)) => {}
+                async |id: u32, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| {
+                    if !shared.wanted() {
+                        cl.lock().unwrap().push(id);
+                        return InjEnd::Closed;
+                    }
+                    loop {
+                        match cmds.recv().await {
+                            None => return InjEnd::Quit,
+                            Some(InjCmd::Sync) if !shared.wanted() => {
+                                cl.lock().unwrap().push(id);
+                                return InjEnd::Closed;
+                            }
+                            Some(InjCmd::Inject(Action::Left)) => return InjEnd::Lost,
+                            Some(InjCmd::Inject(a)) => inj.lock().unwrap().push((id, a)),
+                            Some(InjCmd::Sync | InjCmd::SetClipboard(_)) => {}
+                        }
                     }
                 },
             )
             .await
         });
-        InjRig { cmds, outcomes, injected, setups, done, ready }
+        InjRig { rd, events, cmds, outcomes, injected, closed, setups, done }
+    }
+
+    impl InjRig {
+        /// What `Backend::set_controllable` does.
+        fn want(&self, on: bool) {
+            self.rd.want.store(on, Ordering::SeqCst);
+            self.cmds.send(InjCmd::Sync).unwrap();
+        }
+        fn caps_changes(&mut self) -> usize {
+            let mut n = 0;
+            while let Ok(ev) = self.events.try_recv() {
+                assert_eq!(ev, LocalEvent::CapsChanged);
+                n += 1;
+            }
+            n
+        }
     }
 
     fn key(usage: u32) -> InjCmd {
         InjCmd::Inject(Action::Key { usage, down: true })
+    }
+
+    fn key_up(usage: u32) -> InjCmd {
+        InjCmd::Inject(Action::Key { usage, down: false })
     }
 
     async fn settle() {
@@ -1503,16 +1680,110 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn injection_session_is_recreated_after_an_ei_disconnect() {
+    async fn no_session_until_wanted_and_input_meanwhile_is_dropped() {
         local(async {
             let mut rig = start_injecting();
+            rig.cmds.send(key(4)).unwrap();
+            settle().await;
+            tokio::time::sleep(RETRY_MAX).await;
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 0, "no session (and no GNOME indicator) before it is wanted");
+            assert!(!rig.rd.injecting());
+            rig.want(true);
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 1);
+            assert!(!rig.rd.injecting(), "not ready while opening");
             rig.outcomes.send(Ok(1)).unwrap();
-            assert!((&mut rig.ready).await.unwrap().unwrap());
+            settle().await;
+            assert!(rig.rd.injecting() && rig.rd.portal_clip());
+            assert_eq!(rig.caps_changes(), 1, "the core hears that it can inject now");
+            rig.cmds.send(key(5)).unwrap();
+            settle().await;
+            assert_eq!(*rig.injected.lock().unwrap(), [(1, Action::Key { usage: 5, down: true })]);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_applies_queued_releases_first_and_reopening_makes_a_new_session() {
+        local(async {
+            let mut rig = start_injecting();
+            rig.want(true);
+            rig.outcomes.send(Ok(1)).unwrap();
+            settle().await;
+            assert!(rig.rd.injecting());
+            rig.cmds.send(key(4)).unwrap();
+            // The core releases, then asks for the close.
+            rig.cmds.send(key_up(4)).unwrap();
+            rig.want(false);
+            assert!(!rig.rd.injecting(), "not ready from the moment the close is asked for");
+            settle().await;
+            assert_eq!(
+                *rig.injected.lock().unwrap(),
+                [(1, Action::Key { usage: 4, down: true }), (1, Action::Key { usage: 4, down: false })]
+            );
+            assert_eq!(*rig.closed.lock().unwrap(), [1]);
+            assert_eq!(rig.caps_changes(), 2, "open, closed");
+            // Input while closed is dropped; nothing is re-created on its own.
+            rig.cmds.send(key(5)).unwrap();
+            tokio::time::sleep(RETRY_MAX).await;
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 1);
+            // Reopened on request (the real setup reuses the restore token).
+            rig.want(true);
+            rig.outcomes.send(Ok(2)).unwrap();
+            settle().await;
+            rig.cmds.send(key(6)).unwrap();
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 2);
+            assert_eq!(rig.injected.lock().unwrap().last(), Some(&(2, Action::Key { usage: 6, down: true })));
+            drop(rig.cmds);
+            rig.done.await.unwrap();
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_close_asked_for_while_opening_closes_right_after() {
+        local(async {
+            let mut rig = start_injecting();
+            rig.want(true);
+            settle().await;
+            // The core changes its mind while the portal is still answering.
+            rig.want(false);
+            rig.cmds.send(key(4)).unwrap();
+            rig.outcomes.send(Ok(1)).unwrap();
+            settle().await;
+            assert_eq!(*rig.closed.lock().unwrap(), [1]);
+            assert!(rig.injected.lock().unwrap().is_empty());
+            assert_eq!(rig.caps_changes(), 0, "never reported ready");
+            // A flap back on while open does not close it.
+            rig.want(true);
+            rig.outcomes.send(Ok(2)).unwrap();
+            settle().await;
+            rig.want(false);
+            rig.want(true);
+            settle().await;
+            assert!(rig.rd.injecting());
+            assert_eq!(*rig.closed.lock().unwrap(), [1]);
+            assert_eq!(*rig.setups.lock().unwrap(), 2);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn injection_session_is_recreated_after_an_ei_disconnect() {
+        local(async {
+            let rig = start_injecting();
+            rig.want(true);
+            rig.outcomes.send(Ok(1)).unwrap();
+            settle().await;
             rig.cmds.send(key(4)).unwrap();
             settle().await;
             // EI disconnect.
             rig.cmds.send(InjCmd::Inject(Action::Left)).unwrap();
             settle().await;
+            assert!(!rig.rd.injecting());
             // Input during the outage is dropped, not replayed later.
             rig.cmds.send(key(5)).unwrap();
             settle().await;
@@ -1541,11 +1812,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_lost_session_is_not_recreated_once_no_longer_wanted() {
+        local(async {
+            let rig = start_injecting();
+            rig.want(true);
+            rig.outcomes.send(Ok(1)).unwrap();
+            settle().await;
+            rig.cmds.send(InjCmd::Inject(Action::Left)).unwrap();
+            settle().await;
+            rig.want(false);
+            tokio::time::sleep(RETRY_MAX).await;
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 1);
+            assert!(!rig.done.is_finished());
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn injection_stops_when_the_dialog_is_refused_on_recreation() {
         local(async {
-            let mut rig = start_injecting();
+            let rig = start_injecting();
+            rig.want(true);
             rig.outcomes.send(Ok(1)).unwrap();
-            assert!((&mut rig.ready).await.unwrap().unwrap());
+            settle().await;
             rig.cmds.send(InjCmd::Inject(Action::Left)).unwrap();
             rig.outcomes.send(Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled).into())).unwrap();
             tokio::time::sleep(RETRY_MIN * 2).await;
@@ -1557,14 +1847,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn initial_injection_failure_is_reported_and_not_retried() {
+    async fn a_refused_first_dialog_is_not_asked_again() {
         local(async {
-            let mut rig = start_injecting();
+            let rig = start_injecting();
+            rig.want(true);
             rig.outcomes.send(Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled).into())).unwrap();
-            let e = (&mut rig.ready).await.unwrap().unwrap_err();
-            assert!(is_refusal(&e));
             settle().await;
             assert!(rig.done.is_finished());
+            assert!(rig.cmds.send(InjCmd::Sync).is_err(), "the injector is gone: set_controllable does nothing");
+            assert!(!rig.rd.injecting());
+            assert_eq!(*rig.setups.lock().unwrap(), 1);
         })
         .await
     }
