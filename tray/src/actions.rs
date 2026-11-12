@@ -118,14 +118,21 @@ pub fn open_log(log_file: Option<&str>) -> io::Result<()> {
     open(&path.to_string_lossy())
 }
 
-/// Runs the (updated) tray binary in place of this process, same
-/// arguments; `build` is what it should be now (see [`crate::ENV_REEXEC`]).
-/// Call after the tray released its single-instance lock.
-pub fn restart_tray(build: &str) -> io::Error {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => return e,
-    };
+/// Starts the (updated) tray binary as a new, detached process with the
+/// same arguments; `build` is what it should be now (see
+/// [`crate::ENV_REEXEC`]). The caller keeps the single-instance lock until
+/// this returned, then releases it and exits: the new process waits for the
+/// lock (see `main`), so there is never a moment without an instance that
+/// another login item could fill, and never two.
+///
+/// Not an `exec` in place: the process id would stay, and with it the
+/// tray's D-Bus name (`org.kde.StatusNotifierItem-<pid>-<n>`). The exec'd
+/// process then registers the very name the old connection just gave up;
+/// the tray host (GNOME's AppIndicator extension) drops the item when it
+/// sees the old connection vanish, the new registration with it, and no
+/// icon is shown. A new process has a new pid and so a new name.
+pub fn restart_tray(build: &str) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
     // Linux: the replaced file shows as "<path> (deleted)".
     let exe = match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
         Some(p) if !exe.exists() => PathBuf::from(p),
@@ -136,14 +143,14 @@ pub fn restart_tray(build: &str) -> io::Error {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.exec()
+        // Own process group, no stdin/stdout; stderr stays (the session's
+        // journal), which is where the tray logs.
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).process_group(0);
+        cmd.spawn().map(|_| ())
     }
     #[cfg(not(unix))]
     {
-        match flow_ipc::detach::spawn_detached(&mut cmd) {
-            Ok(_) => std::process::exit(0),
-            Err(e) => e,
-        }
+        flow_ipc::detach::spawn_detached(&mut cmd).map(|_| ())
     }
 }
 

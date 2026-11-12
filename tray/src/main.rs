@@ -36,8 +36,8 @@ fn main() {
         return window();
     }
     let show = has("--show");
-    // Started again after an update: the old process may still be exiting
-    // (Windows) and hold the lock for a moment.
+    // Started by the tray that an update replaced: that one holds the lock
+    // until it has started this process and then exits.
     if std::env::var_os(flow_tray::ENV_REEXEC).is_some() {
         for _ in 0..50 {
             if !instance::is_locked(TRAY_LOCK) {
@@ -63,15 +63,21 @@ fn main() {
         }
     };
     let r = run_tray(show, !has("--no-start-agent"));
-    drop(lock);
     match r {
-        Ok(None) => {}
+        Ok(None) => drop(lock),
         Ok(Some(build)) => {
-            let e = flow_tray::actions::restart_tray(&build);
-            eprintln!("flow-tray: starting the updated tray: {e}");
-            std::process::exit(1);
+            // A new process, started while this one still holds the lock;
+            // it waits for it above. The tray icon (its D-Bus connection)
+            // is gone by now: `run_tray` shut it down before returning.
+            let started = flow_tray::actions::restart_tray(&build);
+            drop(lock);
+            if let Err(e) = started {
+                eprintln!("flow-tray: starting the updated tray: {e}");
+                std::process::exit(1);
+            }
         }
         Err(e) => {
+            drop(lock);
             eprintln!("flow-tray: {e:#}");
             std::process::exit(1);
         }
