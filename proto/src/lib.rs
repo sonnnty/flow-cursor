@@ -41,8 +41,9 @@ pub use settings::{
 pub use update::{UpdateFromHub, UpdatePolicy, UpdateToHub};
 
 /// Bumped whenever a message outside the frozen [`hello`] / [`update`]
-/// modules changes incompatibly (4: frozen handshake and self-update).
-pub const PROTOCOL_VERSION: u32 = 4;
+/// modules changes incompatibly (4: frozen handshake and self-update;
+/// 5: [`ToHub::Caps`]).
+pub const PROTOCOL_VERSION: u32 = 5;
 /// ALPN for agent ↔ hub connections.
 pub const ALPN_HUB: &[u8] = b"flowcursor-hub/1";
 /// ALPN for agent ↔ agent (P2P) connections.
@@ -314,6 +315,11 @@ pub enum ToHub {
         addrs: Vec<IpAddr>,
     },
     Update(UpdateToHub),
+    /// What this node can do now (sent on connect and on every change).
+    /// The register-time capabilities can change while connected: a
+    /// GNOME/Wayland agent opens its remote control session only while it
+    /// can be controlled, so `inject` is false until it is open.
+    Caps(Capabilities),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
