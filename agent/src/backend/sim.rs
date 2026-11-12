@@ -1,6 +1,12 @@
 //! Simulated backend: no OS access. Tests (and `--backend sim`) drive it
 //! through [`SimControl`]: emit local events, observe injected actions,
 //! capture state, pointer warps, the local cursor and the clipboard.
+//!
+//! With [`SimControl::set_on_demand`] it models a backend whose remote
+//! control session is opened on demand (GNOME/Wayland's RemoteDesktop
+//! portal session): it opens after [`SimState::open_delay`] once the core
+//! asks for it, closes at once, and injection or clipboard updates while it
+//! is closed never reach the "OS" (they are recorded apart).
 
 use super::{Backend, EventRx, EventTx, LocalEvent};
 use crate::park::Park;
@@ -8,6 +14,7 @@ use flow_layout::Edge;
 use flow_net::link::Action;
 use flow_proto::{Capabilities, ClipContent, CursorSupport, Monitor, Rect};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub fn default_monitors() -> Vec<Monitor> {
@@ -44,6 +51,23 @@ pub struct SimState {
     pub parks: Vec<Park>,
     /// Number of `restore_cursor` calls.
     pub restores: usize,
+    /// The remote control session is opened on demand (set before the
+    /// agent starts). Off: always open, like X11 and Windows.
+    pub on_demand: bool,
+    /// The on-demand session is open (injection works).
+    pub session_open: bool,
+    /// Last `set_controllable` from the core.
+    pub session_wanted: bool,
+    /// How long opening the session takes (the portal round trip).
+    pub open_delay: Duration,
+    /// Every open (true) and close (false) of the session, in order.
+    pub session_log: Vec<bool>,
+    /// Actions the core injected while the session was closed (they
+    /// never reach the "OS").
+    pub injected_while_closed: Vec<Action>,
+    /// Bumped on every `set_controllable`, so an open that is still
+    /// pending when the core changes its mind is dropped.
+    session_gen: u64,
 }
 
 pub struct SimBackend {
@@ -159,6 +183,41 @@ impl SimControl {
     pub fn set_cursor_support(&self, s: CursorSupport) {
         self.state.lock().unwrap().cursor_support = s;
     }
+    /// Models an on-demand remote control session (see the module docs)
+    /// that takes `open_delay` to open. Call it before the agent starts.
+    pub fn set_on_demand(&self, open_delay: Duration) {
+        let mut s = self.state.lock().unwrap();
+        s.on_demand = true;
+        s.open_delay = open_delay;
+    }
+    pub fn session_open(&self) -> bool {
+        self.state.lock().unwrap().session_open
+    }
+    pub fn session_log(&self) -> Vec<bool> {
+        self.state.lock().unwrap().session_log.clone()
+    }
+    pub fn injected_while_closed(&self) -> Vec<Action> {
+        self.state.lock().unwrap().injected_while_closed.clone()
+    }
+    /// The session is lost on the backend's side (portal gone, EI
+    /// disconnect); the core hears about it like from the real backend.
+    pub fn lose_session(&self) {
+        {
+            let mut s = self.state.lock().unwrap();
+            if !s.session_open {
+                return;
+            }
+            s.session_open = false;
+            s.session_log.push(false);
+        }
+        self.emit(LocalEvent::CapsChanged);
+    }
+}
+
+impl SimState {
+    fn can_inject(&self) -> bool {
+        !self.on_demand || self.session_open
+    }
 }
 
 impl Backend for SimBackend {
@@ -166,7 +225,9 @@ impl Backend for SimBackend {
         "sim"
     }
     fn caps(&self) -> Capabilities {
-        Capabilities { capture: true, inject: true, clipboard: true, cursor: self.state.lock().unwrap().cursor_support }
+        let s = self.state.lock().unwrap();
+        let on = s.can_inject();
+        Capabilities { capture: true, inject: on, clipboard: on, cursor: s.cursor_support }
     }
     fn monitors(&self) -> Vec<Monitor> {
         self.state.lock().unwrap().monitors.clone()
@@ -202,6 +263,10 @@ impl Backend for SimBackend {
     }
     fn inject(&self, action: &Action) {
         let mut s = self.state.lock().unwrap();
+        if !s.can_inject() {
+            s.injected_while_closed.push(*action);
+            return;
+        }
         match action {
             Action::MoveAbs { x, y, .. } | Action::Entered { x, y } => s.pointer = (*x, *y),
             _ => {}
@@ -212,8 +277,45 @@ impl Backend for SimBackend {
         s.injected.push(*action);
     }
     fn set_clipboard(&self, content: &ClipContent) {
-        self.state.lock().unwrap().clipboard = Some(content.clone());
-        let _ = &self.tx;
+        let mut s = self.state.lock().unwrap();
+        // Like the portal clipboard, which belongs to the session.
+        if s.can_inject() {
+            s.clipboard = Some(content.clone());
+        }
+    }
+    fn set_controllable(&self, on: bool) {
+        let (generation, delay) = {
+            let mut s = self.state.lock().unwrap();
+            if !s.on_demand {
+                return;
+            }
+            s.session_wanted = on;
+            s.session_gen += 1;
+            if !on {
+                if s.session_open {
+                    s.session_open = false;
+                    s.session_log.push(false);
+                }
+                return;
+            }
+            if s.session_open {
+                return;
+            }
+            (s.session_gen, s.open_delay)
+        };
+        let (state, tx) = (self.state.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            {
+                let mut s = state.lock().unwrap();
+                if s.session_gen != generation || s.session_open {
+                    return;
+                }
+                s.session_open = true;
+                s.session_log.push(true);
+            }
+            let _ = tx.send(LocalEvent::CapsChanged);
+        });
     }
     fn observes_keys(&self) -> bool {
         !self.state.lock().unwrap().wayland_like
