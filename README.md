@@ -49,7 +49,7 @@ docker compose exec flow-server flow-server --print-token   # join token
 ./install.sh <join token> <ที่อยู่ hub>
 ```
 
-GNOME จะขอสิทธิ์สองครั้ง กดอนุญาตทั้งคู่
+GNOME จะขอสิทธิ์สองครั้ง (Remote Desktop ขอตอนต่อ hub ได้ครั้งแรก) กดอนุญาตทั้งคู่
 
 **3. ติดตั้ง agent บน Windows** ดับเบิลคลิก `build/out/windows/FlowCursor-setup-<เวอร์ชัน>.exe`
 แล้ววาง join token และที่อยู่ hub ในหน้า Join
