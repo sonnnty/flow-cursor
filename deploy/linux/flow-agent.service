@@ -17,7 +17,9 @@ Type=simple
 ExecStart=@BINDIR@/flow-agent run
 Restart=on-failure
 RestartSec=3
-Environment=RUST_LOG=info
+# No RUST_LOG here: the log level comes from the dashboard (or log_level in
+# agent.toml). Set RUST_LOG only to override both, e.g. with
+# `systemctl --user edit flow-agent` and Environment=RUST_LOG=debug.
 
 [Install]
 WantedBy=graphical-session.target

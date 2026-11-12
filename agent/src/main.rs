@@ -81,10 +81,38 @@ enum Cmd {
     },
 }
 
+/// Where the log filter comes from, strongest first: `RUST_LOG` when it
+/// is set in the environment (on purpose: the systemd unit no longer sets
+/// it), then `log_level` in agent.toml, then the hub's setting (applied
+/// through the returned hook when it arrives), else `info`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LogSource {
+    Env,
+    Config,
+    Hub,
+}
+
+fn log_source(env: Option<&str>, config: Option<&str>) -> LogSource {
+    if env.is_some_and(|v| !v.trim().is_empty()) {
+        LogSource::Env
+    } else if config.is_some_and(|v| !v.trim().is_empty()) {
+        LogSource::Config
+    } else {
+        LogSource::Hub
+    }
+}
+
 /// Sets up logging to stdout or `file`, plus an in-memory copy of the last
-/// lines for the status window (`flow-tray`).
-fn init_logging(level: &str, file: Option<&std::path::Path>) -> (flow_agent::LogHook, LogBuffer) {
-    let initial = std::env::var("RUST_LOG").unwrap_or_else(|_| level.to_string());
+/// lines for the status window (`flow-tray`). `config_level` is
+/// `log_level` from agent.toml; see [`LogSource`] for what wins.
+fn init_logging(config_level: Option<&str>, file: Option<&std::path::Path>) -> (flow_agent::LogHook, LogBuffer) {
+    let env = std::env::var("RUST_LOG").ok();
+    let source = log_source(env.as_deref(), config_level);
+    let initial = match source {
+        LogSource::Env => env.clone().unwrap_or_default(),
+        LogSource::Config => config_level.unwrap_or_default().to_string(),
+        LogSource::Hub => "info".to_string(),
+    };
     let (filter, handle) = reload::Layer::new(EnvFilter::try_new(&initial).unwrap_or_else(|_| EnvFilter::new("info")));
     let file_layer = file.and_then(|p| {
         if let Some(d) = p.parent() {
@@ -97,9 +125,10 @@ fn init_logging(level: &str, file: Option<&std::path::Path>) -> (flow_agent::Log
     let logs = LogBuffer::default();
     let mem_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer(logs.clone());
     tracing_subscriber::registry().with(filter).with(stdout_layer).with(file_layer).with(mem_layer).init();
-    let env_set = std::env::var("RUST_LOG").is_ok();
+    // The core only calls the hook when agent.toml has no log_level.
     let hook: flow_agent::LogHook = Arc::new(move |lvl: &str| {
-        if env_set {
+        if source == LogSource::Env {
+            info!("not applying the dashboard log level {lvl:?}: RUST_LOG is set");
             return;
         }
         match EnvFilter::try_new(lvl) {
@@ -166,7 +195,7 @@ async fn main() -> Result<()> {
         }
         Cmd::UpdateGuard { state_dir } => {
             let log = flow_agent::update::state::update_dir(&state_dir).join("guard.log");
-            let _log = init_logging("info", Some(&log));
+            let _log = init_logging(Some("info"), Some(&log));
             info!("update guard {} started", flow_version::FULL);
             let end = flow_agent::update::guard::run(
                 &state_dir,
@@ -228,7 +257,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Monitors { backend: b } => {
-            let _log = init_logging("warn", None);
+            let _log = init_logging(Some("warn"), None);
             let kind = backend::parse_kind(b.as_deref().or(cfg.backend.as_deref()))?;
             let (be, _rx) = backend::create(kind, &BackendOptions { state_dir: cfg.state_dir() }).await?;
             for m in be.monitors() {
@@ -253,9 +282,11 @@ async fn main() -> Result<()> {
             std::env::remove_var(ENV_PAUSED);
             // Without a console (Windows autostart) log to a file by default.
             let log_file = cfg.log_file.clone().or_else(|| (!has_console).then(|| cfg.state_dir().join("agent.log")));
-            let (hook, logs) = init_logging(cfg.log_level.as_deref().unwrap_or("info"), log_file.as_deref());
-            if let Some(l) = &cfg.log_level {
-                hook(l);
+            let (hook, logs) = init_logging(cfg.log_level.as_deref(), log_file.as_deref());
+            match log_source(std::env::var("RUST_LOG").ok().as_deref(), cfg.log_level.as_deref()) {
+                LogSource::Env => info!("log level from RUST_LOG; the dashboard setting is ignored"),
+                LogSource::Config => info!("log level from log_level in agent.toml; the dashboard setting is ignored"),
+                LogSource::Hub => info!("log level from the dashboard (info until the hub sends it)"),
             }
             let endpoint = default_endpoint();
             // Before the backend: on Wayland creating it opens permission
@@ -443,6 +474,25 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
         let rtt = p.rtt_ms.map(|r| format!(" {r:.1} ms")).unwrap_or_default();
         println!("peer:             {} ({state}, {path}{rtt})", p.name);
     }
+    if let Some(c) = &s.capture {
+        let mut line = format!("{}, {} barrier{}", c.state, c.barriers, if c.barriers == 1 { "" } else { "s" });
+        if c.barriers_refused > 0 {
+            line.push_str(&format!(" ({} refused)", c.barriers_refused));
+        }
+        if let Some(z) = c.zone_set {
+            line.push_str(&format!(", zone set {z}"));
+        }
+        line.push_str(&format!(", session {}", c.sessions));
+        if let Some(a) = c.session_age_s {
+            line.push_str(&format!(" ({} old)", ago(a)));
+        }
+        println!("input capture:    {line}");
+        let hit = c.last_activation_s.map(|a| format!("{} ago", ago(a))).unwrap_or_else(|| "never".into());
+        println!("last edge hit:    {hit}");
+        if let (Some(what), Some(a)) = (&c.last_change, c.last_change_s) {
+            println!("capture change:   {what} ({} ago)", ago(a));
+        }
+    }
     for p in &s.problems {
         println!("problem:          {p}");
     }
@@ -470,6 +520,15 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
     }
 }
 
+/// `90` → `1m30s`.
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
 async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
@@ -483,5 +542,35 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_level_precedence() {
+        assert_eq!(log_source(Some("debug"), Some("warn")), LogSource::Env);
+        assert_eq!(log_source(None, Some("warn")), LogSource::Config);
+        assert_eq!(log_source(Some(" "), Some("warn")), LogSource::Config, "an empty RUST_LOG is not a choice");
+        assert_eq!(log_source(None, None), LogSource::Hub);
+        assert_eq!(log_source(None, Some("")), LogSource::Hub);
+    }
+
+    #[test]
+    fn the_systemd_unit_leaves_the_log_level_to_the_hub() {
+        let unit = include_str!("../../deploy/linux/flow-agent.service");
+        assert!(
+            !unit.lines().any(|l| l.trim_start().starts_with("Environment=RUST_LOG")),
+            "a RUST_LOG in the unit overrides the dashboard's log level"
+        );
+    }
+
+    #[test]
+    fn ages() {
+        assert_eq!(ago(5), "5s");
+        assert_eq!(ago(90), "1m30s");
+        assert_eq!(ago(7260), "2h01m");
     }
 }

@@ -177,6 +177,34 @@ pub struct Snapshot {
 
     /// Self-update from the hub.
     pub update: UpdateInfo,
+
+    /// The compositor's capture session (GNOME/Wayland InputCapture);
+    /// None on backends without one and from older agents.
+    pub capture: Option<CaptureInfo>,
+}
+
+/// State of the compositor's capture session: whether pointer barriers are
+/// in place at the edges that lead to other machines.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureInfo {
+    /// `enabled`, `no edges`, `opening` (waiting for the portal or its
+    /// permission dialog), `re-creating`, `lost`, `refused`, `unavailable`,
+    /// `not enabled`.
+    pub state: String,
+    /// Pointer barriers in place / refused by the compositor.
+    pub barriers: u32,
+    pub barriers_refused: u32,
+    /// Zone set (monitor configuration serial) the barriers were set for.
+    pub zone_set: Option<u32>,
+    /// Capture sessions created since the agent started.
+    pub sessions: u32,
+    pub session_age_s: Option<u64>,
+    /// Seconds since a barrier last fired.
+    pub last_activation_s: Option<u64>,
+    /// The last change and how many seconds ago.
+    pub last_change: Option<String>,
+    pub last_change_s: Option<u64>,
 }
 
 /// Why the remote control session is closed on purpose (not a fault).

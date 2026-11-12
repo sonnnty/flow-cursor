@@ -132,6 +132,17 @@ backend = "auto"                  # auto, wayland, x11, windows, sim
 # state_dir = "/path"             # ค่าเริ่มต้น ~/.local/share/flowcursor
 ```
 
+### ระดับ log ของ agent
+
+ใช้ค่าแรกที่มี ตามลำดับ:
+
+1. `RUST_LOG` ใน environment ของ agent (ตั้งเองเท่านั้น unit ของ systemd ไม่ตั้งให้แล้ว)
+2. `log_level` ใน agent.toml
+3. Agent log level ใน dashboard (เปลี่ยนแล้วมีผลทันที)
+4. `info`
+
+agent เขียนใน log ตอนเริ่มว่าใช้ค่าจากไหน เครื่องที่ติดตั้งด้วย `install.sh` ได้ unit ใหม่พร้อมการอัปเดตครั้งถัดไป
+
 agent เขียนตัวตนของตัวเองไว้ใน `state_dir` (`agent.crt`, `agent.key`, `agent-state.json`) สิทธิ์ 0600
 
 ถ้า hub ล่ม agent ใช้ผังจอและที่อยู่เครื่องอื่นล่าสุดที่จำไว้ คุมกันผ่าน P2P ต่อได้ แต่ส่งผ่าน hub ไม่ได้จนกว่า hub กลับมา

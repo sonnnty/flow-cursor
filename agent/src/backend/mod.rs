@@ -66,6 +66,29 @@ pub enum LocalEvent {
     CapsChanged,
 }
 
+/// State of a capture session that the compositor owns (Wayland
+/// InputCapture), for `flow-agent status` and the tray: when crossing out
+/// of this machine stops working, this says whether barriers are in place.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CaptureReport {
+    /// `enabled`, `no edges`, `opening` (waiting for the portal or its
+    /// permission dialog), `re-creating`, `lost`, `refused`, `not enabled`.
+    pub state: String,
+    /// Pointer barriers the compositor accepted / refused.
+    pub barriers: usize,
+    pub barriers_refused: usize,
+    /// Zone set (monitor configuration serial) the barriers were set for.
+    pub zone_set: Option<u32>,
+    /// Sessions created since the agent started.
+    pub sessions: u32,
+    pub session_age: Option<std::time::Duration>,
+    /// Since the last barrier hit.
+    pub since_activation: Option<std::time::Duration>,
+    /// The last change (barriers set, enabled, zones changed…) and since when.
+    pub last_change: Option<String>,
+    pub since_change: Option<std::time::Duration>,
+}
+
 pub type EventTx = mpsc::UnboundedSender<LocalEvent>;
 pub type EventRx = mpsc::UnboundedReceiver<LocalEvent>;
 
@@ -148,6 +171,11 @@ pub trait Backend: Send + Sync + 'static {
     /// the decision itself is the core's ([`crate::cross`]).
     fn set_crossing_key(&self, combo: Option<flow_keymap::Combo>) {
         let _ = combo;
+    }
+    /// State of the compositor's capture session, on backends that have
+    /// one (see [`CaptureReport`]).
+    fn capture_report(&self) -> Option<CaptureReport> {
+        None
     }
 }
 

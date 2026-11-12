@@ -48,7 +48,7 @@ GNOME จะขอสิทธิ์สองอย่าง:
 | หน้าต่าง | ทำให้ | ถามเมื่อไร |
 | :--- | :--- | :--- |
 | Remote Desktop | เครื่องอื่นคุมเครื่องนี้ และใช้คลิปบอร์ด | ครั้งแรกที่ต่อ hub ได้ ครั้งต่อไปไม่ถาม agent เก็บ restore token ไว้ |
-| Input Capture | เครื่องนี้ไปคุมเครื่องอื่น | ทุกครั้งที่ agent เริ่มใหม่ เพราะ GNOME 46 ไม่มี restore token ให้สิทธิ์นี้ |
+| Input Capture | เครื่องนี้ไปคุมเครื่องอื่น | ทุกครั้งที่ agent เริ่มใหม่ เปลี่ยนผังจอ หรือเปลี่ยนจอ เพราะ GNOME 46 ไม่มี restore token ให้สิทธิ์นี้ |
 
 สองสิทธิ์แยกกัน ปฏิเสธอันหนึ่ง อีกอันยังใช้ได้ agent จะไม่ถามซ้ำเองจนกว่าจะ restart:
 
@@ -59,6 +59,18 @@ flow-agent forget-portal   # ลืมสิทธิ์ Remote Desktop ที�
 
 ถ้า portal หลุดระหว่างใช้งาน agent คืนเมาส์ให้เครื่องนี้ทันที แล้วสร้าง session ใหม่เอง
 ระยะรอเริ่มที่ 1 วินาที และเพิ่มเป็นสองเท่าทุกครั้งที่ไม่สำเร็จ สูงสุด 60 วินาที
+
+### เปลี่ยนจอแล้วข้ามจอไม่ได้
+
+ทุกครั้งที่การตั้งค่าจอเปลี่ยน (เสียบหรือถอดจอ เปลี่ยนความละเอียดหรือ scale บางครั้งตอนตื่นจาก sleep)
+GNOME 46 ปิด session Input Capture เงียบๆ ขอบจอที่ใช้ข้ามเครื่องหายไปโดยไม่มีสัญญาณบอกนอกจาก ZonesChanged (ซึ่ง portal 1.18 ไม่ส่งต่อ)
+agent รู้จากสัญญาณ `MonitorsChanged` ของ GNOME (หรือเช็คทุก 10 วินาที) ส่งจอใหม่ให้ hub แล้วสร้าง session ใหม่ให้เองครั้งเดียวต่อการเปลี่ยน
+(รอขอบจอของผังใหม่ไม่เกิน 2 วินาที) GNOME จะถามสิทธิ์ Input Capture อีกครั้ง ให้กด Allow ถ้าเครื่องนี้ไม่มีขอบไปเครื่องอื่น จะไม่ถาม
+นอกจากนี้ agent เช็คทุก 30 วินาที และทุกครั้งที่ hub ส่งผังจอเดิมซ้ำ ว่าขอบจอยังเป็นของชุดจอปัจจุบัน ถ้าไม่ใช่ก็สร้างใหม่
+
+ดูสถานะได้จาก `flow-agent status` บรรทัด `input capture`, `last edge hit` และ `capture change`
+หรือแถว Edge capture ในหน้าต่างสถานะ เช่น `enabled, 1 barrier, zone set 7, session 3`
+ถ้าค้างที่ `opening` แปลว่ารอหน้าต่างขอสิทธิ์ของ GNOME อยู่
 
 ## ไอคอน "มีคนควบคุมเครื่องนี้" บนแถบด้านบน
 
@@ -91,6 +103,11 @@ GNOME ไม่ให้โปรแกรมเบื้องหลังอ�
 2. คลิปบอร์ด X11 ผ่าน XWayland ใช้ได้เฉพาะตอนที่ XWayland ทำงานอยู่
 3. บน Xorg ใช้คลิปบอร์ด X11 ตรงๆ
 
+copy หนึ่งครั้งใน GNOME ทำให้ portal ส่งสัญญาณมา 2 ถึง 3 ครั้ง agent อ่านคลิปบอร์ดครั้งเดียวจากสัญญาณล่าสุด
+คลิปบอร์ดจากเครื่องอื่นที่มาถึงตอน session ยังเปิดไม่เสร็จ (เช่น เพิ่งต่อ hub ได้) จะถูกเก็บไว้แล้วใส่ให้ทันทีที่ session เปิด ถ้ารอไม่เกิน 60 วินาที
+
+ดู log ของคลิปบอร์ดด้วย `log_level = "info,flow_agent=debug"` แล้วหาบรรทัด `clipboard owner changed` และ `local clipboard read`
+
 ## ไอคอนบนแถบด้านบน
 
 GNOME ไม่มี system tray ในตัว ต้องเปิด extension "AppIndicator and KStatusNotifierItem Support"
@@ -111,3 +128,7 @@ flow-agent status
 systemctl --user status flow-agent
 journalctl --user -u flow-agent -f
 ```
+
+ระดับ log มาจาก dashboard (Settings → Agent log level) unit ของ systemd ไม่ตั้ง `RUST_LOG` แล้ว
+ถ้าตั้ง `RUST_LOG` เอง (`systemctl --user edit flow-agent` แล้วใส่ `Environment=RUST_LOG=debug`) หรือ `log_level` ใน agent.toml ค่านั้นจะชนะค่าจาก dashboard
+ดูลำดับได้ที่ [Dashboard และการตั้งค่า](settings.md#ระดับ-log-ของ-agent)
