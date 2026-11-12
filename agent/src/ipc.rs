@@ -189,6 +189,23 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
         problems,
         warnings,
         update: update_info(&ctx.agent.updater.status()),
+        capture: backend.capture_report().map(|r| capture_info(&r)),
+    }
+}
+
+/// The backend's capture report as clients get it (whole seconds).
+pub fn capture_info(r: &crate::backend::CaptureReport) -> flow_ipc::CaptureInfo {
+    let secs = |d: Option<std::time::Duration>| d.map(|d| d.as_secs());
+    flow_ipc::CaptureInfo {
+        state: r.state.clone(),
+        barriers: r.barriers as u32,
+        barriers_refused: r.barriers_refused as u32,
+        zone_set: r.zone_set,
+        sessions: r.sessions,
+        session_age_s: secs(r.session_age),
+        last_activation_s: secs(r.since_activation),
+        last_change: r.last_change.clone(),
+        last_change_s: secs(r.since_change),
     }
 }
 

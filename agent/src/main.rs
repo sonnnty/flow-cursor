@@ -443,6 +443,25 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
         let rtt = p.rtt_ms.map(|r| format!(" {r:.1} ms")).unwrap_or_default();
         println!("peer:             {} ({state}, {path}{rtt})", p.name);
     }
+    if let Some(c) = &s.capture {
+        let mut line = format!("{}, {} barriers", c.state, c.barriers);
+        if c.barriers_refused > 0 {
+            line.push_str(&format!(" ({} refused)", c.barriers_refused));
+        }
+        if let Some(z) = c.zone_set {
+            line.push_str(&format!(", zone set {z}"));
+        }
+        line.push_str(&format!(", session {}", c.sessions));
+        if let Some(a) = c.session_age_s {
+            line.push_str(&format!(" ({} old)", ago(a)));
+        }
+        println!("input capture:    {line}");
+        let hit = c.last_activation_s.map(|a| format!("{} ago", ago(a))).unwrap_or_else(|| "never".into());
+        println!("last edge hit:    {hit}");
+        if let (Some(what), Some(a)) = (&c.last_change, c.last_change_s) {
+            println!("capture change:   {what} ({} ago)", ago(a));
+        }
+    }
     for p in &s.problems {
         println!("problem:          {p}");
     }
@@ -464,6 +483,15 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
     if let Some(f) = &u.failed {
         let rb = if u.failed_rolled_back { " (previous version restored)" } else { "" };
         println!("update failed:    {f}{rb}");
+    }
+}
+
+/// `90` → `1m30s`.
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
     }
 }
 
