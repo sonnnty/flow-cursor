@@ -258,6 +258,9 @@ pub fn view(state: &AgentState) -> View {
     for p in &s.problems {
         lines.push(format!("Problem: {}", shorten(p, 80)));
     }
+    for w in &s.warnings {
+        lines.push(shorten(w, 80));
+    }
     lines.push(format!("Version: {}", s.agent_version));
     if let Some(u) = update_label(s) {
         lines.push(format!("Update: {}", shorten(&u, 80)));
@@ -321,6 +324,15 @@ mod tests {
         assert_eq!(variant(&pending), Variant::Disconnected);
         let revoked = Snapshot { revoked: true, ..joined() };
         assert_eq!(variant(&revoked), Variant::Error);
+    }
+
+    #[test]
+    fn a_layout_without_edges_is_a_note_not_an_error() {
+        let mut s = joined();
+        s.warnings = vec!["No edges to other machines (check the layout in the dashboard).".into()];
+        assert_eq!(variant(&s), Variant::Idle, "no error icon");
+        let v = view(&AgentState::Running(Box::new(s)));
+        assert!(v.lines.iter().any(|l| l.starts_with("No edges to other machines")), "{:?}", v.lines);
     }
 
     /// What the agent sends in each situation (see `flow-agent`'s

@@ -93,6 +93,12 @@ pub struct AgentStatus {
     /// The session is closed on purpose, and why (so no inject or
     /// clipboard capability is no fault); None while it is open or wanted.
     pub session_idle: Option<flow_ipc::SessionIdle>,
+    /// Edges of this machine that lead to another machine in the layout
+    /// (None: this machine is not in the layout).
+    pub edges: Option<usize>,
+    /// This machine is in the layout with other machines but touches none
+    /// of them: the pointer can neither leave nor enter it.
+    pub no_edges: bool,
 }
 
 pub struct AgentHandle {
@@ -1005,7 +1011,19 @@ impl Core {
     }
 
     fn refresh_edges(&self) {
-        let Some(me) = self.me else {
+        let edges = self.me.map(|me| self.layout.edges_of(me));
+        let in_layout = self.me.is_some_and(|me| self.layout.node(me).is_some());
+        let others = self.layout.nodes.iter().filter(|n| Some(n.id) != self.me && !n.monitors.is_empty()).count();
+        let count = edges.as_ref().filter(|_| in_layout).map(Vec::len);
+        let no_edges = count == Some(0) && others > 0;
+        self.status.send_modify(|s| {
+            if no_edges && !s.no_edges {
+                warn!("this machine touches no other screen in the layout: check the layout in the dashboard");
+            }
+            s.edges = count;
+            s.no_edges = no_edges;
+        });
+        let Some(edges) = edges else {
             self.backend.set_edges(Vec::new());
             return;
         };
@@ -1017,7 +1035,7 @@ impl Core {
         // All layout edges, also those to offline machines: crossing is
         // refused at hit time. Keeping the set stable matters on Wayland,
         // where changing pointer barriers recreates the capture session.
-        self.backend.set_edges(self.layout.edges_of(me));
+        self.backend.set_edges(edges);
     }
 
     // ------------------------------------------------------------------
@@ -1093,13 +1111,34 @@ impl Core {
                 Mode::Local => {}
             },
             LocalEvent::Clipboard(c) => self.on_local_clipboard(c),
-            LocalEvent::MonitorsChanged(m) => {
-                info!(monitors = m.len(), "monitor configuration changed");
-                let _ = self.to_hub.send(ToHub::UpdateMonitors(m));
-            }
+            LocalEvent::MonitorsChanged(m) => self.on_monitors_changed(m),
             LocalEvent::CapsChanged => self.refresh_caps(),
         }
         self.publish();
+    }
+
+    /// The backend saw a new monitor configuration. The hub re-lays out
+    /// around this machine and sends everyone the new layout; meanwhile this
+    /// agent applies the same rule to its own copy, so its edges are right
+    /// at once (also while the hub is down) and the hub's layout, computed
+    /// from the same layout, does not change them a second time (on
+    /// Wayland every barrier change may need a new capture session).
+    fn on_monitors_changed(&mut self, m: Vec<flow_proto::Monitor>) {
+        if m.is_empty() {
+            debug!("ignoring an empty monitor list (screens off for a moment)");
+            return;
+        }
+        let rects: Vec<String> =
+            m.iter().map(|m| format!("{}x{}@{},{}", m.rect.w, m.rect.h, m.rect.x, m.rect.y)).collect();
+        info!(monitors = m.len(), ?rects, "monitor configuration changed, telling the hub");
+        if let Some(me) = self.me {
+            let moved = flow_layout::apply_monitors(&mut self.layout, me, m.clone());
+            if !moved.is_empty() {
+                debug!(?moved, "expected re-layout");
+            }
+        }
+        self.refresh_edges();
+        let _ = self.to_hub.send(ToHub::UpdateMonitors(m));
     }
 
     fn on_local_clipboard(&mut self, c: ClipContent) {
