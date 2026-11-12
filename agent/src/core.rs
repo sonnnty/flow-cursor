@@ -27,8 +27,8 @@ use flow_net::quinn::Endpoint;
 use flow_net::Identity;
 use flow_proto::net::{on_allowed_network, Cidr};
 use flow_proto::{
-    AgentSettings, Button, ClipContent, Fingerprint, InputEvent, Layout, NodeId, PathKind, PathReport, PeerInfo, ToHub,
-    ALPN_P2P,
+    AgentSettings, Button, Capabilities, ClipContent, Fingerprint, InputEvent, Layout, NodeId, PathKind, PathReport,
+    PeerInfo, ToHub, ALPN_P2P,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -395,7 +395,7 @@ pub async fn start_with(
         parked: None,
         last_input: None,
         session: SessionGate::new(hub_grace),
-        inject_ready: backend.caps().inject,
+        caps: backend.caps(),
         stopping: false,
     };
     core.apply_settings(AgentSettings::default());
@@ -507,8 +507,8 @@ struct Core {
     last_input: Option<Instant>,
     /// Whether the backend's remote control session should be open.
     session: SessionGate,
-    /// Last `backend.caps().inject` seen: the backend can inject now.
-    inject_ready: bool,
+    /// Last `backend.caps()` seen (`inject`: the backend can inject now).
+    caps: Capabilities,
     /// The agent is stopping (the session closes for good).
     stopping: bool,
 }
@@ -592,7 +592,7 @@ impl Core {
 
     /// Other machines may drive this one now.
     fn controllable(&self) -> bool {
-        !self.away && self.inject_ready
+        !self.away && self.caps.inject
     }
 
     fn hub_state(&self) -> HubState {
@@ -630,21 +630,24 @@ impl Core {
         self.refresh_caps();
     }
 
-    /// Reads the backend's capabilities again; when it can no longer (or
-    /// again) inject, P2P access and the hub follow.
+    /// Reads the backend's capabilities again and tells the hub when they
+    /// changed; when this machine can no longer (or again) be injected
+    /// into, P2P access follows.
     fn refresh_caps(&mut self) {
-        let ready = self.backend.caps().inject;
-        if ready == self.inject_ready {
+        let caps = self.backend.caps();
+        if caps == self.caps {
             return;
         }
-        self.inject_ready = ready;
-        if ready {
-            info!("remote control session ready: other machines can control this one");
-        } else {
-            info!("remote control session closed: other machines cannot control this one");
-            self.release_controllers();
+        let was = std::mem::replace(&mut self.caps, caps);
+        if caps.inject != was.inject {
+            if caps.inject {
+                info!("remote control session ready: other machines can control this one");
+            } else {
+                info!("remote control session closed: other machines cannot control this one");
+                self.release_controllers();
+            }
+            self.update_dir();
         }
-        self.update_dir();
         self.send_caps();
         self.publish();
     }
