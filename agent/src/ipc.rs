@@ -90,6 +90,9 @@ impl From<io::Error> for BindError {
 // ----------------------------------------------------------------------
 
 /// The status snapshot sent to clients.
+/// Shown while this machine touches no other screen in the layout.
+pub const NO_EDGES: &str = "No edges to other machines (check the layout in the dashboard).";
+
 pub fn snapshot(ctx: &IpcContext) -> Snapshot {
     let st: AgentStatus = ctx.agent.status();
     let state = ctx.agent.agent_state();
@@ -141,6 +144,9 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
     let mut warnings = Vec::new();
     if report.clipboard_warning {
         warnings.push("No clipboard access: clipboard sharing is off on this machine.".into());
+    }
+    if st.no_edges && st.connected {
+        warnings.push(NO_EDGES.into());
     }
 
     let hub_address = cfg.hub.clone().filter(|h| !h.trim().is_empty());

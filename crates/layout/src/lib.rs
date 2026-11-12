@@ -11,6 +11,10 @@
 //! * how a remotely driven (virtual) cursor moves inside a node and when it
 //!   leaves it ([`Layout::move_cursor`]).
 //!
+//! It also keeps a layout usable when a node's monitors change
+//! ([`apply_monitors`], rule in the `relayout` module) and finds layouts in
+//! which crossing cannot work ([`overlaps`], [`isolated`]).
+//!
 //! ## Proportional mapping
 //!
 //! For a crossing from node A (side S) to node B, let `seg_A` be the part
@@ -26,6 +30,9 @@
 
 use flow_proto::{Layout, NodeId, NodeLayout, Rect};
 use serde::{Deserialize, Serialize};
+
+mod relayout;
+pub use relayout::{apply_monitors, boxes_overlap, isolated, overlaps, separate_from, touching_side, Moved};
 
 /// Nodes whose facing edges are closer than this are treated as touching
 /// even if they overlap slightly.

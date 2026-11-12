@@ -12,6 +12,25 @@
 //! barriers recreates the session; barriers therefore cover every layout
 //! edge and edges to offline machines are refused at activation time.
 //!
+//! **Monitor changes.** mutter 46 (`meta-input-capture-session.c`,
+//! `on_monitors_changed`) handles every monitor change the same way for
+//! each InputCapture session: it bumps the zone serial, *disables* the
+//! session (barriers dropped, EI seat and devices forgotten; no `Disabled`
+//! signal) and emits `ZonesChanged`. xdg-desktop-portal before 1.19 (1.18.x
+//! in Ubuntu 24.04 and derivatives) never forwards `ZonesChanged` to the
+//! application, and later versions forward it in every session state. So
+//! the portal signal cannot be relied on, with or without barriers; the
+//! backend also listens to `org.gnome.Mutter.DisplayConfig`'s
+//! `MonitorsChanged` on the session bus (emitted right after the internal
+//! signal mutter's sessions react to) and, without that interface, reads
+//! the zones every [`DISPLAY_POLL`]. After a change (debounced by
+//! [`DISPLAY_SETTLE`]) it reads the zones again with `GetZones` (allowed
+//! in every state of an open session), reports them as
+//! [`LocalEvent::MonitorsChanged`] and re-arms the barriers: a session that
+//! was never enabled just gets barriers for the new zone set, an enabled
+//! one is dead and is replaced by a new session, which GNOME 46 may ask
+//! permission for again. Without edges no session is replaced.
+//!
 //! **Local cursor while capturing** (cursor-park setting): GNOME 46 cannot
 //! do "centre" or "hide", so this backend reports no cursor support and
 //! the cursor stays at the edge. From mutter's gnome-46 source: barriers
@@ -212,6 +231,7 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
             vec![Monitor { name: "default".into(), rect: Rect::new(0, 0, 1920, 1080), primary: true }]
         });
         *monitors.lock().expect("poisoned") = m;
+        watch_x11_monitors(monitors.clone(), tx.clone());
     }
     if inj.is_none() && cap.is_none() {
         return Err(anyhow!("neither the RemoteDesktop nor the InputCapture portal works in this session"));
@@ -223,6 +243,28 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
         "Wayland portal backend ready (the remote control session opens while connected to the hub)"
     );
     Ok((Arc::new(b), rx))
+}
+
+/// Without an InputCapture session there are no zones to watch: read the
+/// monitors through XWayland every [`DISPLAY_POLL`] and report changes,
+/// until the agent drops the backend.
+fn watch_x11_monitors(monitors: Arc<Mutex<Vec<Monitor>>>, tx: EventTx) {
+    let spawned = std::thread::Builder::new().name("xwayland-monitors".into()).spawn(move || loop {
+        std::thread::sleep(DISPLAY_POLL);
+        if tx.is_closed() {
+            return;
+        }
+        let Ok(m) = x11_monitors() else { continue };
+        let mut cur = monitors.lock().expect("poisoned");
+        if !m.is_empty() && *cur != m {
+            *cur = m.clone();
+            drop(cur);
+            let _ = tx.send(LocalEvent::MonitorsChanged(m));
+        }
+    });
+    if let Err(e) = spawned {
+        warn!("cannot watch the monitors: {e}");
+    }
 }
 
 fn x11_monitors() -> Result<Vec<Monitor>> {
@@ -309,6 +351,70 @@ impl Backend for WaylandBackend {
             c.set(content);
         }
     }
+}
+
+/// How often the zones are read when GNOME's display configuration
+/// interface is missing (other compositors).
+const DISPLAY_POLL: Duration = Duration::from_secs(10);
+/// Quiet time after a monitor change before the zones are read: docking
+/// sends a burst of changes, and a session re-created in the middle of it
+/// would be disabled again.
+const DISPLAY_SETTLE: Duration = Duration::from_millis(1000);
+const DISPLAY_CONFIG: &str = "org.gnome.Mutter.DisplayConfig";
+const DISPLAY_CONFIG_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
+
+/// Something may have changed the monitors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DisplayTick {
+    /// The compositor said so (DisplayConfig or the portal's ZonesChanged).
+    Changed,
+    /// Periodic check, without a hint.
+    Poll,
+}
+
+/// Where monitor changes come from: GNOME's DisplayConfig signal, or a
+/// timer.
+async fn display_watch() -> LocalBoxStream<'static, DisplayTick> {
+    let watch = match session_bus().await {
+        Ok(conn) => mutter_monitors_changed(&conn).await,
+        Err(e) => Err(e),
+    };
+    match watch {
+        Ok(s) => {
+            info!("watching GNOME's display configuration for monitor changes");
+            s
+        }
+        Err(e) => {
+            info!("no GNOME display configuration ({e:#}); reading the capture zones every {DISPLAY_POLL:?}");
+            poll_ticks()
+        }
+    }
+}
+
+fn poll_ticks() -> LocalBoxStream<'static, DisplayTick> {
+    futures_util::stream::unfold((), |()| async {
+        tokio::time::sleep(DISPLAY_POLL).await;
+        Some((DisplayTick::Poll, ()))
+    })
+    .boxed_local()
+}
+
+async fn mutter_monitors_changed(conn: &ashpd::zbus::Connection) -> Result<LocalBoxStream<'static, DisplayTick>> {
+    use ashpd::zbus;
+    let dbus = zbus::fdo::DBusProxy::new(conn).await?;
+    let name = zbus::names::BusName::try_from(DISPLAY_CONFIG)?;
+    if !dbus.name_has_owner(name).await? {
+        return Err(anyhow!("{DISPLAY_CONFIG} is not on the session bus"));
+    }
+    let proxy = zbus::Proxy::new(conn, DISPLAY_CONFIG, DISPLAY_CONFIG_PATH, DISPLAY_CONFIG).await?;
+    let signals = proxy.receive_signal("MonitorsChanged").await?;
+    // The stream keeps the proxy (and its connection) alive.
+    Ok(signals
+        .map(move |_| {
+            let _ = &proxy;
+            DisplayTick::Changed
+        })
+        .boxed_local())
 }
 
 fn now_us() -> u64 {
@@ -983,7 +1089,11 @@ trait CapturePortal {
     /// Sets pointer barriers for `edges`; returns barrier id → side.
     async fn set_barriers(&mut self, edges: &[Edge]) -> Result<HashMap<u32, Side>>;
     async fn enable(&mut self) -> Result<()>;
+    /// Turns capture off; on GNOME 46 the session cannot be enabled again.
+    async fn disable(&mut self) -> Result<()>;
     async fn release(&mut self, activation_id: Option<u32>, pos: Option<(f64, f64)>) -> Result<()>;
+    /// Reads the zones again (also refreshes the zone set the barriers
+    /// refer to).
     async fn zones(&mut self) -> Result<Vec<Monitor>>;
     /// Next event of the open session, `None` once the session is gone (EI
     /// stream closed or failed, portal signals ended). Must be cancel-safe.
@@ -998,7 +1108,8 @@ async fn start_capture(tx: EventTx, monitors: Arc<Mutex<Vec<Monitor>>>) -> Resul
             Ok(m) => {
                 *monitors.lock().expect("poisoned") = m;
                 let _ = ready.send(Ok(()));
-                run_capture(portal, cmd_rx, tx, monitors).await;
+                let display = display_watch().await;
+                run_capture(portal, cmd_rx, tx, monitors, display).await;
             }
             Err(e) => {
                 let _ = ready.send(Err(e));
@@ -1116,6 +1227,11 @@ impl CapturePortal for PortalCapture {
         bounded("InputCapture.Enable", l.ic.enable(&l.session, Default::default())).await
     }
 
+    async fn disable(&mut self) -> Result<()> {
+        let l = self.live()?;
+        bounded("InputCapture.Disable", l.ic.disable(&l.session, Default::default())).await
+    }
+
     async fn release(&mut self, activation_id: Option<u32>, pos: Option<(f64, f64)>) -> Result<()> {
         let l = self.live()?;
         let opts = ReleaseOptions::default().set_activation_id(activation_id).set_cursor_position(pos);
@@ -1204,7 +1320,10 @@ struct Capture<P> {
     cmds: mpsc::UnboundedReceiver<CapCmd>,
     tx: EventTx,
     monitors: Arc<Mutex<Vec<Monitor>>>,
+    /// Edges the core wants barriers for.
     edges: Vec<Edge>,
+    /// Edges of the barriers of the enabled session.
+    armed: Vec<Edge>,
     ids: HashMap<u32, Side>,
     /// The portal has a live session.
     open: bool,
@@ -1221,6 +1340,11 @@ struct Capture<P> {
     /// When the current session was created; a session that lived longer
     /// than [`RETRY_MAX`] resets the backoff when it is lost.
     opened_at: Instant,
+    /// Monitor change hints.
+    display: LocalBoxStream<'static, DisplayTick>,
+    /// When to read the zones after a hint, and whether the compositor
+    /// said they changed (an enabled session is then dead on GNOME).
+    display_due: Option<(Instant, bool)>,
 }
 
 /// Runs the capture loop until the backend is dropped. The portal must have
@@ -1232,6 +1356,7 @@ async fn run_capture<P: CapturePortal>(
     cmds: mpsc::UnboundedReceiver<CapCmd>,
     tx: EventTx,
     monitors: Arc<Mutex<Vec<Monitor>>>,
+    display: LocalBoxStream<'static, DisplayTick>,
 ) {
     let mut c = Capture {
         portal,
@@ -1239,6 +1364,7 @@ async fn run_capture<P: CapturePortal>(
         tx,
         monitors,
         edges: Vec::new(),
+        armed: Vec::new(),
         ids: HashMap::new(),
         open: true,
         enabled: false,
@@ -1248,9 +1374,12 @@ async fn run_capture<P: CapturePortal>(
         backoff: Backoff::default(),
         retry_at: None,
         opened_at: Instant::now(),
+        display,
+        display_due: None,
     };
     loop {
         let retry_at = c.retry_at;
+        let display_due = c.display_due.map(|(at, _)| at);
         tokio::select! {
             cmd = c.cmds.recv() => match cmd {
                 None => {
@@ -1268,6 +1397,14 @@ async fn run_capture<P: CapturePortal>(
                 c.retry_at = None;
                 c.reopen().await;
             }
+            tick = c.display.next() => match tick {
+                Some(t) => c.display_hint(t),
+                // The bus connection is gone: fall back to polling.
+                None => c.display = poll_ticks(),
+            },
+            _ = tokio::time::sleep_until(display_due.unwrap_or_else(Instant::now)), if display_due.is_some() => {
+                c.display_changed().await;
+            }
         }
     }
 }
@@ -1278,30 +1415,127 @@ impl<P: CapturePortal> Capture<P> {
             return;
         }
         self.edges = new;
+        if self.display_due.is_some() {
+            // The monitors are about to be read again; arm after that.
+            return;
+        }
+        self.sync().await;
+    }
+
+    /// Brings the session in line with `edges`: barriers for them on an
+    /// enabled session, nothing armed without edges. Creates a new session
+    /// only when there are edges and the current one cannot take them
+    /// (enabled with other barriers, or turned off: GNOME 46 cannot enable
+    /// a session twice).
+    async fn sync(&mut self) {
         if !self.open {
             // Applied when the session is back.
             return;
         }
+        if self.edges.is_empty() {
+            if self.enabled {
+                // Nothing to capture. Turning it off ends the session's use;
+                // the next edges get a new one (no dialog until then).
+                self.end_active();
+                if let Err(e) = self.portal.disable().await {
+                    warn!("disabling input capture failed: {e:#}");
+                }
+                self.enabled = false;
+                self.stale = true;
+                self.armed.clear();
+            }
+            return;
+        }
+        if self.enabled && self.armed == self.edges {
+            return;
+        }
         if self.enabled || self.stale {
-            // GNOME 46 cannot re-enable a disabled session: start a new one.
-            // Closing the old one ends a capture in progress.
+            // Closing the old session ends a capture in progress.
             self.end_active();
             match self.portal.open().await {
                 Ok(m) => {
                     self.enabled = false;
                     self.stale = false;
+                    self.armed.clear();
                     self.opened_at = Instant::now();
-                    *self.monitors.lock().expect("poisoned") = m;
                     self.take_queued_edges();
+                    self.store_monitors(m);
                 }
                 Err(e) => {
                     self.open = false;
+                    self.enabled = false;
                     self.open_failed(e, "re-creating the capture session failed");
                     return;
                 }
             }
         }
         self.apply_edges().await;
+    }
+
+    /// Remembers the zones of the session as this machine's monitors and
+    /// reports a change.
+    fn store_monitors(&mut self, m: Vec<Monitor>) {
+        if m.is_empty() {
+            debug!("the compositor reported no zones; keeping the last monitors");
+            return;
+        }
+        let mut cur = self.monitors.lock().expect("poisoned");
+        if *cur != m {
+            *cur = m.clone();
+            drop(cur);
+            let _ = self.tx.send(LocalEvent::MonitorsChanged(m));
+        }
+    }
+
+    /// A hint that the monitors may have changed: read the zones once the
+    /// burst is over.
+    fn display_hint(&mut self, t: DisplayTick) {
+        let said = t == DisplayTick::Changed;
+        let settle = if said { DISPLAY_SETTLE } else { Duration::ZERO };
+        let said = said || self.display_due.is_some_and(|(_, s)| s);
+        debug!(?t, "monitor change hint");
+        self.display_due = Some((Instant::now() + settle, said));
+    }
+
+    /// Reads the zones after a hint, reports new monitors and re-arms the
+    /// barriers where the change took them down.
+    async fn display_changed(&mut self) {
+        let Some((_, said)) = self.display_due.take() else { return };
+        if !self.open {
+            // A new session reads the zones when it opens.
+            return;
+        }
+        let zones = match self.portal.zones().await {
+            Ok(z) => z,
+            Err(e) => {
+                warn!("reading the capture zones failed: {e:#}");
+                return;
+            }
+        };
+        let changed = !zones.is_empty() && *self.monitors.lock().expect("poisoned") != zones;
+        if changed {
+            let rects: Vec<String> =
+                zones.iter().map(|m| format!("{}x{}@{},{}", m.rect.w, m.rect.h, m.rect.x, m.rect.y)).collect();
+            info!(?rects, "the monitors changed");
+        }
+        if self.enabled && (said || changed) {
+            // mutter disables every enabled session on a monitor change.
+            info!(
+                "GNOME turned input capture off with the monitor change; a new capture session takes the barriers \
+                 (GNOME may ask for permission again)"
+            );
+            self.enabled = false;
+            self.stale = true;
+            self.armed.clear();
+            self.end_active();
+        }
+        self.store_monitors(zones);
+        if changed {
+            // The core answers MonitorsChanged with the edges of the new
+            // layout; `set_edges` arms them.
+            return;
+        }
+        self.sync().await;
     }
 
     /// Opening a session may wait for a permission dialog; edge updates
@@ -1320,18 +1554,35 @@ impl<P: CapturePortal> Capture<P> {
     /// Sets the barriers for the current edges and enables capture.
     async fn apply_edges(&mut self) {
         self.enabled = false;
+        self.armed.clear();
         if self.edges.is_empty() {
             return;
         }
-        match self.portal.set_barriers(&self.edges).await {
-            Ok(m) => self.ids = m,
+        let ids = match self.portal.set_barriers(&self.edges).await {
+            Ok(m) => m,
             Err(e) => {
-                warn!("setting pointer barriers failed: {e:#}");
-                return;
+                // Barriers refer to a zone set; after an unnoticed monitor
+                // change it is out of date. Read the zones and try once more.
+                debug!("setting pointer barriers failed ({e:#}); reading the zones again");
+                match self.portal.zones().await {
+                    Ok(z) => self.store_monitors(z),
+                    Err(e) => warn!("reading the capture zones failed: {e:#}"),
+                }
+                match self.portal.set_barriers(&self.edges).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("setting pointer barriers failed: {e:#}");
+                        return;
+                    }
+                }
             }
-        }
+        };
+        self.ids = ids;
         match self.portal.enable().await {
-            Ok(()) => self.enabled = true,
+            Ok(()) => {
+                self.enabled = true;
+                self.armed = self.edges.clone();
+            }
             Err(e) => warn!("enabling input capture failed: {e:#}"),
         }
     }
@@ -1369,15 +1620,10 @@ impl<P: CapturePortal> Capture<P> {
                 );
                 self.enabled = false;
                 self.stale = true;
+                self.armed.clear();
                 self.end_active();
             }
-            CapEvent::ZonesChanged => match self.portal.zones().await {
-                Ok(m) => {
-                    *self.monitors.lock().expect("poisoned") = m.clone();
-                    let _ = self.tx.send(LocalEvent::MonitorsChanged(m));
-                }
-                Err(e) => warn!("reading the capture zones failed: {e:#}"),
-            },
+            CapEvent::ZonesChanged => self.display_hint(DisplayTick::Changed),
             CapEvent::Input(le) => {
                 if self.active.is_some() {
                     let _ = self.tx.send(le);
@@ -1402,6 +1648,7 @@ impl<P: CapturePortal> Capture<P> {
         self.open = false;
         self.enabled = false;
         self.stale = false;
+        self.armed.clear();
         self.ids.clear();
         self.end_active();
         self.portal.close().await;
@@ -1432,11 +1679,7 @@ impl<P: CapturePortal> Capture<P> {
                 crate::problems::clear(PROBLEM_IC);
                 self.opened_at = Instant::now();
                 self.take_queued_edges();
-                let changed = *self.monitors.lock().expect("poisoned") != m;
-                *self.monitors.lock().expect("poisoned") = m.clone();
-                if changed {
-                    let _ = self.tx.send(LocalEvent::MonitorsChanged(m));
-                }
+                self.store_monitors(m);
                 self.apply_edges().await;
             }
             Err(e) => self.open_failed(e, "re-creating the capture session failed"),
@@ -1491,10 +1734,20 @@ mod tests {
         sessions: mpsc::UnboundedReceiver<Result<mpsc::UnboundedReceiver<CapEvent>>>,
         current: Option<mpsc::UnboundedReceiver<CapEvent>>,
         log: Arc<Mutex<Vec<String>>>,
+        /// What GetZones returns (the "compositor's" monitors).
+        zones: Arc<Mutex<Vec<Monitor>>>,
+        /// Barriers refer to a zone set; GetZones brings it up to date.
+        zone_set_stale: Arc<AtomicBool>,
     }
 
     fn monitor() -> Vec<Monitor> {
         vec![Monitor { name: "zone-0".into(), rect: Rect::new(0, 0, 1920, 1080), primary: true }]
+    }
+
+    fn docked() -> Vec<Monitor> {
+        let mut m = monitor();
+        m.push(Monitor { name: "zone-1".into(), rect: Rect::new(1920, 0, 2560, 1440), primary: false });
+        m
     }
 
     impl FakePortal {
@@ -1511,13 +1764,18 @@ mod tests {
             // decides the outcome.
             let s = self.sessions.recv().await.unwrap_or_else(|| Err(anyhow!("portal gone")))?;
             self.current = Some(s);
-            Ok(monitor())
+            self.zone_set_stale.store(false, Ordering::SeqCst);
+            Ok(self.zones.lock().unwrap().clone())
         }
         async fn close(&mut self) {
             self.note("close");
             self.current = None;
         }
         async fn set_barriers(&mut self, edges: &[Edge]) -> Result<HashMap<u32, Side>> {
+            if self.zone_set_stale.load(Ordering::SeqCst) {
+                self.note("barriers refused");
+                return Err(anyhow!("State out of date"));
+            }
             self.note(format!("barriers {}", edges.len()));
             Ok(edges.iter().enumerate().map(|(i, e)| (i as u32 + 1, e.side)).collect())
         }
@@ -1525,12 +1783,18 @@ mod tests {
             self.note("enable");
             Ok(())
         }
+        async fn disable(&mut self) -> Result<()> {
+            self.note("disable");
+            Ok(())
+        }
         async fn release(&mut self, _: Option<u32>, _: Option<(f64, f64)>) -> Result<()> {
             self.note("release");
             Ok(())
         }
         async fn zones(&mut self) -> Result<Vec<Monitor>> {
-            Ok(monitor())
+            self.note("zones");
+            self.zone_set_stale.store(false, Ordering::SeqCst);
+            Ok(self.zones.lock().unwrap().clone())
         }
         async fn next_event(&mut self) -> Option<CapEvent> {
             self.current.as_mut()?.recv().await
@@ -1542,6 +1806,9 @@ mod tests {
         sessions: mpsc::UnboundedSender<Result<mpsc::UnboundedReceiver<CapEvent>>>,
         events: EventRx,
         log: Arc<Mutex<Vec<String>>>,
+        zones: Arc<Mutex<Vec<Monitor>>>,
+        zone_set_stale: Arc<AtomicBool>,
+        display: mpsc::UnboundedSender<DisplayTick>,
     }
 
     impl Rig {
@@ -1551,11 +1818,45 @@ mod tests {
             let (sessions, sessions_rx) = mpsc::unbounded_channel();
             let (first, first_rx) = mpsc::unbounded_channel();
             let log = Arc::new(Mutex::new(Vec::new()));
-            let portal = FakePortal { sessions: sessions_rx, current: Some(first_rx), log: log.clone() };
+            let zones = Arc::new(Mutex::new(monitor()));
+            let zone_set_stale = Arc::new(AtomicBool::new(false));
+            let portal = FakePortal {
+                sessions: sessions_rx,
+                current: Some(first_rx),
+                log: log.clone(),
+                zones: zones.clone(),
+                zone_set_stale: zone_set_stale.clone(),
+            };
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
             let (tx, events) = mpsc::unbounded_channel();
-            tokio::task::spawn_local(run_capture(portal, cmds_rx, tx, Arc::new(Mutex::new(monitor()))));
-            (Rig { cmds, sessions, events, log }, first)
+            let (display, display_rx) = mpsc::unbounded_channel();
+            let ticks = futures_util::stream::unfold(display_rx, |mut r| async move {
+                let t = r.recv().await?;
+                Some((t, r))
+            })
+            .boxed_local();
+            tokio::task::spawn_local(run_capture(portal, cmds_rx, tx, Arc::new(Mutex::new(monitor())), ticks));
+            (Rig { cmds, sessions, events, log, zones, zone_set_stale, display }, first)
+        }
+
+        /// The "compositor" changes its monitors: like mutter, the zone set
+        /// the barriers refer to is out of date from now on.
+        fn set_zones(&self, m: Vec<Monitor>) {
+            *self.zones.lock().unwrap() = m;
+            self.zone_set_stale.store(true, Ordering::SeqCst);
+        }
+
+        /// A monitor change hint, then the settle time.
+        async fn hint(&self, t: DisplayTick) {
+            self.display.send(t).unwrap();
+            self.settle().await;
+            tokio::time::sleep(DISPLAY_SETTLE).await;
+            self.settle().await;
+        }
+
+        /// No event pending for the core.
+        fn no_event(&mut self) {
+            assert!(self.events.try_recv().is_err(), "unexpected event");
         }
 
         fn new_session(&self) -> mpsc::UnboundedSender<CapEvent> {
@@ -2048,7 +2349,9 @@ mod tests {
             rig.take_log();
             // A layout change re-creates the session; the dialog is open
             // while two more updates arrive.
-            rig.cmds.send(CapCmd::SetEdges(vec![])).unwrap();
+            rig.cmds
+                .send(CapCmd::SetEdges(vec![Edge { side: Side::Top, pos: 0, start: 0, end: 1920, to: NodeId(4) }]))
+                .unwrap();
             rig.settle().await;
             let mut two = right_edge();
             two.push(Edge { side: Side::Left, pos: 0, start: 0, end: 1080, to: NodeId(3) });
@@ -2064,5 +2367,192 @@ mod tests {
             assert_eq!(rig.next().await, LocalEvent::EdgeHit { side: Side::Left, x: 0, y: 9 });
         })
         .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn monitors_are_read_again_without_barriers_and_no_session_is_replaced() {
+        // The owner's case: no edges, so the session was never enabled, and
+        // the portal (1.18) never forwards ZonesChanged. GNOME's
+        // DisplayConfig says the monitors changed.
+        local(async {
+            let (mut rig, _first) = Rig::start();
+            rig.set_zones(docked());
+            rig.hint(DisplayTick::Changed).await;
+            assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(docked()));
+            assert_eq!(rig.take_log(), ["zones"], "read, nothing re-created");
+            // Unplugged again.
+            rig.set_zones(monitor());
+            rig.hint(DisplayTick::Changed).await;
+            assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(monitor()));
+            // The hub's new layout has an edge: the same (never enabled)
+            // session takes the barriers, no dialog.
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["zones", "barriers 1", "enable"]);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn polling_finds_a_change_and_a_stale_zone_set_is_refreshed() {
+        // No DisplayConfig (another compositor): the periodic check.
+        local(async {
+            let (mut rig, _first) = Rig::start();
+            rig.hint(DisplayTick::Poll).await;
+            rig.no_event();
+            assert_eq!(rig.take_log(), ["zones"]);
+            // A change between two checks: the barriers are refused for the
+            // old zone set, the zones are read and the barriers set again.
+            rig.set_zones(docked());
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["barriers refused", "zones", "barriers 1", "enable"]);
+            assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(docked()));
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_enabled_session_is_replaced_after_a_monitor_change() {
+        local(async {
+            let (mut rig, first) = Rig::start();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            first.send(activated()).unwrap();
+            assert!(matches!(rig.next().await, LocalEvent::EdgeHit { .. }));
+            rig.take_log();
+            // Docking while controlling another machine: GNOME disabled the
+            // session, capture ends; the zones are read after the burst.
+            rig.set_zones(docked());
+            rig.display.send(DisplayTick::Changed).unwrap();
+            rig.settle().await;
+            rig.display.send(DisplayTick::Changed).unwrap();
+            rig.settle().await;
+            tokio::time::sleep(DISPLAY_SETTLE).await;
+            rig.settle().await;
+            assert_eq!(rig.next().await, LocalEvent::CaptureEnded);
+            assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(docked()));
+            assert_eq!(rig.take_log(), ["zones"], "one read for the burst, waits for the new edges");
+            // The core sends the edges of the new layout: a new session.
+            let _second = rig.new_session();
+            let moved = vec![Edge { side: Side::Right, pos: 4480, start: 0, end: 1440, to: NodeId(2) }];
+            rig.cmds.send(CapCmd::SetEdges(moved.clone())).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+            // The hub's layout gives the same edges: nothing more.
+            rig.cmds.send(CapCmd::SetEdges(moved)).unwrap();
+            rig.settle().await;
+            assert!(rig.log().is_empty(), "{:?}", rig.log());
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_monitors_after_a_change_signal_re_arm_at_once() {
+        // GNOME reconfigured (e.g. a mode change) without changing the
+        // zones: the enabled session is dead all the same, and no new
+        // layout will come, so the session is replaced right away.
+        local(async {
+            let (mut rig, _first) = Rig::start();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            rig.take_log();
+            let _second = rig.new_session();
+            rig.hint(DisplayTick::Changed).await;
+            rig.no_event();
+            assert_eq!(rig.take_log(), ["zones", "open", "barriers 1", "enable"]);
+            // A poll that finds nothing new leaves it alone.
+            rig.hint(DisplayTick::Poll).await;
+            assert_eq!(rig.take_log(), ["zones"]);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_edges_turns_capture_off_and_asks_for_nothing_until_edges_return() {
+        local(async {
+            let (rig, _first) = Rig::start();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            rig.take_log();
+            rig.cmds.send(CapCmd::SetEdges(vec![])).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["disable"]);
+            // A monitor change meanwhile: read, no session.
+            rig.set_zones(docked());
+            rig.hint(DisplayTick::Changed).await;
+            assert_eq!(rig.take_log(), ["zones"]);
+            // Edges again: now a new session (GNOME cannot enable it twice).
+            let _second = rig.new_session();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_portal_zones_changed_signal_is_handled_like_display_config() {
+        local(async {
+            let (mut rig, first) = Rig::start();
+            rig.set_zones(docked());
+            first.send(CapEvent::ZonesChanged).unwrap();
+            rig.settle().await;
+            tokio::time::sleep(DISPLAY_SETTLE).await;
+            rig.settle().await;
+            assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(docked()));
+            // Edges that arrive while the zones are about to be read are
+            // armed after reading them, on the new zone set.
+            rig.take_log();
+            rig.set_zones(monitor());
+            first.send(CapEvent::ZonesChanged).unwrap();
+            rig.settle().await;
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            assert!(rig.log().is_empty(), "{:?}", rig.log());
+            tokio::time::sleep(DISPLAY_SETTLE).await;
+            rig.settle().await;
+            assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(monitor()));
+            assert_eq!(rig.take_log(), ["zones"], "waits for the core's edges for the new monitors");
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["barriers 1", "enable"]);
+        })
+        .await
+    }
+
+    #[test]
+    fn display_config_monitors_changed_reaches_the_watch() {
+        // A private bus with a stand-in for mutter's DisplayConfig.
+        let Ok(mut daemon) = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("dbus-daemon not available, skipping");
+            return;
+        };
+        let mut addr = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(daemon.stdout.take().unwrap()), &mut addr).unwrap();
+        let addr = addr.trim().to_string();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result: Result<()> = rt.block_on(async {
+            let connect = || ashpd::zbus::connection::Builder::address(addr.as_str()).build();
+            let agent = connect().await?;
+            // Not on the bus (another desktop): no watch, the caller polls.
+            assert!(mutter_monitors_changed(&agent).await.is_err());
+            let mutter = connect().await?;
+            mutter.request_name(DISPLAY_CONFIG).await?;
+            let mut ticks = mutter_monitors_changed(&agent).await?;
+            // A signal of another name does not count; MonitorsChanged does.
+            mutter.emit_signal(None::<&str>, DISPLAY_CONFIG_PATH, DISPLAY_CONFIG, "Other", &()).await?;
+            mutter.emit_signal(None::<&str>, DISPLAY_CONFIG_PATH, DISPLAY_CONFIG, "MonitorsChanged", &()).await?;
+            let t = tokio::time::timeout(Duration::from_secs(5), ticks.next()).await?;
+            assert_eq!(t, Some(DisplayTick::Changed));
+            Ok(())
+        });
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        result.unwrap();
     }
 }

@@ -106,6 +106,12 @@ impl SimControl {
         self.state.lock().unwrap().clipboard = Some(c.clone());
         self.emit(LocalEvent::Clipboard(c));
     }
+    /// The user plugs in or unplugs a monitor (or rearranges them): the
+    /// backend reports the new set like the real ones do.
+    pub fn set_monitors(&self, m: Vec<Monitor>) {
+        self.state.lock().unwrap().monitors = m.clone();
+        self.emit(LocalEvent::MonitorsChanged(m));
+    }
     pub fn take_injected(&self) -> Vec<Action> {
         std::mem::take(&mut self.state.lock().unwrap().injected)
     }

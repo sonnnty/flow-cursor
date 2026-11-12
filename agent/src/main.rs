@@ -446,6 +446,9 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
     for p in &s.problems {
         println!("problem:          {p}");
     }
+    for w in &s.warnings {
+        println!("warning:          {w}");
+    }
     let u = &s.update;
     let mut line = format!("{} (policy {})", u.state, if u.policy.is_empty() { "-" } else { &u.policy });
     if let Some(a) = &u.available {

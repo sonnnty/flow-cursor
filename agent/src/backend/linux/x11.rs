@@ -81,7 +81,12 @@ pub async fn create(_opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx
             ],
         }],
     )?;
-    conn.randr_select_input(root, x11rb::protocol::randr::NotifyMask::SCREEN_CHANGE)?;
+    // Screen size changes alone miss a monitor moved, rotated or swapped
+    // within the same root size: CRTC and output changes cover those.
+    {
+        use x11rb::protocol::randr::NotifyMask;
+        conn.randr_select_input(root, NotifyMask::SCREEN_CHANGE | NotifyMask::CRTC_CHANGE | NotifyMask::OUTPUT_CHANGE)?;
+    }
     conn.flush()?;
     let shared = Arc::new(Mutex::new(Shared { monitors: read_monitors(&conn, root)?, ..Default::default() }));
 
@@ -244,11 +249,20 @@ fn event_loop(conn: &RustConnection, root: Window, shared: &Mutex<Shared>, tx: &
                     _ => {}
                 }
             }
-            Event::RandrScreenChangeNotify(_) => {
-                let m = read_monitors(conn, root)?;
-                shared.lock().expect("poisoned").monitors = m.clone();
-                let _ = tx.send(LocalEvent::MonitorsChanged(m));
-            }
+            Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => match read_monitors(conn, root) {
+                // One change sends several notifications: report each new
+                // configuration once.
+                Ok(m) if !m.is_empty() => {
+                    let mut sh = shared.lock().expect("poisoned");
+                    if sh.monitors != m {
+                        sh.monitors = m.clone();
+                        drop(sh);
+                        let _ = tx.send(LocalEvent::MonitorsChanged(m));
+                    }
+                }
+                Ok(_) => debug!("RandR reports no monitors; keeping the last ones"),
+                Err(e) => warn!("reading the monitors after a RandR change failed: {e:#}"),
+            },
             _ => {}
         }
     }
