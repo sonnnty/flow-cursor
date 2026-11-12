@@ -65,6 +65,10 @@
   td input.name { width:100%; max-width:170px; min-width:90px; }
   textarea { width:100%; max-width:360px; resize:vertical; }
   .node.focus rect.mon { stroke:var(--acc); stroke-width:2; }
+  .node.issue rect.mon { stroke:var(--bad); stroke-width:2; }
+  #layoutwarn { flex:none; margin-top:6px; display:flex; flex-direction:column; gap:2px; max-height:72px; overflow:auto; }
+  #layoutwarn:empty { display:none; }
+  #layoutwarn .lw, .hint.bad { color:var(--bad); font-size:12px; }
   .node text { fill:var(--fg); font-size:12px; pointer-events:none; }
   .node { cursor:grab; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
@@ -117,6 +121,7 @@
   <div class="card">
     <h2>Screen layout</h2>
     <svg id="layout"></svg>
+    <div id="layoutwarn" role="status"></div>
     <div class="row actions"><button class="btn primary" id="savelayout" disabled>Save layout</button><button class="btn" id="resetlayout" disabled>Undo changes</button><span class="hint">Drag machines; edges snap together. Edges that touch another machine switch the pointer.</span></div>
   </div>
   <div class="col">
@@ -238,9 +243,19 @@ function renderNodes() {
       try { await api("DELETE", "/nodes/" + n.id); toast("Removed " + n.name); refresh(); } catch (e) { toast(e.message, true); }
     });
     const caps = [n.caps.capture ? "capture" : null, n.caps.inject ? "inject" : null, n.caps.clipboard ? "clipboard" : null].filter(Boolean).join(", ");
-    tb.append(el("tr", {}, el("td", {}, name, el("div", { class: "hint" }, n.hostname + (n.remote ? " · " + n.remote : ""))), el("td", {}, status, why ? el("div", { class: "hint" }, why) : "", el("div", { class: "hint" }, caps), ctl ? el("div", { class: "hint" }, ctl) : ""), el("td", { class: "ver" }, n.os, el("span", { class: "hint" }, " · " + mons), ...versionCell(n)), el("td", {}, speed), el("td", {}, en), el("td", {}, rm)));
+    const lw = layoutNote(n);
+    tb.append(el("tr", {}, el("td", {}, name, el("div", { class: "hint" }, n.hostname + (n.remote ? " · " + n.remote : ""))), el("td", {}, status, why ? el("div", { class: "hint" }, why) : "", el("div", { class: "hint" }, caps), ctl ? el("div", { class: "hint" }, ctl) : "", lw ? el("div", { class: "hint bad", title: lw.title }, "⚠ " + lw.short) : ""), el("td", { class: "ver" }, n.os, el("span", { class: "hint" }, " · " + mons), ...versionCell(n)), el("td", {}, speed), el("td", {}, en), el("td", {}, rm)));
   }
   if (!state.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 6, class: "hint" }, "No machines yet. Run flow-agent join <token> on a computer.")));
+}
+// The saved layout's problem for a machine row (from the hub).
+function layoutNote(n) {
+  for (const w of state.layout_warnings || []) {
+    if (!w.nodes.includes(n.id)) continue;
+    if (w.kind === "overlap") return { short: "overlaps " + nameOf(w.nodes.find(id => id !== n.id)) + ": no edge", title: w.text };
+    return { short: "touches no other screen", title: w.text };
+  }
+  return null;
 }
 // Agent version, update state and the "Update now" button of a machine.
 const UPD = { auto: "automatic", notify: "notify", off: "off" };
@@ -321,8 +336,47 @@ function bbox(n, p) {
   if (!n.monitors.length) { x0 = 0; y0 = 0; x1 = 1920; y1 = 1080; }
   return { x: p.x + x0, y: p.y + y0, w: x1 - x0, h: y1 - y0, lx: x0, ly: y0 };
 }
+// Why crossing cannot work: the hub's warnings for the saved layout, or,
+// while machines are being dragged, the same two rules on the unsaved
+// positions (boxes overlapping by more than 4 px both ways; a connected
+// machine with no other machine beyond any of its sides).
+const TOUCH_TOL = 4;
+function layoutIssues() {
+  if (!dirty) return state.layout_warnings || [];
+  const nodes = state.nodes.filter(n => n.enabled && n.monitors.length);
+  const box = (n) => bbox(n, pos[n.id]);
+  const span = (a0, a1, b0, b1) => Math.min(a1, b1) - Math.max(a0, b0);
+  const out = [];
+  for (let i = 0; i < nodes.length; i++) for (let j = i + 1; j < nodes.length; j++) {
+    const a = box(nodes[i]), b = box(nodes[j]);
+    if (span(a.x, a.x + a.w, b.x, b.x + b.w) > TOUCH_TOL && span(a.y, a.y + a.h, b.y, b.y + b.h) > TOUCH_TOL) {
+      const [x, y] = nodes[i].id < nodes[j].id ? [nodes[i], nodes[j]] : [nodes[j], nodes[i]];
+      out.push({ kind: "overlap", nodes: [x.id, y.id], text: `${x.name} and ${y.name} overlap, so the pointer cannot cross between them: drag them apart until their edges touch.` });
+    }
+  }
+  const overlapping = new Set(out.flatMap(w => w.nodes));
+  const leads = (a, b) => {
+    const v = span(a.y, a.y + a.h, b.y, b.y + b.h) > 0, h = span(a.x, a.x + a.w, b.x, b.x + b.w) > 0;
+    return (v && (b.x - (a.x + a.w) >= -TOUCH_TOL || a.x - (b.x + b.w) >= -TOUCH_TOL)) || (h && (b.y - (a.y + a.h) >= -TOUCH_TOL || a.y - (b.y + b.h) >= -TOUCH_TOL));
+  };
+  if (nodes.length > 1) for (const n of nodes) {
+    if (overlapping.has(n.id) || !(n.status === "online" || n.status === "away")) continue;
+    if (!nodes.some(o => o.id !== n.id && leads(box(n), box(o)))) out.push({ kind: "no_edge", nodes: [n.id], text: `${n.name} does not touch any other screen: drag it next to one.` });
+  }
+  return out;
+}
+function renderLayoutWarnings(issues) {
+  const box = $("layoutwarn");
+  const lines = issues.map(w => el("div", { class: "lw" }, "⚠ " + w.text + (dirty ? " (unsaved)" : "")));
+  const r = state.last_relayout;
+  if (r && !dirty && state.now - r.at < 600) {
+    const ago = Math.max(0, Math.floor((state.now - r.at) / 60));
+    lines.push(el("div", { class: "hint" }, "↻ " + r.text + (ago ? ` (${ago} min ago)` : " (just now)")));
+  }
+  box.replaceChildren(...lines);
+}
 function renderLayout() {
-  const svg = $("layout"); svg.replaceChildren();
+  const svg = $("layout"); svg.replaceChildren(); $("layoutwarn").replaceChildren();
   const W = svg.clientWidth || 800, H = svg.clientHeight || 380;
   const nodes = state.nodes.filter(n => n.enabled);
   if (!nodes.length) return;
@@ -333,10 +387,12 @@ function renderLayout() {
     view = { s, ox: (W - (x1 - x0) * s) / 2 - x0 * s, oy: (H - (y1 - y0) * s) / 2 - y0 * s };
   }
   const focused = new Set(state.focus.map(f => f.target));
+  const issues = layoutIssues(), bad = new Set(issues.flatMap(w => w.nodes));
+  renderLayoutWarnings(issues);
   for (const n of nodes) {
     const p = pos[n.id];
     const g = document.createElementNS(SVGNS, "g");
-    g.setAttribute("class", "node" + ({ offline: " offline", away: " away" }[n.status] || "") + (focused.has(n.id) ? " focus" : ""));
+    g.setAttribute("class", "node" + ({ offline: " offline", away: " away" }[n.status] || "") + (focused.has(n.id) ? " focus" : "") + (bad.has(n.id) ? " issue" : ""));
     g.setAttribute("transform", `translate(${view.ox + p.x * view.s},${view.oy + p.y * view.s})`);
     const mons = n.monitors.length ? n.monitors : [{ rect: { x: 0, y: 0, w: 1920, h: 1080 }, name: "?" }];
     for (const m of mons) {
