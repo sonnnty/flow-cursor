@@ -14,6 +14,10 @@
 | dashboard ขึ้น *no agent builds in this hub* | hub สร้างด้วย `compose --build` ให้ใช้ image จาก `build/build.sh` |
 | `this agent was removed from the hub` | เครื่องถูกยกเลิกสิทธิ์ใน dashboard ต้อง join ใหม่ |
 | เส้นทางเป็น `relay` ตลอด | firewall บล็อก UDP 7879 ระหว่างเครื่อง หรือที่อยู่ที่ประกาศผิด ตั้ง `p2p_advertise` |
+| dashboard เตือน *overlap* หรือ *does not touch any other screen* | ลากเครื่องให้ขอบชิดกันโดยไม่ทับ แล้วกด Save layout ดู [เมื่อจอของเครื่องเปลี่ยน](settings.md#เมื่อจอของเครื่องเปลี่ยน) |
+| tray ขึ้น *No edges to other machines* | เครื่องนี้ไม่ชิดเครื่องไหนในผังจอ แก้ใน dashboard |
+| เสียบหรือถอดจอแล้ว dashboard ยังแสดงจอเก่า | agent รุ่นนี้ส่งจอใหม่เองภายในไม่กี่วินาที (ถ้า GNOME ไม่มี DisplayConfig ภายใน 10 วินาที) ถ้ายังไม่เปลี่ยน ดู log ของ agent ว่ามี `monitor configuration changed` ไหม |
+| GNOME ถาม Input Capture อีกหลังเสียบหรือถอดจอ | ปกติ: GNOME ปิด session จับเมาส์ทุกครั้งที่จอเปลี่ยน agent ต้องเปิด session ใหม่ กด Allow |
 | เมาส์ไม่ข้ามจอ | ขอบจอในผังต้องชิดกัน, เครื่องปลายทางต้อง online และเปิดใช้งาน, บน Wayland ต้องอนุญาต Input Capture, เครื่องปลายทาง GNOME ต้องเปิด session Remote Desktop เสร็จแล้ว (dashboard แสดง inject), ถ้าตั้งปุ่มข้ามจอต้องกดค้าง |
 | เครื่องเป็น `away` ทั้งที่อยู่บ้าน | เทียบ IP ใน dashboard กับวงที่อนุญาต ต้องใส่วงของเครื่อง ไม่ใช่วงของ server |
 | log `permission (... portal) was refused` | กดปฏิเสธหน้าต่างของ GNOME ไป ให้ `systemctl --user restart flow-agent` แล้วกด Allow |
@@ -31,7 +35,8 @@
 **GNOME (Wayland)**
 
 - การไปคุมเครื่องอื่นต้องใช้ GNOME 45 ขึ้นไป เก่ากว่านั้นใช้ session แบบ Xorg
-- หน้าต่าง Input Capture ถามทุกครั้งที่ agent เริ่มใหม่หรืออัปเดต
+- หน้าต่าง Input Capture ถามทุกครั้งที่ agent เริ่มใหม่หรืออัปเดต และหลังจอเปลี่ยนถ้าเครื่องนี้มีขอบไปเครื่องอื่น
+  (GNOME 46 ปิด session เดิมเมื่อจอเปลี่ยน และเปิดซ้ำไม่ได้ ถ้าไม่มีขอบ agent จะยังไม่เปิด session ใหม่)
 - ปุ่มข้ามจอต้องกดหลังเมาส์ชนขอบแล้ว
 - เคอร์เซอร์ตอนคุมเครื่องอื่นอยู่ที่ขอบจอได้อย่างเดียว
 - ถ้าเครื่องปลายทางไม่มีอุปกรณ์ pointer แบบ absolute การเลื่อนจะคลาดเล็กน้อยตาม pointer acceleration
@@ -53,6 +58,9 @@
 - หน้าต่างสถานะเป็นภาษาอังกฤษ
 
 **ยังไม่เคยรันบนเครื่องจริง** (ผ่านแค่ test กับ agent จำลอง และ test ใน Docker)
+
+- การรู้ว่าจอเปลี่ยนบน GNOME (สัญญาณ DisplayConfig, ZonesChanged, เช็คทุก 10 วินาที) และการเปิด session จับเมาส์ใหม่หลังจอเปลี่ยน
+- การเช็คจอซ้ำหลัง `WM_DISPLAYCHANGE` บน Windows และ event RandR แบบ CRTC/output บน X11
 
 - การอัปเดตตัวเองบน Windows และการ restart ผ่าน systemd จริง
 - การย้ายและซ่อนเคอร์เซอร์บน Windows และ X11
