@@ -60,6 +60,9 @@ pub enum LocalEvent {
     /// The local clipboard changed.
     Clipboard(ClipContent),
     MonitorsChanged(Vec<Monitor>),
+    /// [`Backend::caps`] changed on the backend's own account (a remote
+    /// control session opened, or was lost); the core reads them again.
+    CapsChanged,
 }
 
 pub type EventTx = mpsc::UnboundedSender<LocalEvent>;
@@ -99,6 +102,19 @@ pub trait Backend: Send + Sync + 'static {
     fn restore_cursor(&self) {}
     /// Inject an action received from a controlling machine.
     fn inject(&self, action: &Action);
+    /// Whether other machines may control this one now (decided by the
+    /// core, see [`crate::controllable`]). A backend that needs a session
+    /// for injection which the user can see (GNOME/Wayland: the
+    /// RemoteDesktop portal session and its top-bar indicator) opens it on
+    /// `true` and closes it on `false`. `caps().inject` then reports
+    /// whether the session is open and ready: false from the moment this is
+    /// called with `false`, true only once injection works, announced with
+    /// [`LocalEvent::CapsChanged`]. Injections queued before a `false`
+    /// (the core's releases) are still carried out before the session
+    /// closes. Default: nothing to open, always ready.
+    fn set_controllable(&self, on: bool) {
+        let _ = on;
+    }
     fn set_clipboard(&self, content: &ClipContent);
     /// True when changing the edges is expensive (Wayland: new barriers
     /// recreate the capture session and may ask for permission again).

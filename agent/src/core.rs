@@ -10,6 +10,7 @@
 
 use crate::backend::{monitor_at, Backend, EventRx, LocalEvent};
 use crate::config::{AgentConfig, AgentState};
+use crate::controllable::{HubState, SessionGate, HUB_GRACE};
 use crate::cross::{self, EdgeDecision, EdgeHold, HoldStep};
 use crate::edge::EdgeGate;
 use crate::hub::{HubChannels, HubClient, HubEvent, HubRelay, Links};
@@ -80,6 +81,13 @@ pub struct AgentStatus {
     pub last_input: Option<Instant>,
     /// Connected to a hub of another protocol, only to update (its reason).
     pub update_only: Option<String>,
+    /// Other machines can control this one now: sharing is on and the
+    /// backend can inject (on GNOME/Wayland: its remote control session is
+    /// open, see [`crate::controllable`]).
+    pub controllable: bool,
+    /// The core wants the backend's remote control session open (it may
+    /// still be opening).
+    pub session_wanted: bool,
 }
 
 pub struct AgentHandle {
@@ -159,6 +167,12 @@ impl AgentHandle {
     }
 
     pub async fn shutdown(self) {
+        // Let the core release what controlling machines hold here and
+        // close the backend's remote control session first.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.cmds.send(CoreCmd::Stop(tx)).is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+        }
         for t in &self.tasks {
             t.abort();
         }
@@ -228,6 +242,9 @@ pub struct StartOptions {
     pub update: UpdateOptions,
     /// Protocol announced to the hub (tests simulate other generations).
     pub protocol: u32,
+    /// How long the remote control session stays open after the hub
+    /// connection dropped ([`HUB_GRACE`]; tests use less).
+    pub hub_grace: Duration,
 }
 
 impl Default for StartOptions {
@@ -240,6 +257,7 @@ impl Default for StartOptions {
             bind_retry: Duration::ZERO,
             update: UpdateOptions::default(),
             protocol: flow_proto::PROTOCOL_VERSION,
+            hub_grace: HUB_GRACE,
         }
     }
 }
@@ -248,6 +266,8 @@ impl Default for StartOptions {
 #[derive(Debug)]
 enum CoreCmd {
     SetPaused(bool),
+    /// The agent stops: release, close the session, then answer.
+    Stop(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Starts the agent with an already created backend.
@@ -268,7 +288,7 @@ pub async fn start_with(
     events: EventRx,
     opts: StartOptions,
 ) -> Result<AgentHandle> {
-    let StartOptions { log_hook, addrs, net_check_interval, paused, bind_retry, update, protocol } = opts;
+    let StartOptions { log_hook, addrs, net_check_interval, paused, bind_retry, update, protocol, hub_grace } = opts;
     let state_dir = cfg.state_dir();
     std::fs::create_dir_all(&state_dir).with_context(|| format!("creating {}", state_dir.display()))?;
     let host = hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "agent".into());
@@ -374,6 +394,9 @@ pub async fn start_with(
         local_addrs: Vec::new(),
         parked: None,
         last_input: None,
+        session: SessionGate::new(hub_grace),
+        inject_ready: backend.caps().inject,
+        stopping: false,
     };
     core.apply_settings(AgentSettings::default());
     if paused {
@@ -482,6 +505,12 @@ struct Core {
     /// (undone by `end_capture` when it comes back).
     parked: Option<Park>,
     last_input: Option<Instant>,
+    /// Whether the backend's remote control session should be open.
+    session: SessionGate,
+    /// Last `backend.caps().inject` seen: the backend can inject now.
+    inject_ready: bool,
+    /// The agent is stopping (the session closes for good).
+    stopping: bool,
 }
 
 impl Core {
@@ -504,6 +533,11 @@ impl Core {
                 Some((from, a)) = actions.recv() => self.on_action(from, a),
                 Some(c) = cmds.recv() => match c {
                     CoreCmd::SetPaused(p) => self.set_paused(p),
+                    CoreCmd::Stop(done) => {
+                        self.stopping = true;
+                        self.update_session();
+                        let _ = done.send(());
+                    }
                 },
                 _ = tick.tick() => self.on_tick(),
                 _ = report.tick() => self.report_paths(),
@@ -547,7 +581,98 @@ impl Core {
                 || !self.sent_buttons.is_empty()
                 || !self.injected_down.is_empty();
             s.last_input = self.last_input;
+            s.controllable = self.controllable();
+            s.session_wanted = self.session.is_open();
         });
+    }
+
+    // ------------------------------------------------------------------
+    // being controlled: the backend's remote control session
+    // ------------------------------------------------------------------
+
+    /// Other machines may drive this one now.
+    fn controllable(&self) -> bool {
+        !self.away && self.inject_ready
+    }
+
+    fn hub_state(&self) -> HubState {
+        let s = self.status.borrow();
+        if self.stopping || s.revoked || s.update_only.is_some() {
+            HubState::Unusable
+        } else if s.connected {
+            HubState::Connected
+        } else {
+            HubState::Lost
+        }
+    }
+
+    /// Opens or closes the backend's remote control session as
+    /// [`SessionGate`] decides, then picks up what the backend can do.
+    fn update_session(&mut self) {
+        let hub = self.hub_state();
+        if let Some(open) = self.session.update(Instant::now(), hub, self.away) {
+            if open {
+                info!("this machine can be controlled: opening the remote control session");
+            } else {
+                info!(
+                    ?hub,
+                    away = self.away,
+                    "this machine cannot be controlled now: closing the remote control session"
+                );
+                // Whatever controlling machines hold here is released while
+                // the backend can still inject it (same queue, before the
+                // close).
+                self.release_controllers();
+            }
+            self.backend.set_controllable(open);
+            self.publish();
+        }
+        self.refresh_caps();
+    }
+
+    /// Reads the backend's capabilities again; when it can no longer (or
+    /// again) inject, P2P access and the hub follow.
+    fn refresh_caps(&mut self) {
+        let ready = self.backend.caps().inject;
+        if ready == self.inject_ready {
+            return;
+        }
+        self.inject_ready = ready;
+        if ready {
+            info!("remote control session ready: other machines can control this one");
+        } else {
+            info!("remote control session closed: other machines cannot control this one");
+            self.release_controllers();
+        }
+        self.update_dir();
+        self.send_caps();
+        self.publish();
+    }
+
+    fn send_caps(&self) {
+        let _ = self.to_hub.send(ToHub::Caps(self.backend.caps()));
+    }
+
+    /// Releases, right now and through the backend, every key and button
+    /// controlling machines hold here and ends their control; the
+    /// receiver forgets them too (its own release actions arrive later and
+    /// are dropped: nothing is held any more).
+    fn release_controllers(&mut self) {
+        let mut held: Vec<(NodeId, Injected)> = self.injected_down.drain().collect();
+        held.sort_by_key(|(src, what)| (*src, matches!(what, Injected::Button(_))));
+        for (src, what) in held {
+            let a = match what {
+                Injected::Key(usage) => Action::Key { usage, down: false },
+                Injected::Button(button) => Action::Button { button, down: false },
+            };
+            debug!(source = %src, ?a, "released");
+            self.backend.inject(&a);
+        }
+        for src in std::mem::take(&mut self.controllers) {
+            info!(source = %src, "control by a remote machine ended (this machine cannot be controlled now)");
+            self.backend.inject(&Action::Left);
+        }
+        self.receiver.release_everything();
     }
 
     // ------------------------------------------------------------------
@@ -573,8 +698,10 @@ impl Core {
                 if let Mode::Remote { target, .. } = self.mode {
                     let _ = self.to_hub.send(ToHub::FocusChanged { target: Some(target) });
                 }
-                // The hub starts every connection as "not away".
+                // The hub starts every connection as "not away" and with the
+                // capabilities of the Hello, which may be stale by now.
                 self.send_net_status();
+                self.send_caps();
                 self.report_paths();
             }
             HubEvent::Disconnected => {
@@ -591,7 +718,7 @@ impl Core {
                 self.layout = Layout::default();
                 self.refresh_edges();
                 self.set_peers(Vec::new());
-                self.receiver.release_everything();
+                self.release_controllers();
                 self.status.send_modify(|s| {
                     s.connected = false;
                     s.hub_error = None;
@@ -624,7 +751,7 @@ impl Core {
                 self.leave_remote(None);
                 self.me = None;
                 self.set_peers(Vec::new());
-                self.receiver.release_everything();
+                self.release_controllers();
                 self.status.send_modify(|s| {
                     s.revoked = true;
                     s.node_id = None;
@@ -647,6 +774,7 @@ impl Core {
                 self.backend.set_clipboard(&content);
             }
         }
+        self.update_session();
         self.publish();
     }
 
@@ -718,6 +846,7 @@ impl Core {
         changed |= self.update_away();
         if changed {
             self.send_net_status();
+            self.update_session();
             self.publish();
         }
     }
@@ -752,6 +881,7 @@ impl Core {
         }
         self.update_away();
         self.send_net_status();
+        self.update_session();
         self.publish();
     }
 
@@ -765,14 +895,16 @@ impl Core {
     fn go_away(&mut self) {
         self.end_hold(None);
         self.leave_remote(None);
-        self.receiver.release_everything();
+        self.release_controllers();
         self.update_dir();
         self.refresh_edges();
     }
 
-    /// Who may connect to us directly: enabled peers, nobody while away.
+    /// Who may connect to us directly: enabled peers, nobody while this
+    /// machine cannot be controlled (away, or the backend cannot inject).
+    /// Direct connections only carry input to this machine.
     fn update_dir(&self) {
-        if self.away {
+        if !self.controllable() {
             self.dir.set(std::iter::empty());
         } else {
             self.dir.set(self.peers.values().filter(|p| p.enabled).map(|p| (p.fingerprint, p.id)));
@@ -826,8 +958,8 @@ impl Core {
         }
         drop(links);
         if let Mode::Remote { target, .. } = self.mode {
-            if !self.peers.get(&target).is_some_and(|p| p.online && p.enabled && !p.away) {
-                info!(%target, "target went offline, away or was disabled, returning control");
+            if !self.reachable(target) {
+                info!(%target, "target went offline, away, was disabled or cannot be controlled now, returning control");
                 self.leave_remote(None);
             }
         }
@@ -861,7 +993,7 @@ impl Core {
     // ------------------------------------------------------------------
 
     fn on_local(&mut self, ev: LocalEvent) {
-        if !matches!(ev, LocalEvent::Clipboard(_) | LocalEvent::MonitorsChanged(_)) {
+        if !matches!(ev, LocalEvent::Clipboard(_) | LocalEvent::MonitorsChanged(_) | LocalEvent::CapsChanged) {
             self.last_input = Some(Instant::now());
         }
         match ev {
@@ -933,6 +1065,7 @@ impl Core {
                 info!(monitors = m.len(), "monitor configuration changed");
                 let _ = self.to_hub.send(ToHub::UpdateMonitors(m));
             }
+            LocalEvent::CapsChanged => self.refresh_caps(),
         }
         self.publish();
     }
@@ -1185,18 +1318,21 @@ impl Core {
 
     fn on_action(&mut self, from: NodeId, a: Action) {
         self.last_input = Some(Instant::now());
-        // Away: nothing is injected except releases of what was injected
-        // before (from going away, or from sources that have not heard about
-        // it yet), so the local OS never sees a release without a press.
+        // Not controllable (away, or the remote control session is closed):
+        // nothing is injected except releases of what was injected before
+        // (from sources that have not heard about it yet), so the local OS
+        // never sees a release without a press. Going uncontrollable
+        // releases everything at once (`release_controllers`), so whatever
+        // arrives after that is dropped.
         let pressed = |k| self.injected_down.contains(&(from, k));
-        let allowed_while_away = match a {
-            Action::Left => true,
+        let allowed_while_closed = match a {
+            Action::Left => self.controllers.contains(&from),
             Action::Key { usage, down: false } => pressed(Injected::Key(usage)),
             Action::Button { button, down: false } => pressed(Injected::Button(button)),
             _ => false,
         };
-        if self.away && !allowed_while_away {
-            debug!(source = %from, ?a, "input from a controlling machine dropped (away)");
+        if !self.controllable() && !allowed_while_closed {
+            debug!(source = %from, ?a, away = self.away, "input from a controlling machine dropped (cannot be controlled now)");
             return;
         }
         match a {
@@ -1231,6 +1367,9 @@ impl Core {
     }
 
     fn on_tick(&mut self) {
+        if self.session.deadline().is_some_and(|d| Instant::now() >= d) {
+            self.update_session();
+        }
         if let Mode::Hold(h) = self.mode {
             if h.expired(Instant::now()) {
                 self.end_hold(None);
