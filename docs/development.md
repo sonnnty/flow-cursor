@@ -54,6 +54,7 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
 | `malformed.rs` | packet เสีย, frame เกินขนาด, datagram ผิดรูป |
 | `netgate.rs` | วงที่อนุญาตและปุ่มข้ามจอ |
 | `cursor.rs` | ตัวเลือกเคอร์เซอร์และทุกทางที่ควบคุมกลับมา |
+| `monitors.rs` | จอของเครื่องเปลี่ยนระหว่างใช้งาน (เสียบ/ถอดจอ, restart), hub จัดผังใหม่, ข้ามจอได้ต่อ, คำเตือนผังจอทับกันหรือไม่ชิดกัน |
 | `ondemand.rs` | เปิดและปิด session Remote Desktop ตาม hub, pause, away, ช่วงรอ 10 วินาที, ไม่มีปุ่มค้าง |
 | `ipc.rs` | local IPC และสิทธิ์ของ socket |
 | `update.rs` | อัปเดตอัตโนมัติ, ไฟล์ที่ hash ไม่ตรง, policy, rollback |
