@@ -19,6 +19,8 @@
 | log `permission (... portal) was refused` | กดปฏิเสธหน้าต่างของ GNOME ไป ให้ `systemctl --user restart flow-agent` แล้วกด Allow |
 | ปุ่มค้าง | กด emergency hotkey เครื่องที่ถูกคุมจะปล่อยปุ่มเองใน 2.5 วินาทีถ้าต้นทางหายไป |
 | ไม่เห็นไอคอนบน GNOME | เปิด extension AppIndicator ดู [ติดตั้งบน Linux](install-linux.md#ไอคอนบนแถบด้านบน) |
+| ไอคอนหายไปทั้งที่ `flow-tray` ยังรัน | tray ลงทะเบียนใหม่เองภายใน 30 วินาที ถ้ายังไม่ขึ้นให้เปิด extension AppIndicator หรือรัน `flow-tray --quit` แล้วเปิดใหม่ |
+| ไอคอนสีเหลือง หน้าต่างบอกว่าเครื่องอื่นควบคุมไม่ได้ | ปกติ: อยู่นอกวงที่อนุญาตหรือกด Pause อยู่ จะควบคุมได้อีกเมื่อกลับเข้าวงหรือกด Resume |
 | ไอคอนสีเทา แต่ agent รันอยู่ | ต่อ hub ไม่ได้ ดูสาเหตุในหน้าต่างสถานะ |
 | `another flow-agent of this user is already running` | มี agent รันอยู่แล้ว ใช้ `flow-agent status` หรือ `flow-agent stop` |
 | Windows: ไอคอนหายหลังกด Quit | Quit ปิดทั้งไอคอนและ agent เปิดใหม่จาก Start menu |
