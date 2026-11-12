@@ -220,6 +220,57 @@ struct PairView {
     relay_rtt_us: Option<u32>,
 }
 
+/// Why crossing cannot work somewhere in the saved layout.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LayoutWarning {
+    /// `overlap` (two machines on top of each other: no edge between them)
+    /// or `no_edge` (an online machine touches no other screen).
+    pub kind: &'static str,
+    pub nodes: Vec<NodeId>,
+    pub text: String,
+}
+
+/// Warnings for the layout of enabled nodes: overlaps between any of them,
+/// and connected (online or away) nodes that share no edge with another.
+pub fn layout_warnings(st: &crate::state::HubState) -> Vec<LayoutWarning> {
+    let layout = st.p.layout();
+    let name = |id: NodeId| st.p.nodes.get(&id.0).map(|n| n.name.clone()).unwrap_or_else(|| id.to_string());
+    let mut out: Vec<LayoutWarning> = flow_layout::overlaps(&layout)
+        .into_iter()
+        .map(|(a, b)| LayoutWarning {
+            kind: "overlap",
+            nodes: vec![a, b],
+            text: format!(
+                "{} and {} overlap, so the pointer cannot cross between them: drag them apart until their edges touch.",
+                name(a),
+                name(b)
+            ),
+        })
+        .collect();
+    let overlapping: Vec<NodeId> = out.iter().flat_map(|w| w.nodes.clone()).collect();
+    for id in flow_layout::isolated(&layout) {
+        // An overlap already explains it; offline machines are not using it.
+        if overlapping.contains(&id) || !st.online.contains_key(&id) {
+            continue;
+        }
+        out.push(LayoutWarning {
+            kind: "no_edge",
+            nodes: vec![id],
+            text: format!("{} does not touch any other screen: drag it next to one.", name(id)),
+        });
+    }
+    out
+}
+
+/// The last automatic re-layout after a monitor report.
+#[derive(Serialize)]
+struct RelayoutView {
+    node: NodeId,
+    at: u64,
+    moved: Vec<NodeId>,
+    text: String,
+}
+
 #[derive(Serialize)]
 struct StateView {
     hub: HubInfo,
@@ -228,6 +279,8 @@ struct StateView {
     focus: Vec<FocusEntry>,
     pairs: Vec<PairView>,
     last_clip: Option<ClipMeta>,
+    layout_warnings: Vec<LayoutWarning>,
+    last_relayout: Option<RelayoutView>,
 }
 
 async fn get_state(State(hub): State<Arc<Hub>>) -> Json<StateView> {
@@ -359,6 +412,13 @@ async fn get_state(State(hub): State<Arc<Hub>>) -> Json<StateView> {
         focus: st.focus_entries(),
         pairs,
         last_clip: st.last_clip.clone(),
+        layout_warnings: layout_warnings(&st),
+        last_relayout: st.last_relayout.as_ref().map(|r| RelayoutView {
+            node: r.node,
+            at: r.at,
+            moved: r.moved.iter().map(|m| m.id).collect(),
+            text: r.describe(&st.p),
+        }),
     })
 }
 

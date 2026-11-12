@@ -178,6 +178,91 @@ impl Persisted {
     pub fn place_new(&self, monitors: &[Monitor]) -> (i32, i32) {
         self.layout().place_new_node(monitors)
     }
+
+    /// Stores the monitors node `id` reported (on connect or on a change)
+    /// and keeps the layout usable: other nodes follow the edges they
+    /// shared with it and nothing is left overlapping it
+    /// ([`flow_layout::apply_monitors`]). An unchanged report still pushes
+    /// nodes out of an overlap (one saved earlier). An empty report is
+    /// ignored: the node would leave the layout (monitors switched off for a
+    /// moment). Returns what changed, None when nothing did.
+    pub fn report_monitors(&mut self, id: NodeId, monitors: Vec<Monitor>) -> Option<Relayout> {
+        let rec = self.nodes.get(&id.0)?;
+        if monitors.is_empty() {
+            return None;
+        }
+        let before = rec.monitors.clone();
+        let changed = before != monitors;
+        let mut layout = self.layout();
+        let moved = if layout.node(id).is_some() {
+            if changed {
+                flow_layout::apply_monitors(&mut layout, id, monitors.clone())
+            } else {
+                flow_layout::separate_from(&mut layout, id)
+            }
+        } else {
+            // Not in the layout yet (disabled, or no monitors known): only
+            // keep it from landing on top of another node.
+            self.nodes.get_mut(&id.0).expect("exists").monitors = monitors.clone();
+            let mut l = self.layout();
+            if l.node(id).is_some() {
+                flow_layout::separate_from(&mut l, id)
+            } else {
+                Vec::new()
+            }
+        };
+        if !changed && moved.is_empty() {
+            return None;
+        }
+        self.nodes.get_mut(&id.0).expect("exists").monitors = monitors.clone();
+        for m in &moved {
+            if let Some(n) = self.nodes.get_mut(&m.id.0) {
+                (n.x, n.y) = m.to;
+            }
+        }
+        let r = Relayout { node: id, at: unix_now(), before, after: monitors, moved };
+        tracing::info!(node = %id, "{}", r.describe(self));
+        Some(r)
+    }
+}
+
+/// What the hub did with a monitor report (shown in the dashboard).
+#[derive(Clone, Debug)]
+pub struct Relayout {
+    pub node: NodeId,
+    pub at: u64,
+    pub before: Vec<Monitor>,
+    pub after: Vec<Monitor>,
+    pub moved: Vec<flow_layout::Moved>,
+}
+
+impl Relayout {
+    /// "LAPTOP now has 1 monitor (had 3): moved SONTY-PC from 4536,0 to
+    /// 1536,0 to keep it next to LAPTOP."
+    pub fn describe(&self, p: &Persisted) -> String {
+        let name = |id: NodeId| p.nodes.get(&id.0).map(|n| n.name.clone()).unwrap_or_else(|| id.to_string());
+        let count = |m: &[Monitor]| format!("{} monitor{}", m.len(), if m.len() == 1 { "" } else { "s" });
+        let mut s = if self.before == self.after {
+            format!("{} reported its monitors again", name(self.node))
+        } else if self.before.is_empty() {
+            format!("{} reported {}", name(self.node), count(&self.after))
+        } else if self.before.len() == self.after.len() {
+            format!("{}'s monitors changed", name(self.node))
+        } else {
+            format!("{} now has {} (had {})", name(self.node), count(&self.after), self.before.len())
+        };
+        if self.moved.is_empty() {
+            s.push_str(": no other machine had to move.");
+        } else {
+            let moves: Vec<String> = self
+                .moved
+                .iter()
+                .map(|m| format!("{} from {},{} to {},{}", name(m.id), m.from.0, m.from.1, m.to.0, m.to.1))
+                .collect();
+            s.push_str(&format!(": moved {} to keep the layout touching without overlaps.", moves.join(", ")));
+        }
+        s
+    }
 }
 
 /// What a connected agent said about itself (hello, update reports).
@@ -259,6 +344,8 @@ pub struct HubState {
     pub legacy: HashMap<NodeId, LegacyAgent>,
     /// The agent builds this hub carries (None: none in this image).
     pub builds: Option<std::sync::Arc<crate::updates::AgentBuilds>>,
+    /// The last time a monitor report changed the layout (dashboard note).
+    pub last_relayout: Option<Relayout>,
 }
 
 impl HubState {
@@ -318,6 +405,19 @@ impl HubState {
     pub fn broadcast_peers(&self) {
         for id in self.online.keys() {
             self.send_to(*id, FromHub::Peers(self.peers_for(*id)));
+        }
+    }
+
+    /// Applies a monitor report ([`Persisted::report_monitors`]); saves and
+    /// tells every agent when the layout changed. `broadcast` false: the
+    /// caller sends the layout itself (a node that is just connecting).
+    pub fn report_monitors(&mut self, id: NodeId, monitors: Vec<Monitor>, broadcast: bool) {
+        if let Some(r) = self.p.report_monitors(id, monitors) {
+            self.last_relayout = Some(r);
+            self.save();
+            if broadcast {
+                self.broadcast_layout();
+            }
         }
     }
 
@@ -391,6 +491,77 @@ impl HubState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(id: u32, name: &str, x: i32, y: i32, monitors: Vec<Monitor>) -> NodeRecord {
+        NodeRecord {
+            id: NodeId(id),
+            name: name.into(),
+            hostname: name.into(),
+            fingerprint: Fingerprint([id as u8; 32]).to_hex(),
+            os: OsKind::Linux,
+            enabled: true,
+            mouse_speed: 1.0,
+            x,
+            y,
+            monitors,
+            caps: Capabilities::default(),
+            created: 0,
+            last_seen: 0,
+            allowed_networks: None,
+            crossing_key: None,
+            cursor_park: None,
+            update_policy: None,
+            agent: None,
+            platform: String::new(),
+        }
+    }
+
+    fn mon(x: i32, y: i32, w: i32, h: i32) -> Monitor {
+        Monitor { name: format!("{w}x{h}"), rect: flow_proto::Rect::new(x, y, w, h), primary: false }
+    }
+
+    fn docked() -> Vec<Monitor> {
+        vec![mon(0, 0, 1536, 960), mon(1536, 0, 1920, 1080), mon(3456, 0, 1080, 1920)]
+    }
+
+    #[test]
+    fn monitor_reports_keep_the_neighbour_touching() {
+        let mut p = Persisted::fresh();
+        p.nodes.insert(1, rec(1, "LAPTOP", 0, 0, vec![mon(0, 0, 1536, 960)]));
+        p.nodes.insert(2, rec(2, "SONTY-PC", 1536, 0, vec![mon(0, 0, 1920, 1080)]));
+        // Docked: the PC moves right of the new width.
+        let r = p.report_monitors(NodeId(1), docked()).expect("layout changed");
+        assert_eq!((p.nodes[&2].x, p.nodes[&2].y), (4536, 0));
+        assert_eq!(p.nodes[&1].monitors.len(), 3);
+        assert_eq!(
+            r.describe(&p),
+            "LAPTOP now has 3 monitors (had 1): moved SONTY-PC from 1536,0 to 4536,0 to keep the layout touching \
+             without overlaps."
+        );
+        // The same report again (agent reconnects): nothing to do.
+        assert!(p.report_monitors(NodeId(1), docked()).is_none());
+        // Monitors switched off for a moment: ignored, the node stays.
+        assert!(p.report_monitors(NodeId(1), vec![]).is_none());
+        assert_eq!(p.layout().nodes.len(), 2);
+        // Undocked (also when reported by the Hello after a restart).
+        p.report_monitors(NodeId(1), vec![mon(0, 0, 1536, 960)]).expect("layout changed");
+        assert_eq!((p.nodes[&2].x, p.nodes[&2].y), (1536, 0));
+        assert!(p.report_monitors(NodeId(9), docked()).is_none(), "unknown node");
+    }
+
+    #[test]
+    fn an_unchanged_report_still_ends_a_saved_overlap() {
+        // The owner's hub: the PC was placed at 1536 while the laptop already
+        // reported three monitors.
+        let mut p = Persisted::fresh();
+        p.nodes.insert(1, rec(1, "LAPTOP", 0, 0, docked()));
+        p.nodes.insert(2, rec(2, "SONTY-PC", 1536, 0, vec![mon(0, 0, 1920, 1080)]));
+        assert_eq!(flow_layout::overlaps(&p.layout()).len(), 1);
+        let r = p.report_monitors(NodeId(1), docked()).expect("separated");
+        assert!(r.describe(&p).starts_with("LAPTOP reported its monitors again: moved SONTY-PC"), "{}", r.describe(&p));
+        assert!(flow_layout::overlaps(&p.layout()).is_empty());
+        assert!(flow_layout::isolated(&p.layout()).is_empty());
+    }
 
     #[test]
     fn persisted_roundtrip_and_names() {

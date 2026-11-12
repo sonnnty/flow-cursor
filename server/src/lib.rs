@@ -140,6 +140,7 @@ pub async fn start(cfg: HubConfig) -> Result<HubHandle> {
             updating: Default::default(),
             legacy: Default::default(),
             builds: cfg.agent_builds.as_deref().and_then(updates::load_logged),
+            last_relayout: None,
         }),
         admin_token,
         admin_token_source,

@@ -393,9 +393,8 @@ fn authenticate(hub: &Hub, fp: &Fingerprint, hello: &Hello, reg: Option<&Registe
         if let Some(reg) = reg {
             rec.os = reg.os;
             rec.caps = reg.caps;
-            if !reg.monitors.is_empty() {
-                rec.monitors = reg.monitors.clone();
-            }
+            // The full session that follows sends the layout to everyone.
+            st.report_monitors(id, reg.monitors.clone(), false);
         }
         st.save();
         return Ok(id);
@@ -507,15 +506,7 @@ async fn control_loop(hub: &Arc<Hub>, node: NodeId, recv: &mut quinn::RecvStream
                 }
                 st.broadcast_peers();
             }
-            ToHub::UpdateMonitors(m) => {
-                if let Some(rec) = st.p.nodes.get_mut(&node.0) {
-                    if rec.monitors != m {
-                        rec.monitors = m;
-                        st.save();
-                        st.broadcast_layout();
-                    }
-                }
-            }
+            ToHub::UpdateMonitors(m) => st.report_monitors(node, m, true),
             ToHub::FocusChanged { target } => {
                 let changed = match target {
                     Some(t) if t != node => st.focus.insert(node, t) != Some(t),
