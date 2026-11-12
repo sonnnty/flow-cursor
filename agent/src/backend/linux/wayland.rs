@@ -231,6 +231,7 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
             vec![Monitor { name: "default".into(), rect: Rect::new(0, 0, 1920, 1080), primary: true }]
         });
         *monitors.lock().expect("poisoned") = m;
+        watch_x11_monitors(monitors.clone(), tx.clone());
     }
     if inj.is_none() && cap.is_none() {
         return Err(anyhow!("neither the RemoteDesktop nor the InputCapture portal works in this session"));
@@ -242,6 +243,28 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
         "Wayland portal backend ready (the remote control session opens while connected to the hub)"
     );
     Ok((Arc::new(b), rx))
+}
+
+/// Without an InputCapture session there are no zones to watch: read the
+/// monitors through XWayland every [`DISPLAY_POLL`] and report changes,
+/// until the agent drops the backend.
+fn watch_x11_monitors(monitors: Arc<Mutex<Vec<Monitor>>>, tx: EventTx) {
+    let spawned = std::thread::Builder::new().name("xwayland-monitors".into()).spawn(move || loop {
+        std::thread::sleep(DISPLAY_POLL);
+        if tx.is_closed() {
+            return;
+        }
+        let Ok(m) = x11_monitors() else { continue };
+        let mut cur = monitors.lock().expect("poisoned");
+        if !m.is_empty() && *cur != m {
+            *cur = m.clone();
+            drop(cur);
+            let _ = tx.send(LocalEvent::MonitorsChanged(m));
+        }
+    });
+    if let Err(e) = spawned {
+        warn!("cannot watch the monitors: {e}");
+    }
 }
 
 fn x11_monitors() -> Result<Vec<Monitor>> {
