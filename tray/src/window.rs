@@ -281,6 +281,11 @@ fn details(ui: &mut egui::Ui, s: &Snapshot) {
     for w in &s.warnings {
         ui.colored_label(AMBER, w);
     }
+    // Closed on purpose (away, paused, not connected): an explanation, not
+    // a problem.
+    if let Some(n) = model::idle_note(s) {
+        ui.label(RichText::new(n).weak());
+    }
 
     ui.add_space(6.0);
     ui.heading("Hub");
@@ -354,7 +359,7 @@ fn details(ui: &mut egui::Ui, s: &Snapshot) {
             format!(
                 "capture {} · inject {} · clipboard {}",
                 yes_no(s.can_capture),
-                yes_no(s.can_inject),
+                model::inject_label(s),
                 yes_no(s.can_clipboard)
             ),
         );
