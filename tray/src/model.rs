@@ -88,6 +88,29 @@ pub fn inject_label(s: &Snapshot) -> &'static str {
     }
 }
 
+/// The compositor's capture session (GNOME/Wayland), e.g. "enabled · 2
+/// barriers · last edge hit 3m ago"; None on other backends.
+pub fn capture_label(s: &Snapshot) -> Option<String> {
+    let c = s.capture.as_ref()?;
+    let mut parts = vec![c.state.clone()];
+    if c.state == "enabled" {
+        parts.push(format!("{} barrier{}", c.barriers, if c.barriers == 1 { "" } else { "s" }));
+    }
+    parts.push(match c.last_activation_s {
+        Some(a) => format!("last edge hit {} ago", short_age(a)),
+        None => "no edge hit yet".into(),
+    });
+    Some(parts.join(" · "))
+}
+
+fn short_age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        _ => format!("{}h", secs / 3600),
+    }
+}
+
 fn shorten(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &s[..i]),
@@ -498,5 +521,20 @@ mod tests {
         };
         let v = view(&AgentState::Running(Box::new(s)));
         assert_eq!(v.lines.last().unwrap(), "Update: last update failed: 0.2.1+9.gdef: did not reach the hub");
+    }
+
+    #[test]
+    fn capture_line_only_where_the_compositor_captures() {
+        assert_eq!(capture_label(&joined()), None);
+        let mut s = joined();
+        s.capture = Some(flow_ipc::CaptureInfo {
+            state: "enabled".into(),
+            barriers: 2,
+            last_activation_s: Some(190),
+            ..Default::default()
+        });
+        assert_eq!(capture_label(&s).as_deref(), Some("enabled · 2 barriers · last edge hit 3m ago"));
+        s.capture = Some(flow_ipc::CaptureInfo { state: "re-creating".into(), ..Default::default() });
+        assert_eq!(capture_label(&s).as_deref(), Some("re-creating · no edge hit yet"));
     }
 }

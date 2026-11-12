@@ -363,6 +363,9 @@ fn details(ui: &mut egui::Ui, s: &Snapshot) {
                 yes_no(s.can_clipboard)
             ),
         );
+        if let Some(c) = model::capture_label(s) {
+            row(ui, "Edge capture", c);
+        }
         row(ui, "Version", model::version_label(s));
         row(ui, "Agent", format!("pid {}, backend {}", s.pid, s.backend));
         let policy = if s.update.policy.is_empty() { "(not known yet)" } else { s.update.policy.as_str() };

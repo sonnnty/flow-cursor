@@ -62,6 +62,17 @@ flow-agent join <token> [--hub <ที่อยู่>]
 flow-agent forget-portal | monitors
 ```
 
+บน GNOME `flow-agent status` บอกสถานะของ Input Capture ด้วย:
+
+```
+input capture:    enabled, 1 barrier, zone set 7, session 2 (4m10s old)
+last edge hit:    12s ago
+capture change:   enabled with 1 barrier (4m09s ago)
+```
+
+`zone set` คือรุ่นของการตั้งค่าจอที่ขอบจอถูกตั้งไว้ และ `session` คือจำนวน session ที่สร้างตั้งแต่ agent เริ่ม
+หน้าต่างสถานะแสดงแถว Edge capture แบบย่อ
+
 tray กับคำสั่งเหล่านี้คุยกับ agent ผ่าน local IPC ที่เปิดให้เฉพาะผู้ใช้คนนั้น
 Linux ใช้ Unix socket `$XDG_RUNTIME_DIR/flowcursor/agent.sock` และ Windows ใช้ named pipe ที่ผูกกับ SID ของผู้ใช้
 รัน agent ซ้ำสองตัวในผู้ใช้เดียวกันไม่ได้

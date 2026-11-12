@@ -20,7 +20,9 @@
      a panel that outgrows its area scrolls inside itself (.scroll). */
   #app { height:100vh; height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
   header { flex:none; display:flex; align-items:center; gap:12px; padding:6px 14px; background:var(--card); border-bottom:1px solid var(--line); }
-  header h1 { font-size:16px; margin:0; display:flex; align-items:center; gap:8px; }
+  header h1 { font-size:16px; margin:0; display:flex; align-items:center; gap:8px; flex:none; }
+  header nav, header .btn { flex:none; }
+  #hubinfo { flex:1 1 0; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   header h1 img, #login h2 img { width:22px; height:22px; border-radius:5px; }
   nav button { background:none; border:none; color:var(--mute); font-size:13px; padding:4px 10px; cursor:pointer; border-radius:6px; }
   nav button.on { color:var(--fg); background:var(--bg); font-weight:600; }
@@ -29,8 +31,15 @@
   #tab-overview { grid-template-columns:minmax(0,1fr) clamp(500px, 42vw, 760px); }
   #tab-settings { grid-template-columns:minmax(0,1fr) minmax(0,1.1fr); grid-template-rows:minmax(0,1fr) auto; }
   .col { min-height:0; display:flex; flex-direction:column; gap:10px; }
+  /* Settings, right column: the global network card at its natural height
+     (shrinks and scrolls only when the window is very short), the
+     per-machine card takes the rest. */
+  #netcard { flex:0 1 auto; min-height:150px; }
+  #tab-settings .col > .grow { min-height:170px; }
 
-  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; min-height:0; display:flex; flex-direction:column; }
+  /* Cards are query containers: what is inside adapts to the card's width
+     (@container below), not only to the window's. */
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; min-height:0; display:flex; flex-direction:column; container-type:inline-size; }
   .card h2 { flex:none; font-size:14px; margin:0 0 6px; }
   .card > .hint:last-child { margin-bottom:0; }
   .grow { flex:1 1 0; }
@@ -72,8 +81,38 @@
   .node text { fill:var(--fg); font-size:12px; pointer-events:none; }
   .node { cursor:grab; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .grid { display:grid; grid-template-columns:200px minmax(0,1fr); gap:6px 14px; align-items:center; }
+  /* Labels sit at the top of their row, next to the control (not centred
+     against a long hint, where they could end up beside empty space). */
+  .grid { display:grid; grid-template-columns:minmax(110px, 200px) minmax(0,1fr); gap:6px 14px; align-items:start; }
   .grid label { color:var(--mute); }
+  .grid > label { padding-top:4px; }
+  .grid select { max-width:100%; }
+  .keyf input { flex:1 1 130px; min-width:0; max-width:220px; }
+
+  /* Per-machine overrides: a table while it fits, one block per machine in
+     narrower cards. */
+  #ovr { table-layout:fixed; }
+  #ovr th:nth-child(1) { width:22%; } #ovr th:nth-child(2) { width:21%; } #ovr th:nth-child(3) { width:24%; }
+  #ovr th:nth-child(4) { width:20%; } #ovr th:nth-child(5) { width:13%; }
+  #ovr td select, #ovr td textarea { width:100%; min-width:0; max-width:none; }
+  #ovr td { min-width:0; overflow-wrap:anywhere; vertical-align:top; }
+  #ovr td.who .badge { margin-left:6px; }
+  #ovr td.who .btn { margin-top:4px; }
+  @container (max-width: 560px) {
+    .grid { grid-template-columns:minmax(0,1fr); gap:2px; }
+    .grid > label { padding-top:0; margin-top:8px; }
+  }
+  @container (max-width: 860px) {
+    #ovr thead { display:none; }
+    #ovr, #ovr tbody { display:block; }
+    #ovr tr { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:4px 12px; padding:6px 0 8px; border-bottom:1px solid var(--line); }
+    #ovr td { display:block; border:0; padding:0; }
+    #ovr td.who { grid-column:1 / -1; display:flex; flex-wrap:wrap; align-items:center; gap:2px 8px; }
+    #ovr td.who .hint { flex:1 1 200px; }
+    #ovr td.who .btn { margin-top:0; }
+    #ovr td[data-label]::before { content:attr(data-label); display:block; color:var(--mute); font-size:12px; margin-bottom:2px; }
+  }
+  @container (max-width: 440px) { #ovr tr { grid-template-columns:minmax(0,1fr); } }
   .hint { color:var(--mute); font-size:12px; }
   .actions { flex:none; margin-top:8px; }
   .footer { grid-column:1 / -1; }
@@ -154,27 +193,27 @@
       <label for="s-corner">Dead corners (px)</label><input id="s-corner" type="number" min="0" max="2000">
       <label for="s-policy">Input path</label><select id="s-policy"><option value="prefer_p2p">Prefer direct (P2P), fall back to relay</option><option value="force_relay">Always relay through the hub</option></select>
       <label for="s-probe">P2P probe interval (ms)</label><input id="s-probe" type="number" min="100" max="60000">
-      <label for="s-log">Agent log level</label><div><input id="s-log" size="30"> <span class="hint">tracing filter, e.g. info, debug, flow_net=trace (also applied to the hub)</span></div>
+      <label for="s-log">Agent log level</label><div><input id="s-log" size="30"> <span class="hint">tracing filter, e.g. info, debug, flow_net=trace (also applied to the hub). An agent keeps its own level when <code>RUST_LOG</code> or <code>log_level</code> in agent.toml is set.</span></div>
       <label for="s-update">Agent updates</label><div><select id="s-update"></select>
         <div class="hint">When this hub carries another agent build (built into its image): <b>automatic</b> installs it once the machine is idle (not controlling or controlled, no keys held) and restarts; <b>notify</b> shows "update available" and <i>Update now</i> in the tray; <b>off</b> does nothing on its own. <i>Update now</i> on the Overview tab works with every choice.</div></div>
     </div></div>
   </div>
   <div class="col">
-    <div class="card tight" style="max-height:60%">
+    <div class="card" id="netcard">
       <h2>Network, crossing and cursor</h2>
       <div class="scroll"><div class="grid">
         <label for="s-nets">Allowed networks</label><div><textarea id="s-nets" rows="2" cols="34" placeholder="empty = everywhere (no restriction)"></textarea>
-          <div class="hint">CIDR blocks, one per line (IPv4 or IPv6), e.g. <code>10.10.15.0/24</code>. A machine shares mouse, keyboard and clipboard only while one of <b>its own</b> network interfaces has an address inside a block; otherwise it is <b>away</b> (stays connected, shown in the dashboard). A VPN address (e.g. 10.8.0.5) is not inside the home block, so the VPN alone never counts as home.</div></div>
+          <div class="hint">CIDR blocks, one per line (IPv4 or IPv6), e.g. <code>10.10.15.0/24</code>. A machine shares only while one of <b>its own</b> interfaces has an address in a block, otherwise it is <b>away</b> (stays connected). A VPN address outside the blocks does not count as home.</div></div>
         <label>Crossing key</label><div><span id="s-cross"></span>
-          <div class="hint">Hold this key (or combo) while the pointer reaches an edge to switch machines; without it the pointer stays at the edge (useful for games). Applies when leaving a machine's screen, also on the way back. Empty = cross freely.</div></div>
-        <label for="s-park">Cursor while controlling another machine</label><div><select id="s-park"></select>
-          <div class="hint">While its mouse drives another machine. Coming back over an edge, the cursor enters where the pointer crossed; any other way back shows it where it is. GNOME on Wayland can only keep it at the edge.</div></div>
+          <div class="hint">Hold it while the pointer reaches an edge to switch machines (both ways); without it the pointer stays at the edge, e.g. for games. Empty = cross freely.</div></div>
+        <label for="s-park">Cursor while controlling</label><div><select id="s-park"></select>
+          <div class="hint">This machine's cursor while its mouse drives another machine. Coming back over an edge it enters where the pointer crossed. GNOME on Wayland can only keep it at the edge.</div></div>
       </div></div>
     </div>
     <div class="card grow">
       <h2>Per-machine settings</h2>
       <p class="hint" style="margin:0 0 6px">Each machine inherits the global allowed networks, crossing key, cursor behaviour and update policy, or uses its own. Rename, enable/disable, mouse speed and removal (credential revocation) are on the Overview tab.</p>
-      <div class="scroll"><table><thead><tr><th>Machine</th><th>Allowed networks</th><th>Crossing key</th><th>Cursor</th><th>Updates</th></tr></thead><tbody id="overrides"></tbody></table></div>
+      <div class="scroll"><table id="ovr"><thead><tr><th>Machine</th><th>Allowed networks</th><th>Crossing key</th><th>Cursor</th><th>Updates</th></tr></thead><tbody id="overrides"></tbody></table></div>
     </div>
   </div>
   <div class="row footer"><button class="btn primary" id="savesettings">Save settings</button><button class="btn" id="reloadsettings">Reload</button></div>
@@ -492,7 +531,7 @@ function keyField(value) {
   inp.addEventListener("blur", () => { if (recording) stop(); });
   either.addEventListener("change", () => { if (seen.length) inp.value = comboText(seen, either.checked); });
   none.addEventListener("click", () => { stop(); seen = []; inp.value = ""; });
-  return { el: el("span", { class: "row" }, inp, rec, none, el("label", { class: "hint", title: "Record Ctrl instead of LeftCtrl" }, either, " either side")), input: inp };
+  return { el: el("span", { class: "row keyf" }, inp, rec, none, el("label", { class: "hint", title: "Record Ctrl instead of LeftCtrl" }, either, " either side")), input: inp };
 }
 
 // ---- allowed networks ----
@@ -594,11 +633,11 @@ async function renderOverrides(global) {
     });
     const status = el("span", { class: "badge " + ({ online: "ok", away: "warn", update_only: "warn" }[n.status] || "mute") }, n.status.replace("_", "-"));
     tb.append(el("tr", {},
-      el("td", {}, n.name, " ", status, el("div", { class: "hint" }, statusWhy(n)), save),
-      el("td", {}, el("div", { class: "row" }, netMode), nets),
-      el("td", {}, el("div", { class: "row" }, keyMode), key.el),
-      el("td", {}, park, note ? el("div", { class: "hint" }, note) : ""),
-      el("td", {}, upd)));
+      el("td", { class: "who" }, el("b", {}, n.name), status, el("div", { class: "hint" }, statusWhy(n)), save),
+      el("td", { "data-label": "Allowed networks" }, el("div", { class: "row" }, netMode), nets),
+      el("td", { "data-label": "Crossing key" }, el("div", { class: "row" }, keyMode), key.el),
+      el("td", { "data-label": "Cursor" }, park, note ? el("div", { class: "hint" }, note) : ""),
+      el("td", { "data-label": "Updates" }, upd)));
   }
   if (!st.nodes.length) tb.append(el("tr", {}, el("td", { colspan: 5, class: "hint" }, "No machines yet.")));
 }

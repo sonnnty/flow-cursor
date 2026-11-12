@@ -63,6 +63,11 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
 
 - `build/e2e-update.sh`: ติดตั้ง build เก่าใน ubuntu:22.04 แล้วดูมันอัปเดตตัวเองจาก hub image จริง และ rollback เมื่อ build ใหม่เสีย
 - `build/ui-smoke.sh`: เปิด tray และหน้าต่างสถานะบนจอจำลอง (Xvfb) แล้วบันทึกภาพหน้าจอลง `build/out/ui-smoke/`
+- `build/dash-check.sh`: เปิด dashboard ใน Chromium แบบ headless (image ของ Playwright) กับ API จำลอง
+  เช็คว่าหน้าไม่เลื่อน และทุกช่องในแท็บ Settings มองเห็นที่ 1024x700, 1130x900, 1366x650 และ 1920x900 ภาพอยู่ใน `build/out/dash-check/`
+  ไม่ต้อง build ก่อน แต่ครั้งแรกต้องมี network เพื่อโหลด `playwright-core`
+
+test ของคลิปบอร์ด GNOME (`agent/src/backend/linux/portalclip.rs`) ใช้ portal จำลองบน `dbus-daemon` ส่วนตัว ถ้าไม่มี `dbus-daemon` test จะข้ามไป
 
 ## วัด latency
 

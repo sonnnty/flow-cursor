@@ -25,11 +25,19 @@
 //! signal mutter's sessions react to) and, without that interface, reads
 //! the zones every [`DISPLAY_POLL`]. After a change (debounced by
 //! [`DISPLAY_SETTLE`]) it reads the zones again with `GetZones` (allowed
-//! in every state of an open session), reports them as
-//! [`LocalEvent::MonitorsChanged`] and re-arms the barriers: a session that
-//! was never enabled just gets barriers for the new zone set, an enabled
-//! one is dead and is replaced by a new session, which GNOME 46 may ask
-//! permission for again. Without edges no session is replaced.
+//! in every state of an open session) and reports them as
+//! [`LocalEvent::MonitorsChanged`]. Barriers remember the session and the
+//! zone set they were set for; an enabled session whose zone set is no
+//! longer the compositor's (or whose monitors changed) is dead. Re-enabling
+//! it would set barriers but no input would flow (mutter dropped its EI
+//! devices), so it is replaced by a new session, which GNOME 46 asks
+//! permission for again. A session that was never enabled just gets
+//! barriers for the new zone set. With new monitors the loop waits up to
+//! [`ZONES_SETTLE`] for the core's edges of the new layout, so one change
+//! makes at most one new session. The same check runs every
+//! [`HEALTH_CHECK`] and when the core sends the same edges again (hub
+//! reconnect), for changes nobody signalled. Without edges capture is
+//! turned off and no session is replaced until edges return.
 //!
 //! **Local cursor while capturing** (cursor-park setting): GNOME 46 cannot
 //! do "centre" or "hide", so this backend reports no cursor support and
@@ -66,17 +74,20 @@
 //!
 //! **Clipboard** – the portal Clipboard interface on the RemoteDesktop
 //! session (xdg-desktop-portal ≥ 1.17, GNOME ≥ 45), so only while that
-//! session is open. If a session opens without it (or the RemoteDesktop
-//! portal is missing), the X11 CLIPBOARD selection through XWayland is used
-//! from then on (mutter syncs it with the Wayland clipboard), which needs
-//! XWayland to be running.
+//! session is open (see [`super::portalclip`]). Content from another
+//! machine that arrives while no session is open is put on the clipboard
+//! when the next one opens. If a session opens without it (or the
+//! RemoteDesktop portal is missing), the X11 CLIPBOARD selection through
+//! XWayland is used from then on (mutter syncs it with the Wayland
+//! clipboard), which needs XWayland to be running.
 
+use super::portalclip::{self, ClipWork, PortalClip};
 use super::x11clip::{self, X11Clipboard};
-use super::{button_to_evdev, evdev_to_button, PNG_MIME, TEXT_MIMES};
-use crate::backend::{Backend, BackendOptions, EventRx, EventTx, LocalEvent};
+use super::{button_to_evdev, evdev_to_button};
+use crate::backend::{Backend, BackendOptions, CaptureReport, EventRx, EventTx, LocalEvent};
 use crate::config::{load_portal_token, save_portal_token};
 use anyhow::{anyhow, Context, Result};
-use ashpd::desktop::clipboard::{Clipboard, SetSelectionOptions};
+use ashpd::desktop::clipboard::Clipboard;
 use ashpd::desktop::input_capture::{
     Activated, Barrier, BarrierID, BarrierPosition, Capabilities as IcCaps, CreateSessionOptions as IcCreate,
     Deactivated, Disabled, InputCapture, ReleaseOptions, Zones, ZonesChanged,
@@ -102,6 +113,9 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 const RD_TOKEN: &str = "remote_desktop";
+/// How long content from another machine is kept for a session that is
+/// not open yet (opening takes a moment, a dialog maybe longer).
+const REMOTE_CLIP_KEEP: Duration = Duration::from_secs(60);
 
 enum InjCmd {
     Inject(Action),
@@ -123,6 +137,10 @@ struct RdShared {
     /// X11 clipboard through XWayland, when the portal clipboard is missing.
     x11clip: OnceLock<X11Clipboard>,
     x11_tried: AtomicBool,
+    /// Content from another machine that arrived while no session with the
+    /// portal clipboard was open, and when; set when the next one opens
+    /// within [`REMOTE_CLIP_KEEP`].
+    remote_clip: Mutex<Option<(Instant, ClipContent)>>,
     events: EventTx,
 }
 
@@ -134,6 +152,7 @@ impl RdShared {
             clip: AtomicBool::new(false),
             x11clip: OnceLock::new(),
             x11_tried: AtomicBool::new(false),
+            remote_clip: Mutex::new(None),
             events,
         }
     }
@@ -149,6 +168,28 @@ impl RdShared {
 
     fn portal_clip(&self) -> bool {
         self.injecting() && self.clip.load(Ordering::SeqCst)
+    }
+
+    /// The open session lost its portal clipboard.
+    fn lose_clip(&self) {
+        if self.clip.swap(false, Ordering::SeqCst) {
+            let _ = self.events.send(LocalEvent::CapsChanged);
+        }
+    }
+
+    fn keep_remote_clip(&self, c: Option<ClipContent>) {
+        *self.remote_clip.lock().expect("poisoned") = c.map(|c| (Instant::now(), c));
+    }
+
+    /// Remote content kept for the session that just opened, unless it is
+    /// too old to still be what the user expects to paste.
+    fn take_remote_clip(&self) -> Option<ClipContent> {
+        let (at, c) = self.remote_clip.lock().expect("poisoned").take()?;
+        if at.elapsed() > REMOTE_CLIP_KEEP {
+            debug!("clipboard from another machine dropped: too old by the time the session opened");
+            return None;
+        }
+        Some(c)
     }
 
     /// Records whether a session is open; the core re-reads the caps.
@@ -190,6 +231,7 @@ pub struct WaylandBackend {
     inj: Option<mpsc::UnboundedSender<InjCmd>>,
     rd: Arc<RdShared>,
     cap: Option<mpsc::UnboundedSender<CapCmd>>,
+    capture_report: Arc<Mutex<CaptureShared>>,
 }
 
 pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)> {
@@ -206,7 +248,8 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
             None
         }
     };
-    let cap = match start_capture(tx.clone(), monitors.clone()).await {
+    let capture_report = Arc::new(Mutex::new(CaptureShared::default()));
+    let cap = match start_capture(tx.clone(), monitors.clone(), capture_report.clone()).await {
         Ok(s) => Some(s),
         Err(e) if is_refusal(&e) => {
             warn!("{IC_REFUSED}");
@@ -236,7 +279,7 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
     if inj.is_none() && cap.is_none() {
         return Err(anyhow!("neither the RemoteDesktop nor the InputCapture portal works in this session"));
     }
-    let b = WaylandBackend { monitors, inj, rd, cap };
+    let b = WaylandBackend { monitors, inj, rd, cap, capture_report };
     info!(
         caps = ?b.caps(),
         remote_desktop = b.inj.is_some(),
@@ -342,13 +385,29 @@ impl Backend for WaylandBackend {
     fn edge_hit_captures(&self) -> bool {
         self.cap.is_some()
     }
+    fn capture_report(&self) -> Option<CaptureReport> {
+        if self.cap.is_none() {
+            let refused = crate::problems::list().iter().any(|p| p == IC_REFUSED);
+            return Some(CaptureReport {
+                state: if refused { "refused" } else { "unavailable" }.into(),
+                ..Default::default()
+            });
+        }
+        Some(self.capture_report.lock().expect("poisoned").report())
+    }
     fn set_clipboard(&self, content: &ClipContent) {
         if self.rd.portal_clip() {
+            self.rd.keep_remote_clip(None);
             if let Some(i) = &self.inj {
                 let _ = i.send(InjCmd::SetClipboard(content.clone()));
             }
         } else if let Some(c) = self.rd.x11clip.get() {
             c.set(content);
+        } else if self.inj.is_some() {
+            // Not open (yet), e.g. still opening after the hub connection
+            // came back: set it once the session is there.
+            info!("clipboard from another machine kept until the remote control session is open");
+            self.rd.keep_remote_clip(Some(content.clone()));
         }
     }
 }
@@ -624,7 +683,7 @@ const IC_REFUSED: &str = "input capture permission (InputCapture portal) was ref
                           controlled";
 
 type EiParts = (ei::Context, reis::event::Connection, reis::tokio::EiConvertEventStream);
-type InjParts = (RemoteDesktop, Session<RemoteDesktop>, Option<Clipboard>, Option<EiParts>);
+type InjParts = (RemoteDesktop, Session<RemoteDesktop>, Option<PortalClip>, Option<EiParts>);
 
 async fn setup_injector(state_dir: &std::path::Path) -> Result<InjParts> {
     let bus = session_bus().await?;
@@ -664,11 +723,28 @@ async fn setup_injector(state_dir: &std::path::Path) -> Result<InjParts> {
             warn!("could not store the portal restore token: {e:#}");
         }
     }
-    let clipboard = if clipboard.is_some() && resp.is_clipboard_enabled() {
-        info!("clipboard via the portal Clipboard interface");
-        clipboard
-    } else {
-        None
+    let clipboard = match clipboard {
+        Some(c) if resp.is_clipboard_enabled() => match portalclip::session_path(&session) {
+            Ok(path) => match PortalClip::subscribe(c, path).await {
+                Ok(c) => {
+                    info!("clipboard via the portal Clipboard interface");
+                    Some(c)
+                }
+                Err(e) => {
+                    warn!("portal clipboard unavailable: {e:#}");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("portal clipboard unavailable: {e:#}");
+                None
+            }
+        },
+        Some(_) => {
+            info!("the portal did not enable the clipboard for this session");
+            None
+        }
+        None => None,
     };
     let eis = match rd.connect_to_eis(&session, Default::default()).await {
         Ok(fd) => {
@@ -726,7 +802,7 @@ async fn run_ei_sender(
     rd: &RdShared,
     _portal: RemoteDesktop,
     session: Session<RemoteDesktop>,
-    clipboard: Option<Clipboard>,
+    mut clip: Option<PortalClip>,
 ) -> InjEnd {
     let tx = rd.events.clone();
     if !rd.wanted() {
@@ -736,15 +812,14 @@ async fn run_ei_sender(
     let mut devs = EiDevices::default();
     let mut sequence = 1u32;
     let mut last_abs: Option<(f32, f32)> = None;
-    let clip = clipboard;
-    let mut owned: Option<ClipContent> = None;
-    let (mut owner_changes, mut transfers) = match &clip {
-        Some(c) => (
-            c.receive_selection_owner_changed::<RemoteDesktop>().await.ok().map(|s| s.boxed()),
-            c.receive_selection_transfer::<RemoteDesktop>().await.ok().map(|s| s.boxed()),
-        ),
-        None => (None, None),
-    };
+    if let Some(c) = clip.as_mut() {
+        if let Some(content) = rd.take_remote_clip() {
+            info!("setting the clipboard from another machine that arrived before the session was open");
+            if let Err(e) = c.set(content).await {
+                warn!("setting the clipboard failed: {e:#}");
+            }
+        }
+    }
     let end = loop {
         tokio::select! {
             ev = events.next() => match ev {
@@ -801,89 +876,42 @@ async fn run_ei_sender(
                     let _ = ctx.flush();
                 }
                 Some(InjCmd::SetClipboard(c)) => {
-                    if let Some(cs) = &clip {
-                        let mimes: Vec<&str> = match &c {
-                            ClipContent::Text(_) => TEXT_MIMES.to_vec(),
-                            ClipContent::Image { .. } => vec![PNG_MIME],
-                        };
-                        owned = Some(c);
-                        let set = cs.set_selection(&session, SetSelectionOptions::default().set_mime_types(&mimes));
-                        if let Err(e) = bounded("Clipboard.SetSelection", set).await {
+                    if let Some(cs) = clip.as_mut() {
+                        if let Err(e) = cs.set(c).await {
                             warn!("setting the clipboard failed: {e:#}");
                         }
                     }
                 }
             },
-            change = next_or_pending(&mut owner_changes) => {
-                let Some((_s, change)) = change else {
-                    // Not polled again once ended.
-                    owner_changes = None;
-                    continue;
-                };
-                if change.session_is_owner() == Some(true) {
-                    continue;
-                }
-                let Some(cs) = &clip else { continue };
-                let mimes = change.mime_types();
-                let pick = if mimes.iter().any(|m| m == PNG_MIME) {
-                    Some(PNG_MIME.to_string())
-                } else {
-                    TEXT_MIMES.iter().find(|t| mimes.iter().any(|m| m == *t)).map(|s| s.to_string())
-                };
-                if let Some(mime) = pick {
-                    match bounded("Clipboard.SelectionRead", cs.selection_read(&session, &mime)).await {
-                        Ok(fd) => {
-                            let tx = tx.clone();
-                            tokio::task::spawn_blocking(move || {
-                                use std::io::Read;
-                                let mut f = std::fs::File::from(std::os::fd::OwnedFd::from(fd));
-                                let mut buf = Vec::new();
-                                if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                                    let c = if mime == PNG_MIME {
-                                        ClipContent::Image { png: buf }
-                                    } else {
-                                        ClipContent::Text(String::from_utf8_lossy(&buf).into_owned())
-                                    };
-                                    let _ = tx.send(LocalEvent::Clipboard(c));
-                                }
-                            });
+            work = next_clip(&mut clip) => match work {
+                ClipWork::Read(mime) => {
+                    if let Some(cs) = &clip {
+                        if let Err(e) = cs.read(&mime, &tx).await {
+                            warn!("clipboard read failed: {e:#}");
                         }
-                        Err(e) => debug!("clipboard read failed: {e}"),
                     }
                 }
-            }
-            transfer = next_or_pending(&mut transfers) => {
-                let Some((_s, mime, serial)) = transfer else {
-                    transfers = None;
-                    continue;
-                };
-                let Some(cs) = &clip else { continue };
-                let data: Option<Vec<u8>> = match &owned {
-                    Some(ClipContent::Text(t)) if TEXT_MIMES.contains(&mime.as_str()) => Some(t.as_bytes().to_vec()),
-                    Some(ClipContent::Image { png }) if mime == PNG_MIME => Some(png.clone()),
-                    _ => None,
-                };
-                let ok = match (data, bounded("Clipboard.SelectionWrite", cs.selection_write(&session, serial)).await) {
-                    // A reader that never drains the pipe must not park this
-                    // loop: stop waiting (the blocking write is abandoned).
-                    (Some(d), Ok(fd)) => bounded("clipboard write", tokio::task::spawn_blocking(move || {
-                        use std::io::Write;
-                        std::fs::File::from(std::os::fd::OwnedFd::from(fd)).write_all(&d).is_ok()
-                    })).await.unwrap_or(false),
-                    _ => false,
-                };
-                let _ = bounded("Clipboard.SelectionWriteDone", cs.selection_write_done(&session, serial, ok)).await;
-            }
+                ClipWork::Transfer { mime, serial } => {
+                    if let Some(cs) = &clip {
+                        cs.transfer(&mime, serial).await;
+                    }
+                }
+                ClipWork::Ended(what) => {
+                    warn!("the portal clipboard signal {what} ended; no clipboard until the session is reopened");
+                    clip = None;
+                    rd.lose_clip();
+                }
+            },
         }
     };
     let _ = bounded("Session.Close", session.close()).await;
     end
 }
 
-/// Next item of an optional stream; never resolves without a stream.
-async fn next_or_pending<S: futures_util::Stream + Unpin>(s: &mut Option<S>) -> Option<S::Item> {
-    match s {
-        Some(s) => s.next().await,
+/// Next work of the session's clipboard; never resolves without one.
+async fn next_clip(c: &mut Option<PortalClip>) -> ClipWork {
+    match c {
+        Some(c) => c.next().await,
         None => std::future::pending().await,
     }
 }
@@ -1072,9 +1100,21 @@ enum CapEvent {
     Deactivated,
     /// The compositor disabled the session (GNOME 46 cannot re-enable it).
     Disabled,
+    /// The monitor configuration changed. mutter (gnome-46
+    /// `on_monitors_changed`) then disables the session without a
+    /// `Disabled` signal: its barriers and EI devices are gone.
     ZonesChanged,
     /// Captured input, already converted.
     Input(LocalEvent),
+}
+
+/// Barriers the compositor accepted, by our barrier id.
+#[derive(Debug, Default)]
+struct BarrierSet {
+    ids: HashMap<u32, Side>,
+    refused: usize,
+    /// The zone set they were set for.
+    zone_set: u32,
 }
 
 /// The InputCapture operations the capture loop needs. [`PortalCapture`]
@@ -1086,21 +1126,25 @@ trait CapturePortal {
     async fn open(&mut self) -> Result<Vec<Monitor>>;
     /// Disables and closes the current session, if any.
     async fn close(&mut self);
-    /// Sets pointer barriers for `edges`; returns barrier id → side.
-    async fn set_barriers(&mut self, edges: &[Edge]) -> Result<HashMap<u32, Side>>;
+    /// Sets pointer barriers for `edges` on the current zone set.
+    async fn set_barriers(&mut self, edges: &[Edge]) -> Result<BarrierSet>;
     async fn enable(&mut self) -> Result<()>;
     /// Turns capture off; on GNOME 46 the session cannot be enabled again.
     async fn disable(&mut self) -> Result<()>;
     async fn release(&mut self, activation_id: Option<u32>, pos: Option<(f64, f64)>) -> Result<()>;
-    /// Reads the zones again (also refreshes the zone set the barriers
-    /// refer to).
-    async fn zones(&mut self) -> Result<Vec<Monitor>>;
+    /// Reads the zones again: (zone set, monitors). Also brings the zone
+    /// set the next barriers refer to up to date.
+    async fn zones(&mut self) -> Result<(u32, Vec<Monitor>)>;
     /// Next event of the open session, `None` once the session is gone (EI
     /// stream closed or failed, portal signals ended). Must be cancel-safe.
     async fn next_event(&mut self) -> Option<CapEvent>;
 }
 
-async fn start_capture(tx: EventTx, monitors: Arc<Mutex<Vec<Monitor>>>) -> Result<mpsc::UnboundedSender<CapCmd>> {
+async fn start_capture(
+    tx: EventTx,
+    monitors: Arc<Mutex<Vec<Monitor>>>,
+    report: Arc<Mutex<CaptureShared>>,
+) -> Result<mpsc::UnboundedSender<CapCmd>> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let ready = spawn_portal_thread("portal-capture", move |ready| async move {
         let mut portal = PortalCapture::default();
@@ -1109,7 +1153,7 @@ async fn start_capture(tx: EventTx, monitors: Arc<Mutex<Vec<Monitor>>>) -> Resul
                 *monitors.lock().expect("poisoned") = m;
                 let _ = ready.send(Ok(()));
                 let display = display_watch().await;
-                run_capture(portal, cmd_rx, tx, monitors, display).await;
+                run_capture(portal, cmd_rx, tx, monitors, display, report).await;
             }
             Err(e) => {
                 let _ = ready.send(Err(e));
@@ -1148,7 +1192,14 @@ where
     T: for<'de> serde::Deserialize<'de> + ashpd::wire::Type + 'static,
 {
     let s = proxy.receive_signal(name).await.with_context(|| format!("subscribing to InputCapture.{name}"))?;
-    Ok(s.filter_map(|m| std::future::ready(m.body().deserialize::<T>().ok())).boxed_local())
+    Ok(s.filter_map(move |m| {
+        let r = m.body().deserialize::<T>();
+        if let Err(e) = &r {
+            warn!("unexpected InputCapture.{name} signal: {e}");
+        }
+        std::future::ready(r.ok())
+    })
+    .boxed_local())
 }
 
 impl PortalCapture {
@@ -1183,6 +1234,7 @@ impl CapturePortal for PortalCapture {
             .map_err(|e| anyhow!("EI handshake: {e:?}"))?;
         let zones = bounded("InputCapture.GetZones", ic.zones(&session, Default::default())).await?.response()?;
         let mons = zones_to_monitors(&zones);
+        info!(zone_set = zones.zone_set(), zones = mons.len(), "input capture session created");
         self.scroll_acc = (0.0, 0.0);
         self.live =
             Some(LiveCapture { ic, session, ctx, events, zones, activated, deactivated, disabled, zones_changed });
@@ -1193,24 +1245,26 @@ impl CapturePortal for PortalCapture {
         if let Some(l) = self.live.take() {
             let _ = bounded("InputCapture.Disable", l.ic.disable(&l.session, Default::default())).await;
             let _ = bounded("Session.Close", l.session.close()).await;
+            info!("input capture session disabled and closed");
         }
     }
 
-    async fn set_barriers(&mut self, edges: &[Edge]) -> Result<HashMap<u32, Side>> {
+    async fn set_barriers(&mut self, edges: &[Edge]) -> Result<BarrierSet> {
         let l = self.live()?;
-        let mut map = HashMap::new();
+        let mut ids = HashMap::new();
         let barriers: Vec<Barrier> = edges
             .iter()
             .enumerate()
             .filter_map(|(i, e)| {
                 let id = BarrierID::new(i as u32 + 1)?;
-                map.insert(i as u32 + 1, e.side);
+                ids.insert(i as u32 + 1, e.side);
                 Some(Barrier::new(id, barrier_for(e)))
             })
             .collect();
+        let zone_set = l.zones.zone_set();
         let resp = bounded(
             "InputCapture.SetPointerBarriers",
-            l.ic.set_pointer_barriers(&l.session, &barriers, l.zones.zone_set(), Default::default()),
+            l.ic.set_pointer_barriers(&l.session, &barriers, zone_set, Default::default()),
         )
         .await?
         .response()?;
@@ -1218,8 +1272,11 @@ impl CapturePortal for PortalCapture {
         if !failed.is_empty() {
             warn!(?failed, "the compositor refused some pointer barriers (they must lie on outer screen edges)");
         }
-        info!(barriers = barriers.len() - failed.len(), "pointer barriers set");
-        Ok(map)
+        for f in failed {
+            ids.remove(&f.get());
+        }
+        info!(barriers = ids.len(), zone_set, "pointer barriers set");
+        Ok(BarrierSet { refused: barriers.len() - ids.len(), ids, zone_set })
     }
 
     async fn enable(&mut self) -> Result<()> {
@@ -1238,10 +1295,10 @@ impl CapturePortal for PortalCapture {
         bounded("InputCapture.Release", l.ic.release(&l.session, opts)).await
     }
 
-    async fn zones(&mut self) -> Result<Vec<Monitor>> {
+    async fn zones(&mut self) -> Result<(u32, Vec<Monitor>)> {
         let l = self.live()?;
         l.zones = bounded("InputCapture.GetZones", l.ic.zones(&l.session, Default::default())).await?.response()?;
-        Ok(zones_to_monitors(&l.zones))
+        Ok((l.zones.zone_set(), zones_to_monitors(&l.zones)))
     }
 
     async fn next_event(&mut self) -> Option<CapEvent> {
@@ -1314,7 +1371,54 @@ fn inside(side: Side, x: f64, y: f64) -> (f64, f64) {
     }
 }
 
+/// After a monitor change, how long the core gets to send the edges of the
+/// new layout before the session is brought in line with the edges it has
+/// (hub down, layout unchanged): one new session (and permission dialog)
+/// per change instead of two.
+const ZONES_SETTLE: Duration = Duration::from_secs(2);
+/// How often the session is checked against the compositor's zone set (a
+/// changed set means the barriers of an enabled session are gone).
+const HEALTH_CHECK: Duration = Duration::from_secs(30);
+
+/// What the capture loop shares for [`Backend::capture_report`]: times as
+/// instants, turned into ages when the report is asked for.
+#[derive(Clone, Debug, Default)]
+struct CaptureShared {
+    state: String,
+    barriers: usize,
+    barriers_refused: usize,
+    zone_set: Option<u32>,
+    sessions: u32,
+    opened_at: Option<Instant>,
+    last_activation: Option<Instant>,
+    last_change: Option<(String, Instant)>,
+}
+
+impl CaptureShared {
+    fn report(&self) -> CaptureReport {
+        CaptureReport {
+            state: self.state.clone(),
+            barriers: self.barriers,
+            barriers_refused: self.barriers_refused,
+            zone_set: self.zone_set,
+            sessions: self.sessions,
+            session_age: self.opened_at.map(|t| t.elapsed()),
+            since_activation: self.last_activation.map(|t| t.elapsed()),
+            last_change: self.last_change.as_ref().map(|c| c.0.clone()),
+            since_change: self.last_change.as_ref().map(|c| c.1.elapsed()),
+        }
+    }
+}
+
 /// State of the capture loop around one [`CapturePortal`].
+///
+/// One recovery path for every way the barriers can die: a monitor change
+/// (DisplayConfig, the portal's `ZonesChanged` or a poll, read after
+/// [`DISPLAY_SETTLE`]), a `Disabled` signal, and the periodic or
+/// re-sent-edges check. Each of them ends in [`Capture::verify`] or
+/// [`Capture::went_stale`], and every session change goes through
+/// [`Capture::sync`], which creates at most one new session for the edges
+/// the core wants.
 struct Capture<P> {
     portal: P,
     cmds: mpsc::UnboundedReceiver<CapCmd>,
@@ -1324,27 +1428,43 @@ struct Capture<P> {
     edges: Vec<Edge>,
     /// Edges of the barriers of the enabled session.
     armed: Vec<Edge>,
-    ids: HashMap<u32, Side>,
+    /// Barriers of the current session (empty without one).
+    barriers: BarrierSet,
+    /// (session, zone set) the enabled barriers belong to.
+    applied: Option<(u32, u32)>,
     /// The portal has a live session.
     open: bool,
     enabled: bool,
-    /// Disabled by the compositor: GNOME 46 cannot re-enable a session, so
-    /// the next barrier update creates a new one.
+    /// The session cannot take barriers any more: the compositor disabled
+    /// it (a `Disabled` signal, or a monitor change, after which GNOME 46
+    /// drops barriers and EI devices without a signal) or we did (no
+    /// edges). GNOME 46 cannot enable a session twice: the next edges need
+    /// a new session.
     stale: bool,
+    /// The dialog was refused: nothing is re-created until a restart.
+    refused: bool,
     /// (activation id, side, cursor position) while captured.
     active: Option<(Option<u32>, Side, (f64, f64))>,
     released_by_us: bool,
     backoff: Backoff,
     /// When to re-create a lost session.
     retry_at: Option<Instant>,
+    /// When to bring the session in line with the edges unless new edges
+    /// arrive first (see [`ZONES_SETTLE`]).
+    sync_at: Option<Instant>,
+    next_check: Instant,
+    /// Sessions created so far; the current one is number `sessions`.
+    sessions: u32,
     /// When the current session was created; a session that lived longer
     /// than [`RETRY_MAX`] resets the backoff when it is lost.
     opened_at: Instant,
+    last_activation: Option<Instant>,
+    last_change: Option<(String, Instant)>,
+    report: Arc<Mutex<CaptureShared>>,
     /// Monitor change hints.
     display: LocalBoxStream<'static, DisplayTick>,
-    /// When to read the zones after a hint, and whether the compositor
-    /// said they changed (an enabled session is then dead on GNOME).
-    display_due: Option<(Instant, bool)>,
+    /// When to read the zones after a hint.
+    display_due: Option<Instant>,
 }
 
 /// Runs the capture loop until the backend is dropped. The portal must have
@@ -1357,6 +1477,7 @@ async fn run_capture<P: CapturePortal>(
     tx: EventTx,
     monitors: Arc<Mutex<Vec<Monitor>>>,
     display: LocalBoxStream<'static, DisplayTick>,
+    report: Arc<Mutex<CaptureShared>>,
 ) {
     let mut c = Capture {
         portal,
@@ -1365,21 +1486,31 @@ async fn run_capture<P: CapturePortal>(
         monitors,
         edges: Vec::new(),
         armed: Vec::new(),
-        ids: HashMap::new(),
+        barriers: BarrierSet::default(),
+        applied: None,
         open: true,
         enabled: false,
         stale: false,
+        refused: false,
         active: None,
         released_by_us: false,
         backoff: Backoff::default(),
         retry_at: None,
+        sync_at: None,
+        next_check: Instant::now() + HEALTH_CHECK,
+        sessions: 1,
         opened_at: Instant::now(),
+        last_activation: None,
+        last_change: None,
+        report,
         display,
         display_due: None,
     };
+    c.publish();
     loop {
         let retry_at = c.retry_at;
-        let display_due = c.display_due.map(|(at, _)| at);
+        let sync_at = c.sync_at;
+        let display_due = c.display_due;
         tokio::select! {
             cmd = c.cmds.recv() => match cmd {
                 None => {
@@ -1390,6 +1521,11 @@ async fn run_capture<P: CapturePortal>(
                 Some(CapCmd::Release(warp)) => c.release(warp).await,
             },
             ev = c.portal.next_event(), if c.open => match ev {
+                // Captured input is the hot path and changes nothing shown.
+                Some(CapEvent::Input(le)) => {
+                    c.on_event(CapEvent::Input(le)).await;
+                    continue;
+                }
                 Some(ev) => c.on_event(ev).await,
                 None => c.lost("the EI capture stream closed").await,
             },
@@ -1397,21 +1533,74 @@ async fn run_capture<P: CapturePortal>(
                 c.retry_at = None;
                 c.reopen().await;
             }
+            _ = tokio::time::sleep_until(sync_at.unwrap_or_else(Instant::now)), if sync_at.is_some() => {
+                c.sync_at = None;
+                // While a monitor change settles, reading the zones decides.
+                if c.display_due.is_none() {
+                    c.sync().await;
+                }
+            }
+            _ = tokio::time::sleep_until(c.next_check) => {
+                c.check().await;
+            }
             tick = c.display.next() => match tick {
                 Some(t) => c.display_hint(t),
                 // The bus connection is gone: fall back to polling.
                 None => c.display = poll_ticks(),
             },
             _ = tokio::time::sleep_until(display_due.unwrap_or_else(Instant::now)), if display_due.is_some() => {
-                c.display_changed().await;
+                c.display_due = None;
+                if c.open {
+                    // A new session reads the zones when it opens.
+                    c.verify("the monitors changed").await;
+                }
             }
         }
+        c.publish();
     }
 }
 
 impl<P: CapturePortal> Capture<P> {
+    fn changed(&mut self, what: impl Into<String>) {
+        self.last_change = Some((what.into(), Instant::now()));
+    }
+
+    /// Updates what [`Backend::capture_report`] returns.
+    fn publish(&self) {
+        let state = if self.refused {
+            "refused"
+        } else if !self.open {
+            "lost"
+        } else if self.edges.is_empty() {
+            "no edges"
+        } else if self.stale {
+            "re-creating"
+        } else if self.enabled {
+            "enabled"
+        } else {
+            "not enabled"
+        };
+        self.publish_state(state);
+    }
+
+    fn publish_state(&self, state: &str) {
+        *self.report.lock().expect("poisoned") = CaptureShared {
+            state: state.into(),
+            barriers: if self.enabled { self.barriers.ids.len() } else { 0 },
+            barriers_refused: self.barriers.refused,
+            zone_set: self.applied.map(|a| a.1),
+            sessions: self.sessions,
+            opened_at: self.open.then_some(self.opened_at),
+            last_activation: self.last_activation,
+            last_change: self.last_change.clone(),
+        };
+    }
+
     async fn set_edges(&mut self, new: Vec<Edge>) {
         if new == self.edges && self.enabled {
+            // The same edges again (e.g. the hub connection came back): a
+            // cheap check that the barriers are still in place.
+            self.check().await;
             return;
         }
         self.edges = new;
@@ -1428,6 +1617,7 @@ impl<P: CapturePortal> Capture<P> {
     /// (enabled with other barriers, or turned off: GNOME 46 cannot enable
     /// a session twice).
     async fn sync(&mut self) {
+        self.sync_at = None;
         if !self.open {
             // Applied when the session is back.
             return;
@@ -1442,7 +1632,10 @@ impl<P: CapturePortal> Capture<P> {
                 }
                 self.enabled = false;
                 self.stale = true;
+                self.applied = None;
                 self.armed.clear();
+                info!("no edges lead to another machine: input capture turned off");
+                self.changed("no edges");
             }
             return;
         }
@@ -1450,89 +1643,123 @@ impl<P: CapturePortal> Capture<P> {
             return;
         }
         if self.enabled || self.stale {
-            // Closing the old session ends a capture in progress.
-            self.end_active();
-            match self.portal.open().await {
-                Ok(m) => {
-                    self.enabled = false;
-                    self.stale = false;
-                    self.armed.clear();
-                    self.opened_at = Instant::now();
-                    self.take_queued_edges();
-                    self.store_monitors(m);
-                }
-                Err(e) => {
-                    self.open = false;
-                    self.enabled = false;
-                    self.open_failed(e, "re-creating the capture session failed");
+            let why = if self.stale { "the compositor turned it off" } else { "the edges changed" };
+            match self.recreate(why).await {
+                None => return,
+                // The core answers MonitorsChanged with new edges.
+                Some(true) => {
+                    self.sync_at = Some(Instant::now() + ZONES_SETTLE);
                     return;
                 }
+                Some(false) => {}
             }
         }
         self.apply_edges().await;
     }
 
+    /// Replaces the session with a new one (GNOME asks for permission
+    /// again); whether the monitors changed, `None` when that failed (a
+    /// retry is scheduled unless the dialog was refused).
+    async fn recreate(&mut self, why: &str) -> Option<bool> {
+        // Closing the old session ends a capture in progress.
+        self.end_active();
+        info!("re-creating the input capture session ({why}); GNOME may ask for permission again");
+        self.publish_state("opening");
+        match self.portal.open().await {
+            Ok(m) => Some(self.session_opened(m)),
+            Err(e) => {
+                self.open = false;
+                self.enabled = false;
+                self.stale = false;
+                self.applied = None;
+                self.armed.clear();
+                self.barriers = BarrierSet::default();
+                self.open_failed(e, "re-creating the capture session failed");
+                None
+            }
+        }
+    }
+
+    /// A new session is open; returns whether its zones are new monitors.
+    fn session_opened(&mut self, m: Vec<Monitor>) -> bool {
+        self.open = true;
+        self.enabled = false;
+        self.stale = false;
+        self.applied = None;
+        self.armed.clear();
+        self.barriers = BarrierSet::default();
+        self.sessions += 1;
+        self.opened_at = Instant::now();
+        self.next_check = Instant::now() + HEALTH_CHECK;
+        crate::problems::clear(PROBLEM_IC);
+        self.changed(format!("session {} created", self.sessions));
+        self.take_queued_edges();
+        self.store_monitors(m)
+    }
+
     /// Remembers the zones of the session as this machine's monitors and
-    /// reports a change.
-    fn store_monitors(&mut self, m: Vec<Monitor>) {
+    /// reports a change; returns whether they changed.
+    fn store_monitors(&mut self, m: Vec<Monitor>) -> bool {
         if m.is_empty() {
             debug!("the compositor reported no zones; keeping the last monitors");
-            return;
+            return false;
         }
         let mut cur = self.monitors.lock().expect("poisoned");
-        if *cur != m {
-            *cur = m.clone();
-            drop(cur);
-            let _ = self.tx.send(LocalEvent::MonitorsChanged(m));
+        if *cur == m {
+            return false;
         }
+        let rects: Vec<String> =
+            m.iter().map(|m| format!("{}x{}@{},{}", m.rect.w, m.rect.h, m.rect.x, m.rect.y)).collect();
+        info!(?rects, "the monitors changed");
+        *cur = m.clone();
+        drop(cur);
+        let _ = self.tx.send(LocalEvent::MonitorsChanged(m));
+        true
     }
 
     /// A hint that the monitors may have changed: read the zones once the
-    /// burst is over.
+    /// burst is over (a session re-created in the middle of it would be
+    /// disabled again).
     fn display_hint(&mut self, t: DisplayTick) {
-        let said = t == DisplayTick::Changed;
-        let settle = if said { DISPLAY_SETTLE } else { Duration::ZERO };
-        let said = said || self.display_due.is_some_and(|(_, s)| s);
         debug!(?t, "monitor change hint");
-        self.display_due = Some((Instant::now() + settle, said));
+        match t {
+            DisplayTick::Changed => self.display_due = Some(Instant::now() + DISPLAY_SETTLE),
+            // A poll does not cut a pending settle time short.
+            DisplayTick::Poll => {
+                self.display_due.get_or_insert_with(Instant::now);
+            }
+        }
     }
 
-    /// Reads the zones after a hint, reports new monitors and re-arms the
-    /// barriers where the change took them down.
-    async fn display_changed(&mut self) {
-        let Some((_, said)) = self.display_due.take() else { return };
-        if !self.open {
-            // A new session reads the zones when it opens.
-            return;
-        }
-        let zones = match self.portal.zones().await {
+    /// Reads the zones (reporting new monitors), finds barriers that died
+    /// without a signal and brings the session in line with the edges.
+    /// Barriers belong to a session and a zone set: mutter bumps the zone
+    /// set with every monitor change and disables the session with it, so
+    /// an enabled session whose zone set is not the current one is dead.
+    async fn verify(&mut self, why: &str) {
+        let (zone_set, m) = match self.portal.zones().await {
             Ok(z) => z,
             Err(e) => {
                 warn!("reading the capture zones failed: {e:#}");
                 return;
             }
         };
-        let changed = !zones.is_empty() && *self.monitors.lock().expect("poisoned") != zones;
-        if changed {
-            let rects: Vec<String> =
-                zones.iter().map(|m| format!("{}x{}@{},{}", m.rect.w, m.rect.h, m.rect.x, m.rect.y)).collect();
-            info!(?rects, "the monitors changed");
-        }
-        if self.enabled && (said || changed) {
-            // mutter disables every enabled session on a monitor change.
+        let new_monitors = !m.is_empty() && *self.monitors.lock().expect("poisoned") != m;
+        let current = self.applied == Some((self.sessions, zone_set));
+        if self.enabled && (new_monitors || !current) {
             info!(
-                "GNOME turned input capture off with the monitor change; a new capture session takes the barriers \
-                 (GNOME may ask for permission again)"
+                applied = ?self.applied,
+                zone_set,
+                session = self.sessions,
+                "the pointer barriers belong to an old session or zone set ({why}); re-creating the session"
             );
-            self.enabled = false;
-            self.stale = true;
-            self.armed.clear();
-            self.end_active();
+            self.changed(format!("barriers out of date ({why})"));
+            self.went_stale();
         }
-        self.store_monitors(zones);
-        if changed {
+        if self.store_monitors(m) {
             // The core answers MonitorsChanged with the edges of the new
-            // layout; `set_edges` arms them.
+            // layout; `set_edges` arms them, else `sync_at` does.
+            self.sync_at = Some(Instant::now() + ZONES_SETTLE);
             return;
         }
         self.sync().await;
@@ -1551,39 +1778,54 @@ impl<P: CapturePortal> Capture<P> {
         }
     }
 
-    /// Sets the barriers for the current edges and enables capture.
+    /// Sets the barriers for the current edges on the current session and
+    /// enables capture.
     async fn apply_edges(&mut self) {
         self.enabled = false;
+        self.applied = None;
         self.armed.clear();
         if self.edges.is_empty() {
+            self.barriers = BarrierSet::default();
             return;
         }
-        let ids = match self.portal.set_barriers(&self.edges).await {
-            Ok(m) => m,
-            Err(e) => {
-                // Barriers refer to a zone set; after an unnoticed monitor
-                // change it is out of date. Read the zones and try once more.
-                debug!("setting pointer barriers failed ({e:#}); reading the zones again");
-                match self.portal.zones().await {
-                    Ok(z) => self.store_monitors(z),
-                    Err(e) => warn!("reading the capture zones failed: {e:#}"),
-                }
-                match self.portal.set_barriers(&self.edges).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!("setting pointer barriers failed: {e:#}");
-                        return;
-                    }
+        // Barriers must name the compositor's current zone set.
+        match self.portal.zones().await {
+            Ok((_, m)) => {
+                if self.store_monitors(m) {
+                    // Changed unnoticed: these edges are for the old
+                    // monitors, the core sends new ones.
+                    self.sync_at = Some(Instant::now() + ZONES_SETTLE);
+                    return;
                 }
             }
-        };
-        self.ids = ids;
+            Err(e) => warn!("reading the capture zones failed: {e:#}"),
+        }
+        match self.portal.set_barriers(&self.edges).await {
+            Ok(b) => self.barriers = b,
+            Err(e) => {
+                warn!("setting pointer barriers failed: {e:#}");
+                self.changed(format!("setting barriers failed: {e:#}"));
+                return;
+            }
+        }
         match self.portal.enable().await {
             Ok(()) => {
                 self.enabled = true;
                 self.armed = self.edges.clone();
+                self.applied = Some((self.sessions, self.barriers.zone_set));
+                info!(
+                    barriers = self.barriers.ids.len(),
+                    zone_set = self.barriers.zone_set,
+                    session = self.sessions,
+                    "input capture enabled"
+                );
+                let n = self.barriers.ids.len();
+                self.changed(format!("enabled with {n} barrier{}", if n == 1 { "" } else { "s" }));
             }
-            Err(e) => warn!("enabling input capture failed: {e:#}"),
+            Err(e) => {
+                warn!("enabling input capture failed: {e:#}");
+                self.changed(format!("enabling failed: {e:#}"));
+            }
         }
     }
 
@@ -1600,11 +1842,13 @@ impl<P: CapturePortal> Capture<P> {
     async fn on_event(&mut self, ev: CapEvent) {
         match ev {
             CapEvent::Activated { activation_id, barrier, pos: (x, y) } => {
-                let Some(side) = barrier.and_then(|b| self.ids.get(&b).copied()) else {
-                    // Activated without one of our barriers: give control back.
+                self.last_activation = Some(Instant::now());
+                let Some(side) = barrier.and_then(|b| self.barriers.ids.get(&b).copied()) else {
+                    warn!(?barrier, ?activation_id, "input capture activated without one of our barriers; releasing");
                     let _ = self.portal.release(activation_id, None).await;
                     return;
                 };
+                debug!(?barrier, ?side, x, y, "pointer barrier hit");
                 self.active = Some((activation_id, side, (x, y)));
                 self.released_by_us = false;
                 let _ = self.tx.send(LocalEvent::EdgeHit { side, x: x.round() as i32, y: y.round() as i32 });
@@ -1615,20 +1859,57 @@ impl<P: CapturePortal> Capture<P> {
                 }
             }
             CapEvent::Disabled => {
-                warn!(
-                    "input capture was disabled by the compositor; a new session is created on the next layout change"
-                );
-                self.enabled = false;
-                self.stale = true;
-                self.armed.clear();
-                self.end_active();
+                warn!("input capture was disabled by the compositor; re-creating the session");
+                self.changed("disabled by the compositor");
+                self.went_stale();
             }
-            CapEvent::ZonesChanged => self.display_hint(DisplayTick::Changed),
+            CapEvent::ZonesChanged => {
+                info!("input capture zones changed (monitor configuration)");
+                self.changed("zones changed");
+                if self.enabled {
+                    // mutter disabled the session with the change (no
+                    // `Disabled` signal): its barriers are gone.
+                    info!("the compositor dropped the pointer barriers with the monitor change");
+                    self.went_stale();
+                }
+                self.display_hint(DisplayTick::Changed);
+            }
             CapEvent::Input(le) => {
                 if self.active.is_some() {
                     let _ = self.tx.send(le);
                 }
             }
+        }
+    }
+
+    /// The session is useless now: end a capture, re-create it shortly
+    /// (or earlier when new edges arrive or the monitors were read).
+    fn went_stale(&mut self) {
+        self.enabled = false;
+        self.stale = true;
+        self.applied = None;
+        self.armed.clear();
+        self.end_active();
+        if self.sync_at.is_none() {
+            self.sync_at = Some(Instant::now() + ZONES_SETTLE);
+        }
+    }
+
+    /// Self-healing, every [`HEALTH_CHECK`] and when the core re-sends the
+    /// same edges: barriers that are set and enabled must belong to the
+    /// current session and zone set (see [`Self::verify`]); a session with
+    /// edges that is not enabled (enable failed) is enabled again.
+    async fn check(&mut self) {
+        self.next_check = Instant::now() + HEALTH_CHECK;
+        if !self.open || self.refused || self.display_due.is_some() || self.sync_at.is_some() {
+            // A change is being handled already.
+            return;
+        }
+        if self.enabled {
+            self.verify("self-check").await;
+        } else if !self.edges.is_empty() {
+            info!("input capture is not enabled although edges lead to other machines; enabling it again");
+            self.sync().await;
         }
     }
 
@@ -1648,8 +1929,11 @@ impl<P: CapturePortal> Capture<P> {
         self.open = false;
         self.enabled = false;
         self.stale = false;
+        self.sync_at = None;
+        self.applied = None;
         self.armed.clear();
-        self.ids.clear();
+        self.barriers = BarrierSet::default();
+        self.changed(format!("lost: {why}"));
         self.end_active();
         self.portal.close().await;
         self.schedule_retry();
@@ -1665,22 +1949,25 @@ impl<P: CapturePortal> Capture<P> {
         if is_refusal(&e) {
             warn!("{IC_REFUSED}");
             crate::problems::set(PROBLEM_IC, IC_REFUSED);
+            self.refused = true;
+            self.changed("permission refused");
         } else {
             warn!("{what}: {e:#}");
+            self.changed(format!("{what}: {e:#}"));
             self.schedule_retry();
         }
     }
 
     async fn reopen(&mut self) {
+        self.publish_state("opening");
         match self.portal.open().await {
             Ok(m) => {
                 info!("input capture session re-created");
-                self.open = true;
-                crate::problems::clear(PROBLEM_IC);
-                self.opened_at = Instant::now();
-                self.take_queued_edges();
-                self.store_monitors(m);
-                self.apply_edges().await;
+                if self.session_opened(m) {
+                    self.sync_at = Some(Instant::now() + ZONES_SETTLE);
+                } else {
+                    self.apply_edges().await;
+                }
             }
             Err(e) => self.open_failed(e, "re-creating the capture session failed"),
         }
@@ -1718,6 +2005,7 @@ fn ei_to_local(ev: &EiEvent, scroll_acc: &mut (f32, f32)) -> Option<LocalEvent> 
 mod tests {
     use super::*;
     use flow_proto::NodeId;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn barrier_geometry_matches_portal_convention() {
@@ -1736,8 +2024,14 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         /// What GetZones returns (the "compositor's" monitors).
         zones: Arc<Mutex<Vec<Monitor>>>,
-        /// Barriers refer to a zone set; GetZones brings it up to date.
-        zone_set_stale: Arc<AtomicBool>,
+        /// The compositor's zone set (bumped by a monitor change).
+        zone_set: Arc<Mutex<u32>>,
+        /// The zone set this side last read; barriers for another one are
+        /// refused, as by the portal.
+        seen: u32,
+        /// GetZones calls (kept out of the log, which shows what happens to
+        /// sessions and barriers).
+        zone_reads: Arc<AtomicUsize>,
     }
 
     fn monitor() -> Vec<Monitor> {
@@ -1764,20 +2058,21 @@ mod tests {
             // decides the outcome.
             let s = self.sessions.recv().await.unwrap_or_else(|| Err(anyhow!("portal gone")))?;
             self.current = Some(s);
-            self.zone_set_stale.store(false, Ordering::SeqCst);
+            self.seen = *self.zone_set.lock().unwrap();
             Ok(self.zones.lock().unwrap().clone())
         }
         async fn close(&mut self) {
             self.note("close");
             self.current = None;
         }
-        async fn set_barriers(&mut self, edges: &[Edge]) -> Result<HashMap<u32, Side>> {
-            if self.zone_set_stale.load(Ordering::SeqCst) {
+        async fn set_barriers(&mut self, edges: &[Edge]) -> Result<BarrierSet> {
+            if self.seen != *self.zone_set.lock().unwrap() {
                 self.note("barriers refused");
                 return Err(anyhow!("State out of date"));
             }
             self.note(format!("barriers {}", edges.len()));
-            Ok(edges.iter().enumerate().map(|(i, e)| (i as u32 + 1, e.side)).collect())
+            let ids = edges.iter().enumerate().map(|(i, e)| (i as u32 + 1, e.side)).collect();
+            Ok(BarrierSet { ids, refused: 0, zone_set: self.seen })
         }
         async fn enable(&mut self) -> Result<()> {
             self.note("enable");
@@ -1791,10 +2086,10 @@ mod tests {
             self.note("release");
             Ok(())
         }
-        async fn zones(&mut self) -> Result<Vec<Monitor>> {
-            self.note("zones");
-            self.zone_set_stale.store(false, Ordering::SeqCst);
-            Ok(self.zones.lock().unwrap().clone())
+        async fn zones(&mut self) -> Result<(u32, Vec<Monitor>)> {
+            self.zone_reads.fetch_add(1, Ordering::SeqCst);
+            self.seen = *self.zone_set.lock().unwrap();
+            Ok((self.seen, self.zones.lock().unwrap().clone()))
         }
         async fn next_event(&mut self) -> Option<CapEvent> {
             self.current.as_mut()?.recv().await
@@ -1807,8 +2102,10 @@ mod tests {
         events: EventRx,
         log: Arc<Mutex<Vec<String>>>,
         zones: Arc<Mutex<Vec<Monitor>>>,
-        zone_set_stale: Arc<AtomicBool>,
+        zone_set: Arc<Mutex<u32>>,
+        zone_reads: Arc<AtomicUsize>,
         display: mpsc::UnboundedSender<DisplayTick>,
+        report: Arc<Mutex<CaptureShared>>,
     }
 
     impl Rig {
@@ -1819,13 +2116,16 @@ mod tests {
             let (first, first_rx) = mpsc::unbounded_channel();
             let log = Arc::new(Mutex::new(Vec::new()));
             let zones = Arc::new(Mutex::new(monitor()));
-            let zone_set_stale = Arc::new(AtomicBool::new(false));
+            let zone_set = Arc::new(Mutex::new(1));
+            let zone_reads = Arc::new(AtomicUsize::new(0));
             let portal = FakePortal {
                 sessions: sessions_rx,
                 current: Some(first_rx),
                 log: log.clone(),
                 zones: zones.clone(),
-                zone_set_stale: zone_set_stale.clone(),
+                zone_set: zone_set.clone(),
+                seen: 1,
+                zone_reads: zone_reads.clone(),
             };
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
             let (tx, events) = mpsc::unbounded_channel();
@@ -1835,15 +2135,28 @@ mod tests {
                 Some((t, r))
             })
             .boxed_local();
-            tokio::task::spawn_local(run_capture(portal, cmds_rx, tx, Arc::new(Mutex::new(monitor())), ticks));
-            (Rig { cmds, sessions, events, log, zones, zone_set_stale, display }, first)
+            let report = Arc::new(Mutex::new(CaptureShared::default()));
+            let monitors = Arc::new(Mutex::new(monitor()));
+            tokio::task::spawn_local(run_capture(portal, cmds_rx, tx, monitors, ticks, report.clone()));
+            (Rig { cmds, sessions, events, log, zones, zone_set, zone_reads, display, report }, first)
         }
 
-        /// The "compositor" changes its monitors: like mutter, the zone set
-        /// the barriers refer to is out of date from now on.
+        /// The "compositor" changes its monitors: like mutter, with a new
+        /// zone set (barriers for the old one are refused).
         fn set_zones(&self, m: Vec<Monitor>) {
             *self.zones.lock().unwrap() = m;
-            self.zone_set_stale.store(true, Ordering::SeqCst);
+            self.bump_zone_set();
+        }
+
+        /// mutter reconfigured without changing the zones (e.g. a mode
+        /// change): a new zone set all the same.
+        fn bump_zone_set(&self) {
+            *self.zone_set.lock().unwrap() += 1;
+        }
+
+        /// GetZones calls since the last call.
+        fn take_zone_reads(&self) -> usize {
+            self.zone_reads.swap(0, Ordering::SeqCst)
         }
 
         /// A monitor change hint, then the settle time.
@@ -1986,6 +2299,20 @@ mod tests {
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_clipboard_waits_for_the_session_but_not_forever() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let rd = RdShared::new(tx);
+        let text = |s: &str| ClipContent::Text(s.into());
+        rd.keep_remote_clip(Some(text("one")));
+        rd.keep_remote_clip(Some(text("two")));
+        assert_eq!(rd.take_remote_clip(), Some(text("two")), "the newest content is set once the session opens");
+        assert_eq!(rd.take_remote_clip(), None, "and only once");
+        rd.keep_remote_clip(Some(text("old")));
+        tokio::time::sleep(REMOTE_CLIP_KEEP + Duration::from_secs(1)).await;
+        assert_eq!(rd.take_remote_clip(), None, "too old to overwrite the clipboard");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2341,6 +2668,132 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_monitor_change_recreates_the_session_and_sets_the_barriers_again() {
+        local(async {
+            let (mut rig, first) = Rig::start();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["barriers 1", "enable"]);
+            assert_eq!(rig.report.lock().unwrap().state, "enabled");
+            // GNOME: a new zone set, the session silently disabled, only
+            // ZonesChanged. Input captured at that moment is given back.
+            first.send(activated()).unwrap();
+            assert!(matches!(rig.next().await, LocalEvent::EdgeHit { .. }));
+            rig.set_zones(docked());
+            first.send(CapEvent::ZonesChanged).unwrap();
+            assert_eq!(rig.next().await, LocalEvent::CaptureEnded);
+            rig.settle().await;
+            assert_eq!(rig.report.lock().unwrap().state, "re-creating");
+            // The zones are read once the burst is over and reported.
+            tokio::time::sleep(DISPLAY_SETTLE).await;
+            rig.settle().await;
+            assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(docked()));
+            assert!(rig.log().is_empty(), "waits for the new layout first: {:?}", rig.log());
+            // The core sends the same edges again (layout unchanged): the
+            // session is re-created once, right away.
+            let second = rig.new_session();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+            tokio::time::sleep(ZONES_SETTLE * 2).await;
+            rig.settle().await;
+            assert!(rig.log().is_empty(), "not re-created a second time: {:?}", rig.log());
+            second.send(activated()).unwrap();
+            assert!(matches!(rig.next().await, LocalEvent::EdgeHit { .. }));
+            let r = rig.report.lock().unwrap().report();
+            assert_eq!((r.state.as_str(), r.barriers, r.zone_set, r.sessions), ("enabled", 1, Some(2), 2));
+            assert_eq!(r.since_activation, Some(Duration::ZERO));
+            // Ages are those of the moment the report is read.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let r = rig.report.lock().unwrap().report();
+            assert_eq!(r.since_activation, Some(Duration::from_secs(5)));
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_new_edges_the_session_is_recreated_after_a_monitor_change() {
+        local(async {
+            let (rig, first) = Rig::start();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            rig.take_log();
+            let _second = rig.new_session();
+            *rig.zone_set.lock().unwrap() = 2;
+            first.send(CapEvent::ZonesChanged).unwrap();
+            // The hub is down, nobody sends edges: healed on its own.
+            tokio::time::sleep(ZONES_SETTLE).await;
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_monitor_change_before_any_barrier_needs_no_new_session() {
+        local(async {
+            let (rig, first) = Rig::start();
+            *rig.zone_set.lock().unwrap() = 2;
+            first.send(CapEvent::ZonesChanged).unwrap();
+            tokio::time::sleep(ZONES_SETTLE * 2).await;
+            rig.settle().await;
+            assert!(rig.log().is_empty(), "{:?}", rig.log());
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["barriers 1", "enable"]);
+            assert_eq!(rig.report.lock().unwrap().zone_set, Some(2));
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn barriers_for_an_old_zone_set_are_noticed_and_set_again() {
+        local(async {
+            let (rig, _first) = Rig::start();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            rig.take_log();
+            // The zone set changes and the signal is lost.
+            *rig.zone_set.lock().unwrap() = 5;
+            // The same edges again (the hub connection came back) trigger
+            // the check.
+            let _second = rig.new_session();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+            assert_eq!(rig.report.lock().unwrap().zone_set, Some(5));
+            // Without any trigger, the periodic check finds it too.
+            *rig.zone_set.lock().unwrap() = 6;
+            let _third = rig.new_session();
+            tokio::time::sleep(HEALTH_CHECK).await;
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+            // Nothing to do while everything matches.
+            tokio::time::sleep(HEALTH_CHECK * 3).await;
+            rig.settle().await;
+            assert!(rig.log().is_empty(), "{:?}", rig.log());
+            assert_eq!(rig.report.lock().unwrap().sessions, 3);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_compositor_disable_is_healed_without_a_layout_change() {
+        local(async {
+            let (rig, first) = Rig::start();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            rig.take_log();
+            let _second = rig.new_session();
+            first.send(CapEvent::Disabled).unwrap();
+            tokio::time::sleep(ZONES_SETTLE).await;
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn edges_queued_during_the_permission_dialog_do_not_recreate_again() {
         local(async {
             let (mut rig, _first) = Rig::start();
@@ -2379,7 +2832,8 @@ mod tests {
             rig.set_zones(docked());
             rig.hint(DisplayTick::Changed).await;
             assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(docked()));
-            assert_eq!(rig.take_log(), ["zones"], "read, nothing re-created");
+            assert_eq!(rig.take_zone_reads(), 1);
+            assert!(rig.log().is_empty(), "read, nothing re-created: {:?}", rig.log());
             // Unplugged again.
             rig.set_zones(monitor());
             rig.hint(DisplayTick::Changed).await;
@@ -2388,26 +2842,38 @@ mod tests {
             // session takes the barriers, no dialog.
             rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
             rig.settle().await;
-            assert_eq!(rig.take_log(), ["zones", "barriers 1", "enable"]);
+            assert_eq!(rig.take_log(), ["barriers 1", "enable"]);
+            // Nothing re-created later either.
+            tokio::time::sleep(ZONES_SETTLE * 2).await;
+            rig.settle().await;
+            assert!(rig.log().is_empty(), "{:?}", rig.log());
         })
         .await
     }
 
     #[tokio::test(start_paused = true)]
-    async fn polling_finds_a_change_and_a_stale_zone_set_is_refreshed() {
+    async fn polling_finds_a_change_and_barriers_wait_for_edges_of_the_new_monitors() {
         // No DisplayConfig (another compositor): the periodic check.
         local(async {
             let (mut rig, _first) = Rig::start();
             rig.hint(DisplayTick::Poll).await;
             rig.no_event();
-            assert_eq!(rig.take_log(), ["zones"]);
-            // A change between two checks: the barriers are refused for the
-            // old zone set, the zones are read and the barriers set again.
+            assert_eq!(rig.take_zone_reads(), 1);
+            assert!(rig.log().is_empty(), "{:?}", rig.log());
+            // A change between two checks, then edges: the zones are read
+            // before the barriers (which name the zone set), the change is
+            // reported and the core gets time to send edges for it.
             rig.set_zones(docked());
             rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
             rig.settle().await;
-            assert_eq!(rig.take_log(), ["barriers refused", "zones", "barriers 1", "enable"]);
             assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(docked()));
+            assert!(rig.log().is_empty(), "{:?}", rig.log());
+            // The core's edges did not change: armed after ZONES_SETTLE, on
+            // the new zone set (never refused).
+            tokio::time::sleep(ZONES_SETTLE).await;
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["barriers 1", "enable"]);
+            assert_eq!(rig.report.lock().unwrap().zone_set, Some(2));
         })
         .await
     }
@@ -2421,6 +2887,7 @@ mod tests {
             first.send(activated()).unwrap();
             assert!(matches!(rig.next().await, LocalEvent::EdgeHit { .. }));
             rig.take_log();
+            rig.take_zone_reads();
             // Docking while controlling another machine: GNOME disabled the
             // session, capture ends; the zones are read after the burst.
             rig.set_zones(docked());
@@ -2432,7 +2899,8 @@ mod tests {
             rig.settle().await;
             assert_eq!(rig.next().await, LocalEvent::CaptureEnded);
             assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(docked()));
-            assert_eq!(rig.take_log(), ["zones"], "one read for the burst, waits for the new edges");
+            assert_eq!(rig.take_zone_reads(), 1, "one read for the burst");
+            assert!(rig.log().is_empty(), "waits for the new edges: {:?}", rig.log());
             // The core sends the edges of the new layout: a new session.
             let _second = rig.new_session();
             let moved = vec![Edge { side: Side::Right, pos: 4480, start: 0, end: 1440, to: NodeId(2) }];
@@ -2442,7 +2910,10 @@ mod tests {
             // The hub's layout gives the same edges: nothing more.
             rig.cmds.send(CapCmd::SetEdges(moved)).unwrap();
             rig.settle().await;
+            tokio::time::sleep(ZONES_SETTLE * 2).await;
+            rig.settle().await;
             assert!(rig.log().is_empty(), "{:?}", rig.log());
+            assert_eq!(rig.report.lock().unwrap().sessions, 2);
         })
         .await
     }
@@ -2450,20 +2921,28 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn same_monitors_after_a_change_signal_re_arm_at_once() {
         // GNOME reconfigured (e.g. a mode change) without changing the
-        // zones: the enabled session is dead all the same, and no new
-        // layout will come, so the session is replaced right away.
+        // zones: a new zone set, so the enabled session is dead all the
+        // same, and no new layout will come: replaced right away.
         local(async {
             let (mut rig, _first) = Rig::start();
             rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
             rig.settle().await;
             rig.take_log();
             let _second = rig.new_session();
+            rig.bump_zone_set();
             rig.hint(DisplayTick::Changed).await;
             rig.no_event();
-            assert_eq!(rig.take_log(), ["zones", "open", "barriers 1", "enable"]);
-            // A poll that finds nothing new leaves it alone.
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+            // A hint that changed nothing (same zone set) or a poll that
+            // finds nothing new leaves it alone: no dialog for nothing.
+            rig.take_zone_reads();
+            rig.hint(DisplayTick::Changed).await;
             rig.hint(DisplayTick::Poll).await;
-            assert_eq!(rig.take_log(), ["zones"]);
+            tokio::time::sleep(ZONES_SETTLE * 2).await;
+            rig.settle().await;
+            assert!(rig.log().is_empty(), "{:?}", rig.log());
+            assert_eq!(rig.take_zone_reads(), 2);
+            assert_eq!(rig.report.lock().unwrap().sessions, 2);
         })
         .await
     }
@@ -2478,10 +2957,13 @@ mod tests {
             rig.cmds.send(CapCmd::SetEdges(vec![])).unwrap();
             rig.settle().await;
             assert_eq!(rig.take_log(), ["disable"]);
-            // A monitor change meanwhile: read, no session.
+            assert_eq!(rig.report.lock().unwrap().state, "no edges");
+            // A monitor change meanwhile: read, no session, also not later.
             rig.set_zones(docked());
             rig.hint(DisplayTick::Changed).await;
-            assert_eq!(rig.take_log(), ["zones"]);
+            tokio::time::sleep(ZONES_SETTLE + HEALTH_CHECK).await;
+            rig.settle().await;
+            assert!(rig.log().is_empty(), "{:?}", rig.log());
             // Edges again: now a new session (GNOME cannot enable it twice).
             let _second = rig.new_session();
             rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
@@ -2513,10 +2995,46 @@ mod tests {
             tokio::time::sleep(DISPLAY_SETTLE).await;
             rig.settle().await;
             assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(monitor()));
-            assert_eq!(rig.take_log(), ["zones"], "waits for the core's edges for the new monitors");
+            assert!(rig.log().is_empty(), "waits for the core's edges for the new monitors: {:?}", rig.log());
             rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
             rig.settle().await;
             assert_eq!(rig.take_log(), ["barriers 1", "enable"]);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_hint_of_one_monitor_change_makes_one_new_session() {
+        // Docking with portal >= 1.19: DisplayConfig and the portal's
+        // ZonesChanged both report the burst, the core answers with edges
+        // for the new layout and the hub with the same edges a bit later.
+        // One new session, so GNOME asks once.
+        local(async {
+            let (mut rig, first) = Rig::start();
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            rig.take_log();
+            rig.set_zones(docked());
+            rig.display.send(DisplayTick::Changed).unwrap();
+            first.send(CapEvent::ZonesChanged).unwrap();
+            rig.display.send(DisplayTick::Changed).unwrap();
+            first.send(CapEvent::ZonesChanged).unwrap();
+            rig.settle().await;
+            assert!(rig.log().is_empty(), "nothing while the burst lasts: {:?}", rig.log());
+            tokio::time::sleep(DISPLAY_SETTLE).await;
+            rig.settle().await;
+            assert_eq!(rig.next().await, LocalEvent::MonitorsChanged(docked()));
+            let second = rig.new_session();
+            let moved = vec![Edge { side: Side::Right, pos: 4480, start: 0, end: 1440, to: NodeId(2) }];
+            rig.cmds.send(CapCmd::SetEdges(moved.clone())).unwrap();
+            rig.settle().await;
+            rig.cmds.send(CapCmd::SetEdges(moved)).unwrap();
+            tokio::time::sleep(ZONES_SETTLE + HEALTH_CHECK).await;
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+            assert_eq!(rig.report.lock().unwrap().sessions, 2);
+            second.send(activated()).unwrap();
+            assert!(matches!(rig.next().await, LocalEvent::EdgeHit { .. }));
         })
         .await
     }
