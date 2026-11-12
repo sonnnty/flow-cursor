@@ -204,7 +204,7 @@ pub struct WaylandBackend {
     inj: Option<mpsc::UnboundedSender<InjCmd>>,
     rd: Arc<RdShared>,
     cap: Option<mpsc::UnboundedSender<CapCmd>>,
-    capture_report: Arc<Mutex<CaptureReport>>,
+    capture_report: Arc<Mutex<CaptureShared>>,
 }
 
 pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)> {
@@ -221,7 +221,7 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
             None
         }
     };
-    let capture_report = Arc::new(Mutex::new(CaptureReport::default()));
+    let capture_report = Arc::new(Mutex::new(CaptureShared::default()));
     let cap = match start_capture(tx.clone(), monitors.clone(), capture_report.clone()).await {
         Ok(s) => Some(s),
         Err(e) if is_refusal(&e) => {
@@ -343,7 +343,7 @@ impl Backend for WaylandBackend {
                 ..Default::default()
             });
         }
-        Some(self.capture_report.lock().expect("poisoned").clone())
+        Some(self.capture_report.lock().expect("poisoned").report())
     }
     fn set_clipboard(&self, content: &ClipContent) {
         if self.rd.portal_clip() {
@@ -1026,7 +1026,7 @@ trait CapturePortal {
 async fn start_capture(
     tx: EventTx,
     monitors: Arc<Mutex<Vec<Monitor>>>,
-    report: Arc<Mutex<CaptureReport>>,
+    report: Arc<Mutex<CaptureShared>>,
 ) -> Result<mpsc::UnboundedSender<CapCmd>> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let ready = spawn_portal_thread("portal-capture", move |ready| async move {
@@ -1256,6 +1256,36 @@ const ZONES_SETTLE: Duration = Duration::from_secs(2);
 /// set (a changed set means its barriers are gone).
 const HEALTH_CHECK: Duration = Duration::from_secs(30);
 
+/// What the capture loop shares for [`Backend::capture_report`]: times as
+/// instants, turned into ages when the report is asked for.
+#[derive(Clone, Debug, Default)]
+struct CaptureShared {
+    state: String,
+    barriers: usize,
+    barriers_refused: usize,
+    zone_set: Option<u32>,
+    sessions: u32,
+    opened_at: Option<Instant>,
+    last_activation: Option<Instant>,
+    last_change: Option<(String, Instant)>,
+}
+
+impl CaptureShared {
+    fn report(&self) -> CaptureReport {
+        CaptureReport {
+            state: self.state.clone(),
+            barriers: self.barriers,
+            barriers_refused: self.barriers_refused,
+            zone_set: self.zone_set,
+            sessions: self.sessions,
+            session_age: self.opened_at.map(|t| t.elapsed()),
+            since_activation: self.last_activation.map(|t| t.elapsed()),
+            last_change: self.last_change.as_ref().map(|c| c.0.clone()),
+            since_change: self.last_change.as_ref().map(|c| c.1.elapsed()),
+        }
+    }
+}
+
 /// State of the capture loop around one [`CapturePortal`].
 struct Capture<P> {
     portal: P,
@@ -1292,7 +1322,7 @@ struct Capture<P> {
     opened_at: Instant,
     last_activation: Option<Instant>,
     last_change: Option<(String, Instant)>,
-    report: Arc<Mutex<CaptureReport>>,
+    report: Arc<Mutex<CaptureShared>>,
 }
 
 /// Runs the capture loop until the backend is dropped. The portal must have
@@ -1304,7 +1334,7 @@ async fn run_capture<P: CapturePortal>(
     cmds: mpsc::UnboundedReceiver<CapCmd>,
     tx: EventTx,
     monitors: Arc<Mutex<Vec<Monitor>>>,
-    report: Arc<Mutex<CaptureReport>>,
+    report: Arc<Mutex<CaptureShared>>,
 ) {
     let mut c = Capture {
         portal,
@@ -1344,6 +1374,11 @@ async fn run_capture<P: CapturePortal>(
                 Some(CapCmd::Release(warp)) => c.release(warp).await,
             },
             ev = c.portal.next_event(), if c.open => match ev {
+                // Captured input is the hot path and changes nothing shown.
+                Some(CapEvent::Input(le)) => {
+                    c.on_event(CapEvent::Input(le)).await;
+                    continue;
+                }
                 Some(ev) => c.on_event(ev).await,
                 None => c.lost("the EI capture stream closed").await,
             },
@@ -1387,16 +1422,15 @@ impl<P: CapturePortal> Capture<P> {
     }
 
     fn publish_state(&self, state: &str) {
-        *self.report.lock().expect("poisoned") = CaptureReport {
+        *self.report.lock().expect("poisoned") = CaptureShared {
             state: state.into(),
             barriers: if self.enabled { self.barriers.ids.len() } else { 0 },
             barriers_refused: self.barriers.refused,
             zone_set: self.applied.map(|a| a.1),
             sessions: self.sessions,
-            session_age: self.open.then(|| self.opened_at.elapsed()),
-            since_activation: self.last_activation.map(|t| t.elapsed()),
-            last_change: self.last_change.as_ref().map(|c| c.0.clone()),
-            since_change: self.last_change.as_ref().map(|c| c.1.elapsed()),
+            opened_at: self.open.then_some(self.opened_at),
+            last_activation: self.last_activation,
+            last_change: self.last_change.clone(),
         };
     }
 
@@ -1814,7 +1848,7 @@ mod tests {
         events: EventRx,
         log: Arc<Mutex<Vec<String>>>,
         zone_set: Arc<Mutex<u32>>,
-        report: Arc<Mutex<CaptureReport>>,
+        report: Arc<Mutex<CaptureShared>>,
     }
 
     impl Rig {
@@ -1833,7 +1867,7 @@ mod tests {
             };
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
             let (tx, events) = mpsc::unbounded_channel();
-            let report = Arc::new(Mutex::new(CaptureReport::default()));
+            let report = Arc::new(Mutex::new(CaptureShared::default()));
             tokio::task::spawn_local(run_capture(portal, cmds_rx, tx, Arc::new(Mutex::new(monitor())), report.clone()));
             (Rig { cmds, sessions, events, log, zone_set, report }, first)
         }
@@ -2362,9 +2396,13 @@ mod tests {
             assert!(rig.log().is_empty(), "not re-created a second time: {:?}", rig.log());
             second.send(activated()).unwrap();
             assert!(matches!(rig.next().await, LocalEvent::EdgeHit { .. }));
-            let r = rig.report.lock().unwrap().clone();
+            let r = rig.report.lock().unwrap().report();
             assert_eq!((r.state.as_str(), r.barriers, r.zone_set, r.sessions), ("enabled", 1, Some(2), 2));
             assert_eq!(r.since_activation, Some(Duration::ZERO));
+            // Ages are those of the moment the report is read.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let r = rig.report.lock().unwrap().report();
+            assert_eq!(r.since_activation, Some(Duration::from_secs(5)));
         })
         .await
     }
