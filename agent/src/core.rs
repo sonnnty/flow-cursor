@@ -88,6 +88,11 @@ pub struct AgentStatus {
     /// The core wants the backend's remote control session open (it may
     /// still be opening).
     pub session_wanted: bool,
+    /// Since when the core has wanted the session open (None: it does not).
+    pub session_wanted_since: Option<Instant>,
+    /// The session is closed on purpose, and why (so no inject or
+    /// clipboard capability is no fault); None while it is open or wanted.
+    pub session_idle: Option<flow_ipc::SessionIdle>,
 }
 
 pub struct AgentHandle {
@@ -395,6 +400,7 @@ pub async fn start_with(
         parked: None,
         last_input: None,
         session: SessionGate::new(hub_grace),
+        session_wanted_since: None,
         caps: backend.caps(),
         stopping: false,
     };
@@ -507,6 +513,8 @@ struct Core {
     last_input: Option<Instant>,
     /// Whether the backend's remote control session should be open.
     session: SessionGate,
+    /// When the session gate last opened (see `AgentStatus::session_wanted_since`).
+    session_wanted_since: Option<Instant>,
     /// Last `backend.caps()` seen (`inject`: the backend can inject now).
     caps: Capabilities,
     /// The agent is stopping (the session closes for good).
@@ -553,6 +561,7 @@ impl Core {
             Mode::Local | Mode::Hold(_) => None,
         };
         let me = self.me;
+        let idle = self.session_idle();
         let online: Vec<NodeId> = {
             let mut v: Vec<NodeId> =
                 self.peers.values().filter(|p| p.online && p.enabled && !p.away).map(|p| p.id).collect();
@@ -583,6 +592,8 @@ impl Core {
             s.last_input = self.last_input;
             s.controllable = self.controllable();
             s.session_wanted = self.session.is_open();
+            s.session_wanted_since = self.session_wanted_since.filter(|_| s.session_wanted);
+            s.session_idle = idle;
         });
     }
 
@@ -593,6 +604,23 @@ impl Core {
     /// Other machines may drive this one now.
     fn controllable(&self) -> bool {
         !self.away && self.caps.inject
+    }
+
+    /// Why the session is closed on purpose (None: open, or not closed on
+    /// purpose), see [`crate::controllable::idle_reason`].
+    fn session_idle(&self) -> Option<flow_ipc::SessionIdle> {
+        let (revoked, update_only) = {
+            let s = self.status.borrow();
+            (s.revoked, s.update_only.is_some())
+        };
+        crate::controllable::idle_reason(
+            self.backend.session_support(),
+            self.session.is_open(),
+            update_only,
+            self.stopping || revoked,
+            self.paused,
+            self.net_away,
+        )
     }
 
     fn hub_state(&self) -> HubState {
@@ -624,6 +652,7 @@ impl Core {
                 // close).
                 self.release_controllers();
             }
+            self.session_wanted_since = open.then(Instant::now);
             self.backend.set_controllable(open);
             self.publish();
         }

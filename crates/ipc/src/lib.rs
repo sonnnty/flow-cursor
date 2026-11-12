@@ -155,14 +155,46 @@ pub struct Snapshot {
     pub can_capture: bool,
     pub can_inject: bool,
     pub can_clipboard: bool,
+    /// Other machines can control this one now (sharing is on and the
+    /// backend can inject; on GNOME its remote control session is open).
+    pub controllable: bool,
+    /// The agent wants the backend's remote control session open (it may
+    /// still be opening).
+    pub session_wanted: bool,
+    /// Set when the backend's remote control session is closed on purpose
+    /// (so `can_inject` and, on GNOME, `can_clipboard` are false and that
+    /// is no fault): the reason. None while the session is open or wanted,
+    /// on backends without such a session, and from agents that predate
+    /// the field (a missing inject capability is then a problem).
+    pub session_idle: Option<SessionIdle>,
     /// Human-readable problems that break sharing (missing permissions,
-    /// …): the tray shows the error icon.
+    /// …): the tray shows the error icon. Never lists a capability that is
+    /// missing only because the session is closed on purpose
+    /// ([`Snapshot::session_idle`]).
     pub problems: Vec<String>,
     /// Lesser limitations (no clipboard access): listed, no error icon.
     pub warnings: Vec<String>,
 
     /// Self-update from the hub.
     pub update: UpdateInfo,
+}
+
+/// Why the remote control session is closed on purpose (not a fault).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionIdle {
+    /// Sharing paused by the user.
+    Paused,
+    /// Not on an allowed network.
+    Away,
+    /// No full session with the hub (not connected, grace period over).
+    Disconnected,
+    /// Connected to a hub of another protocol, only to update.
+    UpdateOnly,
+    /// Any other deliberate reason (revoked, agent stopping), or one a
+    /// newer agent reports and this program does not know.
+    #[serde(other)]
+    Other,
 }
 
 /// Self-update state of the agent.
@@ -392,6 +424,22 @@ mod tests {
         assert!(parse_reply(r#"{"v":9,"type":"ok","message":""}"#).is_err());
         assert_eq!(snap.peer_name(4), "pc");
         assert_eq!(snap.peer_name(9), "node-9");
+    }
+
+    #[test]
+    fn session_idle_is_compatible_both_ways() {
+        // An agent without the fields: no idle reason (the old meaning of a
+        // missing inject capability: a problem).
+        let r = parse_reply(r#"{"v":1,"type":"status","status":{"can_inject":false}}"#).unwrap();
+        let Reply::Status { status } = r else { panic!("{r:?}") };
+        assert_eq!(status.session_idle, None);
+        assert!(!status.session_wanted && !status.controllable);
+        // The wire names, and a reason this program does not know.
+        let s = Snapshot { session_idle: Some(SessionIdle::UpdateOnly), ..Default::default() };
+        assert!(line(&Reply::Status { status: Box::new(s) }).contains(r#""session_idle":"update_only""#));
+        let r = parse_reply(r#"{"v":1,"type":"status","status":{"session_idle":"on_fire"}}"#).unwrap();
+        let Reply::Status { status } = r else { panic!("{r:?}") };
+        assert_eq!(status.session_idle, Some(SessionIdle::Other));
     }
 
     #[test]
