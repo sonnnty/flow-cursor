@@ -14,7 +14,7 @@
 | dashboard ขึ้น *no agent builds in this hub* | hub สร้างด้วย `compose --build` ให้ใช้ image จาก `build/build.sh` |
 | `this agent was removed from the hub` | เครื่องถูกยกเลิกสิทธิ์ใน dashboard ต้อง join ใหม่ |
 | เส้นทางเป็น `relay` ตลอด | firewall บล็อก UDP 7879 ระหว่างเครื่อง หรือที่อยู่ที่ประกาศผิด ตั้ง `p2p_advertise` |
-| เมาส์ไม่ข้ามจอ | ขอบจอในผังต้องชิดกัน, เครื่องปลายทางต้อง online และเปิดใช้งาน, บน Wayland ต้องอนุญาต Input Capture, ถ้าตั้งปุ่มข้ามจอต้องกดค้าง |
+| เมาส์ไม่ข้ามจอ | ขอบจอในผังต้องชิดกัน, เครื่องปลายทางต้อง online และเปิดใช้งาน, บน Wayland ต้องอนุญาต Input Capture, เครื่องปลายทาง GNOME ต้องเปิด session Remote Desktop เสร็จแล้ว (dashboard แสดง inject), ถ้าตั้งปุ่มข้ามจอต้องกดค้าง |
 | เครื่องเป็น `away` ทั้งที่อยู่บ้าน | เทียบ IP ใน dashboard กับวงที่อนุญาต ต้องใส่วงของเครื่อง ไม่ใช่วงของ server |
 | log `permission (... portal) was refused` | กดปฏิเสธหน้าต่างของ GNOME ไป ให้ `systemctl --user restart flow-agent` แล้วกด Allow |
 | ปุ่มค้าง | กด emergency hotkey เครื่องที่ถูกคุมจะปล่อยปุ่มเองใน 2.5 วินาทีถ้าต้นทางหายไป |
@@ -33,6 +33,7 @@
 - ปุ่มข้ามจอต้องกดหลังเมาส์ชนขอบแล้ว
 - เคอร์เซอร์ตอนคุมเครื่องอื่นอยู่ที่ขอบจอได้อย่างเดียว
 - ถ้าเครื่องปลายทางไม่มีอุปกรณ์ pointer แบบ absolute การเลื่อนจะคลาดเล็กน้อยตาม pointer acceleration
+- ถ้า hub ล่มเกิน 10 วินาที เครื่องอื่นคุมเครื่องนี้ไม่ได้จนกว่า hub กลับมา ดู [ติดตั้งบน Linux](install-linux.md#ไอคอน-มีคนควบคุมเครื่องนี้-บนแถบด้านบน)
 
 **Windows**
 

@@ -488,6 +488,25 @@ async fn control_loop(hub: &Arc<Hub>, node: NodeId, recv: &mut quinn::RecvStream
                     st.broadcast_peers();
                 }
             }
+            ToHub::Caps(caps) => {
+                let Some(rec) = st.p.nodes.get_mut(&node.0) else { continue };
+                if rec.caps == caps {
+                    continue;
+                }
+                let was = rec.caps.inject;
+                rec.caps = caps;
+                st.save();
+                if was && !caps.inject {
+                    info!(%node, "node can no longer be controlled (its remote control session is closed)");
+                    // Agents refuse input on their own too; this tells the
+                    // sources that still drive it.
+                    st.release_focus_on(node);
+                    st.broadcast_focus();
+                } else if !was && caps.inject {
+                    info!(%node, "node can be controlled again");
+                }
+                st.broadcast_peers();
+            }
             ToHub::UpdateMonitors(m) => {
                 if let Some(rec) = st.p.nodes.get_mut(&node.0) {
                     if rec.monitors != m {

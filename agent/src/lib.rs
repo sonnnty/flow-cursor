@@ -3,6 +3,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod controllable;
 pub mod core;
 pub mod cross;
 pub mod edge;

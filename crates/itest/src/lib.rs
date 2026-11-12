@@ -51,18 +51,37 @@ pub async fn start_hub_with_builds(builds: PathBuf) -> HubHandle {
     start_hub_cfg(temp_dir("hub"), Some(builds)).await
 }
 
-async fn start_hub_cfg(data_dir: PathBuf, agent_builds: Option<PathBuf>) -> HubHandle {
-    flow_server::start(HubConfig {
+/// Starts a hub again on the data and the QUIC address of one that was
+/// shut down (agents reconnect to the address they know). Retries while
+/// the port is still held by the old endpoint.
+pub async fn restart_hub(data_dir: PathBuf, quic_addr: SocketAddr) -> HubHandle {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match flow_server::start(hub_config(data_dir.clone(), quic_addr, None)).await {
+            Ok(h) => return h,
+            Err(e) if Instant::now() < deadline => {
+                eprintln!("hub restart: {e:#}; retrying");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("hub restart failed: {e:#}"),
+        }
+    }
+}
+
+fn hub_config(data_dir: PathBuf, quic_addr: SocketAddr, agent_builds: Option<PathBuf>) -> HubConfig {
+    HubConfig {
         data_dir,
-        quic_addr: "127.0.0.1:0".parse().unwrap(),
+        quic_addr,
         http_addr: Some("127.0.0.1:0".parse().unwrap()),
         admin_token: Some(ADMIN.into()),
         mdns: false,
         name: "itest".into(),
         agent_builds,
-    })
-    .await
-    .expect("hub starts")
+    }
+}
+
+async fn start_hub_cfg(data_dir: PathBuf, agent_builds: Option<PathBuf>) -> HubHandle {
+    flow_server::start(hub_config(data_dir, "127.0.0.1:0".parse().unwrap(), agent_builds)).await.expect("hub starts")
 }
 
 /// A directory of agent builds like the hub image has: `files` for
@@ -114,6 +133,9 @@ pub struct AgentSpec {
     pub update: Option<flow_agent::update::UpdateOptions>,
     /// Protocol announced to the hub (default: this one).
     pub protocol: Option<u32>,
+    /// How long a remote control session stays open after the hub
+    /// connection dropped (default: the agent's).
+    pub hub_grace: Option<Duration>,
 }
 
 impl AgentSpec {
@@ -128,6 +150,7 @@ impl AgentSpec {
             prepare: None,
             update: None,
             protocol: None,
+            hub_grace: None,
         }
     }
 }
@@ -154,6 +177,9 @@ pub async fn start_agent(hub: &HubHandle, spec: AgentSpec) -> TestAgent {
     }
     if let Some(p) = spec.protocol {
         opts.protocol = p;
+    }
+    if let Some(g) = spec.hub_grace {
+        opts.hub_grace = g;
     }
     let agent = flow_agent::start_with(cfg, backend, rx, opts).await.expect("agent starts");
     TestAgent { agent, sim, state_dir, net }
