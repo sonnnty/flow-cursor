@@ -1510,7 +1510,8 @@ impl<P: CapturePortal> Capture<P> {
                     session = self.sessions,
                     "input capture enabled"
                 );
-                self.changed(format!("enabled with {} barriers", self.barriers.ids.len()));
+                let n = self.barriers.ids.len();
+                self.changed(format!("enabled with {n} barrier{}", if n == 1 { "" } else { "s" }));
             }
             Err(e) => {
                 warn!("enabling input capture failed: {e:#}");

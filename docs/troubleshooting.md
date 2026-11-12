@@ -14,6 +14,8 @@
 | dashboard ขึ้น *no agent builds in this hub* | hub สร้างด้วย `compose --build` ให้ใช้ image จาก `build/build.sh` |
 | `this agent was removed from the hub` | เครื่องถูกยกเลิกสิทธิ์ใน dashboard ต้อง join ใหม่ |
 | เส้นทางเป็น `relay` ตลอด | firewall บล็อก UDP 7879 ระหว่างเครื่อง หรือที่อยู่ที่ประกาศผิด ตั้ง `p2p_advertise` |
+| GNOME: เคยข้ามจอได้ แล้วชนขอบเฉยๆ | ดู `flow-agent status` บรรทัด `input capture` ถ้าเป็น `opening` ให้กด Allow ในหน้าต่างของ GNOME ที่ค้างอยู่ ดู [เปลี่ยนจอแล้วข้ามจอไม่ได้](install-linux.md#เปลี่ยนจอแล้วข้ามจอไม่ได้) |
+| GNOME: copy แล้วเครื่องอื่นไม่ได้ | `flow-agent status` ต้องมี clipboard ถ้าไม่มี session Remote Desktop อาจปิดอยู่ (pause, away, ไม่ได้ต่อ hub) |
 | เมาส์ไม่ข้ามจอ | ขอบจอในผังต้องชิดกัน, เครื่องปลายทางต้อง online และเปิดใช้งาน, บน Wayland ต้องอนุญาต Input Capture, เครื่องปลายทาง GNOME ต้องเปิด session Remote Desktop เสร็จแล้ว (dashboard แสดง inject), ถ้าตั้งปุ่มข้ามจอต้องกดค้าง |
 | เครื่องเป็น `away` ทั้งที่อยู่บ้าน | เทียบ IP ใน dashboard กับวงที่อนุญาต ต้องใส่วงของเครื่อง ไม่ใช่วงของ server |
 | log `permission (... portal) was refused` | กดปฏิเสธหน้าต่างของ GNOME ไป ให้ `systemctl --user restart flow-agent` แล้วกด Allow |
@@ -24,14 +26,16 @@
 | ไอคอนสีเทา แต่ agent รันอยู่ | ต่อ hub ไม่ได้ ดูสาเหตุในหน้าต่างสถานะ |
 | `another flow-agent of this user is already running` | มี agent รันอยู่แล้ว ใช้ `flow-agent status` หรือ `flow-agent stop` |
 | Windows: ไอคอนหายหลังกด Quit | Quit ปิดทั้งไอคอนและ agent เปิดใหม่จาก Start menu |
-| ต้องการ log ละเอียด | Settings → log level เป็น `debug` |
+| ต้องการ log ละเอียด | Settings → log level เป็น `debug` ถ้าไม่มีผล agent มี `RUST_LOG` หรือ `log_level` ใน agent.toml อยู่ ดู [ระดับ log](settings.md#ระดับ-log-ของ-agent) |
 
 ## ข้อจำกัด
 
 **GNOME (Wayland)**
 
 - การไปคุมเครื่องอื่นต้องใช้ GNOME 45 ขึ้นไป เก่ากว่านั้นใช้ session แบบ Xorg
-- หน้าต่าง Input Capture ถามทุกครั้งที่ agent เริ่มใหม่หรืออัปเดต
+- หน้าต่าง Input Capture ถามทุกครั้งที่ agent เริ่มใหม่ อัปเดต เปลี่ยนผังจอ หรือเปลี่ยนจอ
+- dashboard แสดงขนาดจอเป็น logical pixel เช่นจอ 1920x1200 ที่ scale 125% แสดงเป็น 1536x960 ซึ่งถูกต้องสำหรับผังจอ
+  การแสดงความละเอียดจริงคู่กันต้องเพิ่ม field ใน protocol ซึ่งทำให้ทุก agent ต้องอัปเดตก่อนใช้งานได้ จึงยังไม่ได้ทำ
 - ปุ่มข้ามจอต้องกดหลังเมาส์ชนขอบแล้ว
 - เคอร์เซอร์ตอนคุมเครื่องอื่นอยู่ที่ขอบจอได้อย่างเดียว
 - ถ้าเครื่องปลายทางไม่มีอุปกรณ์ pointer แบบ absolute การเลื่อนจะคลาดเล็กน้อยตาม pointer acceleration

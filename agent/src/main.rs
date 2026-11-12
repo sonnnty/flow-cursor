@@ -475,7 +475,7 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
         println!("peer:             {} ({state}, {path}{rtt})", p.name);
     }
     if let Some(c) = &s.capture {
-        let mut line = format!("{}, {} barriers", c.state, c.barriers);
+        let mut line = format!("{}, {} barrier{}", c.state, c.barriers, if c.barriers == 1 { "" } else { "s" });
         if c.barriers_refused > 0 {
             line.push_str(&format!(" ({} refused)", c.barriers_refused));
         }
