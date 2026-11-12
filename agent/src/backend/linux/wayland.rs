@@ -283,6 +283,14 @@ impl Backend for WaylandBackend {
             let _ = i.send(InjCmd::Sync);
         }
     }
+    fn session_support(&self) -> crate::controllable::SessionSupport {
+        use crate::controllable::SessionSupport::*;
+        if self.inj.is_some() {
+            OnDemand
+        } else {
+            Unavailable
+        }
+    }
     fn keep_edges_stable(&self) -> bool {
         true
     }

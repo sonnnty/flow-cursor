@@ -283,6 +283,13 @@ impl Backend for SimBackend {
             s.clipboard = Some(content.clone());
         }
     }
+    fn session_support(&self) -> crate::controllable::SessionSupport {
+        if self.state.lock().unwrap().on_demand {
+            crate::controllable::SessionSupport::OnDemand
+        } else {
+            crate::controllable::SessionSupport::Always
+        }
+    }
     fn set_controllable(&self, on: bool) {
         let (generation, delay) = {
             let mut s = self.state.lock().unwrap();

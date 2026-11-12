@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs inside the smoke-test container (see build/ui-smoke.sh): a hub, two
 # agents with the simulated backend, the tray against a StatusNotifierWatcher
-# stub on a private session bus, and status-window screenshots under Xvfb.
+# stub on a private session bus, status-window screenshots under Xvfb, and
+# sni-checks.sh (re-registration, restart after an update, away not an error).
 # Binaries in /bin-in, results in /out.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -69,6 +70,11 @@ $B/flow-agent resume >/dev/null
 log "second tray: $($B/flow-tray 2>&1 || true)"
 $B/flow-tray --quit; sleep 1
 log "tray processes after --quit: $(pgrep -c flow-tray || true)"
+
+# --- tray icon registration: watcher restart, dropped item, self-update restart,
+# away is not an error (own bus, stand-in watcher and agent)
+log "tray registration checks:"
+bash /smoke/sni-checks.sh "$B" "$OUT" || { log "sni checks failed"; exit 1; }
 
 if [ -n "${WITH_WESTON:-}" ]; then
   log "Wayland (weston headless):"

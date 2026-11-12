@@ -10,6 +10,8 @@ pub mod watch;
 pub mod window;
 
 #[cfg(target_os = "linux")]
+pub mod sni;
+#[cfg(target_os = "linux")]
 pub mod tray_linux;
 #[cfg(windows)]
 pub mod tray_windows;
@@ -29,6 +31,9 @@ pub enum Action {
     RestartAgent,
     UpdateNow,
     OpenLog,
+    /// Linux: the tray host does not list the icon any more; register it
+    /// again with a new item (see [`sni`]). Nothing to do elsewhere.
+    ReRegister,
     Quit,
 }
 
@@ -131,6 +136,7 @@ impl TrayCore {
                 let file = self.state.snapshot().and_then(|s| s.log_file.clone());
                 background("opening the log", move || actions::open_log(file.as_deref()).map(|_| String::new()))
             }
+            Action::ReRegister => {}
             Action::Quit => {
                 if self.quit_stops_agent {
                     let _ = actions::request(flow_ipc::Command::Shutdown);

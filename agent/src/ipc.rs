@@ -119,16 +119,27 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
         })
         .collect();
 
+    // A session that is closed on purpose (away, paused, not connected,
+    // update-only) is why inject and clipboard are missing then: not a
+    // problem. One that should be open and is not (refused, portal missing,
+    // failed to open) is.
+    let report = crate::controllable::session_report(
+        backend.session_support(),
+        st.session_idle,
+        caps.inject,
+        caps.clipboard,
+        st.session_wanted_since.map(|t| t.elapsed()),
+    );
     let mut problems = Vec::new();
     if !caps.capture {
         problems.push("This machine cannot capture its mouse and keyboard: it cannot control other machines.".into());
     }
-    if !caps.inject {
+    if report.inject_problem {
         problems.push("This machine cannot inject input: other machines cannot control it.".into());
     }
     problems.extend(crate::problems::list());
     let mut warnings = Vec::new();
-    if !caps.clipboard {
+    if report.clipboard_warning {
         warnings.push("No clipboard access: clipboard sharing is off on this machine.".into());
     }
 
@@ -172,6 +183,9 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
         can_capture: caps.capture,
         can_inject: caps.inject,
         can_clipboard: caps.clipboard,
+        controllable: st.controllable,
+        session_wanted: st.session_wanted,
+        session_idle: st.session_idle,
         problems,
         warnings,
         update: update_info(&ctx.agent.updater.status()),

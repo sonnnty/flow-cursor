@@ -2,6 +2,7 @@
 //! agent core only sees [`LocalEvent`]s coming in and calls the trait to
 //! capture, inject and set the clipboard.
 
+use crate::controllable::SessionSupport;
 use crate::park::Park;
 use anyhow::{bail, Result};
 use flow_layout::{Edge, Side};
@@ -116,6 +117,12 @@ pub trait Backend: Send + Sync + 'static {
         let _ = on;
     }
     fn set_clipboard(&self, content: &ClipContent);
+    /// How injection becomes possible (see [`SessionSupport`]): decides
+    /// whether a missing inject capability is the intended state of a
+    /// closed session or a fault. Default: always ready.
+    fn session_support(&self) -> SessionSupport {
+        SessionSupport::Always
+    }
     /// True when changing the edges is expensive (Wayland: new barriers
     /// recreate the capture session and may ask for permission again).
     /// The core then keeps the edges and refuses crossings at hit time

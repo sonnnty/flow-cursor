@@ -2,7 +2,7 @@
 //! status lines at the top of the menu. Platform independent (tested).
 
 use crate::icon::Variant;
-use flow_ipc::Snapshot;
+use flow_ipc::{SessionIdle, Snapshot};
 
 /// What the tray knows about the agent.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -62,6 +62,29 @@ pub fn variant(s: &Snapshot) -> Variant {
         Variant::Active
     } else {
         Variant::Idle
+    }
+}
+
+/// The neutral explanation for a machine that cannot be controlled right
+/// now because its remote control session is closed on purpose (the agent
+/// reports why in [`Snapshot::session_idle`]; this is no problem and no
+/// warning, and it never changes the icon).
+pub fn idle_note(s: &Snapshot) -> Option<&'static str> {
+    Some(match s.session_idle? {
+        SessionIdle::Away => "Other machines can control this one again when it is back on an allowed network",
+        SessionIdle::Paused => "Other machines can control this one again when sharing is resumed",
+        SessionIdle::Disconnected => "Other machines can control this one again once it is connected to the hub",
+        SessionIdle::UpdateOnly => "Other machines can control this one again once it is updated and connected",
+        SessionIdle::Other => "Other machines cannot control this one right now",
+    })
+}
+
+/// "yes", or "no" with the reason when it is the intended state.
+pub fn inject_label(s: &Snapshot) -> &'static str {
+    match (s.can_inject, s.session_idle) {
+        (true, _) => "yes",
+        (false, Some(_)) => "no (closed while sharing is off)",
+        (false, None) => "no",
     }
 }
 
@@ -298,6 +321,91 @@ mod tests {
         assert_eq!(variant(&pending), Variant::Disconnected);
         let revoked = Snapshot { revoked: true, ..joined() };
         assert_eq!(variant(&revoked), Variant::Error);
+    }
+
+    /// What the agent sends in each situation (see `flow-agent`'s
+    /// `controllable` module): the tray decides from these fields only.
+    fn closed_for(why: SessionIdle) -> Snapshot {
+        Snapshot { can_inject: false, can_clipboard: false, session_idle: Some(why), ..joined() }
+    }
+
+    #[test]
+    fn a_session_closed_on_purpose_is_not_an_error() {
+        // Away: yellow icon, a neutral explanation, no problem lines.
+        let s = Snapshot { away: true, ..closed_for(SessionIdle::Away) };
+        assert_eq!(variant(&s), Variant::Away);
+        assert_eq!(
+            idle_note(&s),
+            Some("Other machines can control this one again when it is back on an allowed network")
+        );
+        let v = view(&AgentState::Running(Box::new(s.clone())));
+        assert_eq!(v.headline, "FlowCursor: away (not on an allowed network)");
+        assert!(!v.lines.iter().any(|l| l.starts_with("Problem")), "{:?}", v.lines);
+        assert_eq!(inject_label(&s), "no (closed while sharing is off)");
+
+        // Paused: yellow.
+        let s = Snapshot { paused: true, ..closed_for(SessionIdle::Paused) };
+        assert_eq!(variant(&s), Variant::Away);
+        assert_eq!(idle_note(&s), Some("Other machines can control this one again when sharing is resumed"));
+
+        // Not connected (hub down, grace over): grey.
+        let s = Snapshot { hub_connected: false, ..closed_for(SessionIdle::Disconnected) };
+        assert_eq!(variant(&s), Variant::Disconnected);
+        assert_eq!(idle_note(&s), Some("Other machines can control this one again once it is connected to the hub"));
+
+        // Update-only, the update is on its way: not an error either. (Waiting
+        // for the user to start the update is, see `update_lines_and_actions`.)
+        let mut s = Snapshot { hub_connected: false, ..closed_for(SessionIdle::UpdateOnly) };
+        s.update.update_only = Some("protocol 5 vs 4".into());
+        s.update.state = "installing".into();
+        assert_eq!(variant(&s), Variant::Disconnected);
+        assert!(idle_note(&s).unwrap().contains("updated"));
+        assert_eq!(variant(&Snapshot { hub_connected: true, ..closed_for(SessionIdle::Other) }), Variant::Idle);
+    }
+
+    #[test]
+    fn no_note_when_the_session_is_open_or_wanted() {
+        // Open and working.
+        let s =
+            Snapshot { can_inject: true, can_clipboard: true, controllable: true, session_wanted: true, ..joined() };
+        assert_eq!((variant(&s), idle_note(&s), inject_label(&s)), (Variant::Idle, None, "yes"));
+        // Hub-drop grace period: the session is still open (or wanted), the
+        // machine only shows that the hub is gone.
+        let s = Snapshot { hub_connected: false, session_wanted: true, can_inject: true, ..joined() };
+        assert_eq!((variant(&s), idle_note(&s)), (Variant::Disconnected, None));
+        // An agent without the field (older): no note, `can_inject: false`
+        // stays what it was.
+        let s = Snapshot { can_inject: false, ..joined() };
+        assert_eq!((idle_note(&s), inject_label(&s)), (None, "no"));
+    }
+
+    #[test]
+    fn a_session_that_should_be_open_but_is_not_stays_an_error() {
+        // GNOME dialog refused: the agent lists the refusal, the session is
+        // wanted, nothing is closed on purpose.
+        let s = Snapshot {
+            can_inject: false,
+            session_wanted: true,
+            problems: vec!["remote control permission (RemoteDesktop portal) was refused in the GNOME dialog".into()],
+            ..joined()
+        };
+        assert_eq!(variant(&s), Variant::Error);
+        assert_eq!(idle_note(&s), None, "no neutral explanation for a fault");
+        let v = view(&AgentState::Running(Box::new(s)));
+        assert!(v.headline.contains("refused in the GNOME dialog"), "{}", v.headline);
+        assert!(v.lines.iter().any(|l| l.starts_with("Problem: remote control permission")));
+
+        // Portal missing (never wanted open, or away): a problem at once.
+        for away in [false, true] {
+            let s = Snapshot {
+                can_inject: false,
+                away,
+                problems: vec!["This machine cannot inject input: other machines cannot control it.".into()],
+                ..joined()
+            };
+            assert_eq!(variant(&s), Variant::Error, "away: {away}");
+            assert_eq!(idle_note(&s), None);
+        }
     }
 
     #[test]

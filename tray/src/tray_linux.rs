@@ -8,7 +8,7 @@
 use crate::icon::{render, Variant};
 use crate::model::{view, AgentState, View};
 use crate::{instance, Action};
-use ksni::blocking::TrayMethods;
+use ksni::blocking::{Handle, TrayMethods};
 use ksni::menu::{MenuItem, StandardItem};
 use std::sync::mpsc::Sender;
 
@@ -122,18 +122,15 @@ impl ksni::Tray for FlowTray {
     }
 }
 
-/// Runs the tray until "Quit" (Ok(None)) or until an update replaced the
-/// tray binary (Ok(Some(new build)): the caller starts it). `open_window`
-/// opens the status window at start (`--show`).
-pub fn run(open_window: bool) -> anyhow::Result<Option<String>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let tray = FlowTray { view: view(&AgentState::Unknown), actions: tx.clone() };
-    let handle = match tray.spawn() {
+/// The icon's D-Bus service (`None`: no session bus). Prefers a host that is
+/// there; without one the service waits for it to appear.
+fn spawn_item(tx: &Sender<Action>) -> Option<Handle<FlowTray>> {
+    let new = |view| FlowTray { view, actions: tx.clone() };
+    match new(view(&AgentState::Unknown)).spawn() {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("flow-tray: {HINT} ({e})");
-            let tray = FlowTray { view: view(&AgentState::Unknown), actions: tx.clone() };
-            match tray.assume_sni_available(true).spawn() {
+            match new(view(&AgentState::Unknown)).assume_sni_available(true).spawn() {
                 Ok(h) => Some(h),
                 Err(e) => {
                     eprintln!("flow-tray: no D-Bus session ({e}); running without a tray icon");
@@ -141,7 +138,21 @@ pub fn run(open_window: bool) -> anyhow::Result<Option<String>> {
                 }
             }
         }
-    };
+    }
+}
+
+/// Runs the tray until "Quit" (Ok(None)) or until an update replaced the
+/// tray binary (Ok(Some(new build)): the caller starts it). `open_window`
+/// opens the status window at start (`--show`).
+pub fn run(open_window: bool) -> anyhow::Result<Option<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut handle = spawn_item(&tx);
+    if handle.is_some() {
+        let tx = tx.clone();
+        crate::sni::supervise(move || {
+            let _ = tx.send(Action::ReRegister);
+        });
+    }
     if open_window {
         instance::open_window();
     }
@@ -151,15 +162,31 @@ pub fn run(open_window: bool) -> anyhow::Result<Option<String>> {
     });
     let mut core = crate::TrayCore::default();
     for a in rx {
-        if let Action::State(s) = &a {
-            let v = view(s);
-            if let Some(h) = &handle {
-                h.update(|t| {
-                    if t.view != v {
-                        t.view = v;
-                    }
-                });
+        match &a {
+            Action::State(s) => {
+                let v = view(s);
+                if let Some(h) = &handle {
+                    h.update(|t| {
+                        if t.view != v {
+                            t.view = v;
+                        }
+                    });
+                }
             }
+            Action::ReRegister => {
+                // The host dropped the item: a new one (new name, new
+                // connection) with what the old one showed. The old one
+                // goes first so the host sees one item, not two.
+                let current = handle.as_ref().and_then(|h| h.update(|t| t.view.clone()));
+                if let Some(h) = handle.take() {
+                    h.shutdown().wait();
+                }
+                handle = spawn_item(&tx);
+                if let (Some(h), Some(v)) = (&handle, current) {
+                    h.update(|t| t.view = v);
+                }
+            }
+            _ => {}
         }
         if !core.handle(a) {
             break;

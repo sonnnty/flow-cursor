@@ -257,6 +257,64 @@ async fn pause_and_away_close_the_session_at_once() {
     w.hub.unwrap().shutdown().await;
 }
 
+/// The IPC snapshot the tray gets from `t`.
+fn snapshot(t: &TestAgent) -> flow_ipc::Snapshot {
+    let (control, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let ctx = flow_agent::ipc::IpcContext {
+        agent: t.agent.observer(),
+        info: std::sync::Arc::new(flow_agent::ipc::AgentInfo {
+            config_file: t.state_dir.join("agent.toml"),
+            log_file: None,
+            cfg: flow_agent::config::AgentConfig { state_dir: Some(t.state_dir.clone()), ..Default::default() },
+        }),
+        logs: Default::default(),
+        control,
+    };
+    flow_agent::ipc::snapshot(&ctx)
+}
+
+/// No problem, no warning, and the reason for a closed session (or none).
+fn assert_calm(s: &flow_ipc::Snapshot, idle: Option<flow_ipc::SessionIdle>) {
+    assert_eq!(s.session_idle, idle, "{s:?}");
+    assert!(s.problems.is_empty(), "no problem: {:?}", s.problems);
+    assert!(s.warnings.is_empty(), "no warning: {:?}", s.warnings);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_closed_on_purpose_is_no_problem_in_the_status() {
+    use flow_ipc::SessionIdle::*;
+    let mut w = pair(on_demand).await;
+    wait_b_controllable(&w).await;
+    let s = snapshot(&w.b);
+    assert!(s.can_inject && s.can_clipboard && s.controllable && s.session_wanted);
+    assert_calm(&s, None);
+
+    // Paused: closed on purpose.
+    w.b.agent.set_paused(true);
+    assert!(w.b.agent.wait(T, |s| s.paused && !s.controllable).await);
+    let s = snapshot(&w.b);
+    assert!(!s.can_inject && !s.can_clipboard && !s.session_wanted);
+    assert_calm(&s, Some(Paused));
+    w.b.agent.set_paused(false);
+    wait_b_controllable(&w).await;
+    assert_calm(&snapshot(&w.b), None);
+
+    // Away.
+    set_allowed_networks(w.hub.as_ref().unwrap(), json!(["10.10.15.0/24"])).await;
+    w.b.net.set([ip("192.168.1.50")]);
+    assert!(w.b.agent.wait(T, |s| s.away && !s.controllable).await);
+    assert_calm(&snapshot(&w.b), Some(Away));
+    w.b.net.set([ip("10.10.15.11")]);
+    wait_b_controllable(&w).await;
+
+    // The hub is gone and the grace period is over.
+    w.hub.take().unwrap().shutdown().await;
+    assert!(w.b.agent.wait(GRACE + T, |s| !s.controllable && !s.connected).await);
+    let s = snapshot(&w.b);
+    assert!(!s.hub_connected);
+    assert_calm(&s, Some(Disconnected));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_lost_by_the_backend_makes_the_machine_uncontrollable() {
     let w = pair(on_demand).await;

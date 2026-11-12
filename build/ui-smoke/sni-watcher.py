@@ -91,6 +91,14 @@ class Watcher(dbus.service.Object):
             "ProtocolVersion": dbus.Int32(0),
         }
 
+    # Test hook: forget every item without telling anyone, like the GNOME
+    # extension does when the connection that owned an item's name goes away.
+    @dbus.service.method("org.flowcursor.Test")
+    def Forget(self):
+        log.write("Forget(): dropping all items\n")
+        items.clear()
+        last.clear()
+
     @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ss", out_signature="v")
     def Get(self, iface, prop):
         return self._props()[prop]

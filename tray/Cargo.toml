@@ -27,6 +27,9 @@ winit = "0.30"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+# Same D-Bus library and executor as ksni (one copy): the tray checks that the
+# host still lists its item (see `sni`).
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.26", default-features = false }
