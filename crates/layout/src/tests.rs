@@ -337,3 +337,177 @@ fn clamp_to_screens_keeps_the_cursor_at_the_edge() {
     let empty = node(2, 0, 0, vec![]);
     assert_eq!(clamp_to_screens(&empty, 7.0, 8.0), (7.0, 8.0));
 }
+
+// ---------------------------------------------------------------------------
+// re-layout when a node's monitors change
+// ---------------------------------------------------------------------------
+
+/// The owner's laptop: built-in 1536x960, docked with 1920x1080 and a
+/// portrait 1080x1920 (4536 px wide in all).
+fn laptop_docked() -> Vec<Monitor> {
+    vec![mon(0, 0, 1536, 960), mon(1536, 0, 1920, 1080), mon(3456, 0, 1080, 1920)]
+}
+
+fn laptop_alone() -> Vec<Monitor> {
+    vec![mon(0, 0, 1536, 960)]
+}
+
+fn pos(l: &Layout, id: NodeId) -> (i32, i32) {
+    let n = l.node(id).unwrap();
+    (n.x, n.y)
+}
+
+fn touches(l: &Layout, a: NodeId, b: NodeId) -> bool {
+    l.edges_of(a).iter().any(|e| e.to == b) && l.edges_of(b).iter().any(|e| e.to == a)
+}
+
+#[test]
+fn docking_keeps_the_pc_right_of_the_laptop() {
+    let mut l = Layout { nodes: vec![node(1, 0, 0, laptop_alone()), node(2, 1536, 0, vec![mon(0, 0, 1920, 1080)])] };
+    assert!(touches(&l, A, B));
+    let moved = apply_monitors(&mut l, A, laptop_docked());
+    assert_eq!(moved, vec![Moved { id: B, from: (1536, 0), to: (4536, 0) }]);
+    assert_eq!(pos(&l, A), (0, 0), "the changed node keeps its place");
+    assert!(touches(&l, A, B));
+    assert!(overlaps(&l).is_empty());
+}
+
+#[test]
+fn undocking_pulls_the_pc_back_and_lines_it_up_again() {
+    // The PC sat next to the portrait screen, lower than the laptop's own
+    // 960 px: after undocking it would no longer face the laptop.
+    let mut l =
+        Layout { nodes: vec![node(1, 0, 0, laptop_docked()), node(2, 4536, 1000, vec![mon(0, 0, 1920, 1080)])] };
+    assert!(touches(&l, A, B));
+    let moved = apply_monitors(&mut l, A, laptop_alone());
+    assert_eq!(moved, vec![Moved { id: B, from: (4536, 1000), to: (1536, 0) }]);
+    assert!(touches(&l, A, B));
+    // Still facing it after the move: only the x changes.
+    let mut l = Layout { nodes: vec![node(1, 0, 0, laptop_docked()), node(2, 4536, 200, vec![mon(0, 0, 1920, 1080)])] };
+    apply_monitors(&mut l, A, laptop_alone());
+    assert_eq!(pos(&l, B), (1536, 200));
+}
+
+#[test]
+fn a_row_of_machines_moves_as_one_block() {
+    let pc = || vec![mon(0, 0, 1920, 1080)];
+    let mut l = Layout { nodes: vec![node(1, 0, 0, laptop_alone()), node(2, 1536, 0, pc()), node(3, 3456, 0, pc())] };
+    apply_monitors(&mut l, A, laptop_docked());
+    assert_eq!((pos(&l, B), pos(&l, C)), ((4536, 0), (6456, 0)));
+    assert!(touches(&l, A, B) && touches(&l, B, C));
+}
+
+#[test]
+fn vertical_neighbours_follow_the_bottom_and_top() {
+    // A TV below, a screen above; a second monitor appears below the first.
+    let wide = || vec![mon(0, 0, 1920, 1080)];
+    let mut l = Layout { nodes: vec![node(1, 0, 0, wide()), node(2, 0, 1080, wide()), node(3, 0, -1080, wide())] };
+    let moved = apply_monitors(&mut l, A, vec![mon(0, 0, 1920, 1080), mon(0, 1080, 1920, 1080)]);
+    assert_eq!(moved, vec![Moved { id: B, from: (0, 1080), to: (0, 2160) }], "the screen above stays");
+    assert!(touches(&l, A, B) && touches(&l, A, C));
+    // And back.
+    apply_monitors(&mut l, A, wide());
+    assert_eq!(pos(&l, B), (0, 1080));
+    // A monitor added above (negative y) moves the screen above up.
+    apply_monitors(&mut l, A, vec![mon(0, -1080, 1920, 1080), mon(0, 0, 1920, 1080)]);
+    assert_eq!((pos(&l, B), pos(&l, C)), ((0, 1080), (0, -2160)));
+    assert!(touches(&l, A, C));
+}
+
+#[test]
+fn a_monitor_left_of_the_primary_moves_left_neighbours() {
+    // Windows: a second monitor left of the primary has negative x.
+    let mut l = Layout { nodes: vec![node(1, 0, 0, vec![mon(0, 0, 1920, 1080)]), node(2, 1920, 0, laptop_alone())] };
+    let moved = apply_monitors(&mut l, B, vec![mon(-1920, 0, 1920, 1080), mon(0, 0, 1536, 960)]);
+    assert_eq!(moved, vec![Moved { id: A, from: (0, 0), to: (-1920, 0) }]);
+    assert!(touches(&l, A, B));
+}
+
+#[test]
+fn nodes_that_did_not_touch_are_left_alone() {
+    // C touches neither A nor anything that moves; B is right of A. A grows
+    // only downwards, so B (still facing A) does not move either.
+    let wide = || vec![mon(0, 0, 1920, 1080)];
+    let mut l = Layout { nodes: vec![node(1, 0, 0, wide()), node(2, 1920, 0, wide()), node(3, -5000, 3000, wide())] };
+    let moved = apply_monitors(&mut l, A, vec![mon(0, 0, 1920, 1080), mon(0, 1080, 1920, 1080)]);
+    assert!(moved.is_empty(), "{moved:?}");
+    assert!(touches(&l, A, B));
+    // Same monitors again: nothing to do.
+    assert!(apply_monitors(&mut l, A, vec![mon(0, 0, 1920, 1080), mon(0, 1080, 1920, 1080)]).is_empty());
+}
+
+#[test]
+fn overlapping_nodes_are_pushed_the_shortest_way_until_they_touch() {
+    // B was 64 px away from A (not touching); A grows into it. Out to the
+    // right is 456 px, down 1180 px, up 980 px.
+    let mut l = Layout { nodes: vec![node(1, 0, 0, laptop_alone()), node(2, 3000, -100, vec![mon(0, 0, 1920, 1080)])] };
+    let moved = apply_monitors(&mut l, A, vec![mon(0, 0, 1536, 960), mon(1536, 0, 1920, 1080)]);
+    assert_eq!(moved, vec![Moved { id: B, from: (3000, -100), to: (3456, -100) }]);
+    assert!(overlaps(&l).is_empty());
+    assert!(touches(&l, A, B));
+
+    // Down is shorter here.
+    let mut l = Layout { nodes: vec![node(1, 0, 0, laptop_alone()), node(2, 1600, 500, vec![mon(0, 0, 1920, 1080)])] };
+    apply_monitors(&mut l, A, vec![mon(0, 0, 1536, 960), mon(1536, 0, 1920, 1080)]);
+    assert_eq!(pos(&l, B), (1600, 1080));
+    assert!(touches(&l, A, B));
+}
+
+#[test]
+fn pushes_cascade_and_avoid_placed_nodes() {
+    // B and C stand in a column right of A's future second monitor; A grows
+    // into B, B is pushed and then overlaps C, which moves too.
+    let pc = || vec![mon(0, 0, 1920, 1080)];
+    let mut l = Layout {
+        nodes: vec![node(1, 0, 0, vec![mon(0, 0, 1920, 1080)]), node(2, 2000, 0, pc()), node(3, 3950, 0, pc())],
+    };
+    apply_monitors(&mut l, A, vec![mon(0, 0, 1920, 1080), mon(1920, 0, 2560, 1440)]);
+    assert!(overlaps(&l).is_empty(), "{:?} {l:?}", overlaps(&l));
+    assert_eq!(pos(&l, A), (0, 0));
+}
+
+#[test]
+fn a_block_touching_two_sides_is_not_dragged_two_ways() {
+    // B right of A, C below A, and B and C touch each other: one block that
+    // would move right and down at once. It stays; nothing overlaps.
+    let mut l = Layout {
+        nodes: vec![
+            node(1, 0, 0, vec![mon(0, 0, 1000, 1000)]),
+            node(2, 1000, 0, vec![mon(0, 0, 1000, 2000)]),
+            node(3, 0, 1000, vec![mon(0, 0, 1000, 1000)]),
+        ],
+    };
+    let moved = apply_monitors(&mut l, A, vec![mon(0, 0, 900, 900)]);
+    assert!(moved.is_empty(), "{moved:?}");
+}
+
+#[test]
+fn separate_from_fixes_an_overlap_saved_earlier() {
+    let mut l = Layout { nodes: vec![node(1, 0, 0, laptop_docked()), node(2, 1536, 0, vec![mon(0, 0, 1920, 1080)])] };
+    assert_eq!(overlaps(&l), vec![(A, B)]);
+    assert_eq!(isolated(&l), vec![A, B]);
+    let moved = separate_from(&mut l, A);
+    assert_eq!(moved.len(), 1);
+    assert!(overlaps(&l).is_empty() && isolated(&l).is_empty());
+}
+
+#[test]
+fn overlap_and_isolation_checks() {
+    let pc = || vec![mon(0, 0, 1920, 1080)];
+    // Touching, also with a few pixels of overlap: fine.
+    let l = Layout { nodes: vec![node(1, 0, 0, pc()), node(2, 1917, 0, pc())] };
+    assert!(overlaps(&l).is_empty() && isolated(&l).is_empty());
+    // Diagonal: no shared edge.
+    let l = Layout { nodes: vec![node(1, 0, 0, pc()), node(2, 1920, 1080, pc())] };
+    assert!(overlaps(&l).is_empty());
+    assert_eq!(isolated(&l), vec![A, B]);
+    // A gap along a shared extent still leads across (see `neighbors`).
+    let l = Layout { nodes: vec![node(1, 0, 0, pc()), node(2, 2500, 300, pc())] };
+    assert!(isolated(&l).is_empty());
+    // One node alone is never "isolated" (nothing to touch).
+    let l = Layout { nodes: vec![node(1, 0, 0, pc())] };
+    assert!(isolated(&l).is_empty());
+    assert_eq!(touching_side(&Rect::new(0, 0, 10, 10), &Rect::new(10, 5, 10, 10)), Some(Side::Right));
+    assert_eq!(touching_side(&Rect::new(0, 0, 10, 10), &Rect::new(5, -10, 10, 10)), Some(Side::Top));
+    assert!(boxes_overlap(&Rect::new(0, 0, 10, 10), &Rect::new(5, 5, 10, 10)));
+}
