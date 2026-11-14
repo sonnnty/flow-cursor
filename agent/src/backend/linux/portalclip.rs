@@ -1,5 +1,11 @@
-//! The portal Clipboard interface of one RemoteDesktop session
-//! (`org.freedesktop.portal.Clipboard`), driven by its raw D-Bus signals.
+//! The clipboard of one RemoteDesktop session, driven by its raw D-Bus
+//! signals: either the portal Clipboard interface
+//! (`org.freedesktop.portal.Clipboard`) or, on the Mutter direct path (see
+//! [`super::mutter`]), the clipboard methods of mutter's own
+//! `org.gnome.Mutter.RemoteDesktop.Session`, which the portal backend
+//! forwards to. Both behave the same; only the call and signal shapes
+//! differ (the portal names the session in every call and signal, mutter's
+//! session object is the session).
 //!
 //! ashpd's typed `receive_selection_owner_changed` cannot be used with
 //! GNOME: xdg-desktop-portal-gnome (gnome-46 `clipboard.c`) only renames
@@ -8,7 +14,7 @@
 //! `as`. ashpd's deserialization of the whole signal then fails and its
 //! stream drops the signal without a trace, so a local copy was never seen.
 //! The signals are therefore parsed here, accepting both forms (and
-//! mutter's dashed key names), and only for this session's handle.
+//! mutter's dashed key names), and only for this session.
 //!
 //! A copy in a GNOME app arrives as a burst (mutter sends one signal per
 //! owner change, the first often with no MIME types yet): the newest offer
@@ -19,7 +25,7 @@ use super::{PNG_MIME, TEXT_MIMES};
 use crate::backend::{EventTx, LocalEvent};
 use anyhow::{anyhow, Context, Result};
 use ashpd::desktop::clipboard::{Clipboard, SetSelectionOptions};
-use ashpd::zbus::{Message, OwnedObjectPath, OwnedVariant, Variant};
+use ashpd::zbus::{Message, OwnedObjectPath, OwnedVariant, Proxy, Variant};
 use flow_proto::ClipContent;
 use futures_util::stream::LocalBoxStream;
 use futures_util::StreamExt;
@@ -49,10 +55,20 @@ pub enum ClipWork {
     Ended(&'static str),
 }
 
+/// Which interface the clipboard of the session is reached through.
+enum Api {
+    /// `org.freedesktop.portal.Clipboard`: calls and signals name the
+    /// session handle.
+    Portal { proxy: Clipboard, session: OwnedObjectPath },
+    /// `org.gnome.Mutter.RemoteDesktop.Session`: a proxy for the session
+    /// object itself. mutter emits the signals on the session's path (to
+    /// every listener), so the proxy's match rule already selects them.
+    Mutter { proxy: Proxy<'static> },
+}
+
 /// The clipboard of one RemoteDesktop session.
 pub struct PortalClip {
-    proxy: Clipboard,
-    session: OwnedObjectPath,
+    api: Api,
     owner_changes: LocalBoxStream<'static, Message>,
     transfers: LocalBoxStream<'static, Message>,
     /// Newest offer not read yet and when to read it.
@@ -80,7 +96,72 @@ impl PortalClip {
             .boxed_local();
         let transfers =
             proxy.receive_signal("SelectionTransfer").await.context("subscribing to Clipboard.SelectionTransfer")?;
-        Ok(PortalClip { proxy, session, owner_changes, transfers: transfers.boxed_local(), offer: None, owned: None })
+        Ok(PortalClip {
+            api: Api::Portal { proxy, session },
+            owner_changes,
+            transfers: transfers.boxed_local(),
+            offer: None,
+            owned: None,
+        })
+    }
+
+    /// Subscribes to the clipboard signals of a mutter RemoteDesktop
+    /// session (`proxy` is for the session object). The session's
+    /// `EnableClipboard` is called afterwards by its owner: mutter announces
+    /// the current owner right away, and that signal must not be missed.
+    pub async fn mutter(proxy: Proxy<'static>) -> Result<Self> {
+        let owner_changes = proxy
+            .receive_signal("SelectionOwnerChanged")
+            .await
+            .context("subscribing to RemoteDesktop.Session.SelectionOwnerChanged")?
+            .boxed_local();
+        let transfers = proxy
+            .receive_signal("SelectionTransfer")
+            .await
+            .context("subscribing to RemoteDesktop.Session.SelectionTransfer")?
+            .boxed_local();
+        Ok(PortalClip { api: Api::Mutter { proxy }, owner_changes, transfers, offer: None, owned: None })
+    }
+
+    /// The session's object path (the portal's handle or mutter's session).
+    fn session(&self) -> &str {
+        match &self.api {
+            Api::Portal { session, .. } => session.as_str(),
+            Api::Mutter { proxy } => proxy.path().as_str(),
+        }
+    }
+
+    /// `SelectionOwnerChanged` of this session, None for another one.
+    fn owner_change(&self, m: &Message) -> Result<Option<OwnerChange>> {
+        let c = match self.api {
+            Api::Portal { .. } => parse_owner_changed(m)?,
+            Api::Mutter { .. } => parse_mutter_owner_changed(m)?,
+        };
+        if c.session.as_str() != self.session() {
+            debug!(path = %c.session, "clipboard owner change for another session ignored");
+            return Ok(None);
+        }
+        Ok(Some(c))
+    }
+
+    /// `SelectionTransfer` of this session as (mime, serial).
+    fn transfer_of(&self, m: &Message) -> Result<Option<(String, u32)>> {
+        Ok(match self.api {
+            Api::Portal { .. } => {
+                let (path, mime, serial) = parse_transfer(m)?;
+                if path.as_str() != self.session() {
+                    debug!(%path, "clipboard transfer for another session ignored");
+                    return Ok(None);
+                }
+                Some((mime, serial))
+            }
+            Api::Mutter { .. } => {
+                if m.header().path().map(|p| p.as_str()) != Some(self.session()) {
+                    return Ok(None);
+                }
+                Some(m.body().deserialize::<(String, u32)>().context("body is not (su)")?)
+            }
+        })
     }
 
     /// The next thing to do. Cancel-safe: the pending offer is kept in
@@ -94,12 +175,10 @@ impl PortalClip {
                     None => return ClipWork::Ended("SelectionOwnerChanged"),
                 },
                 m = self.transfers.next() => match m {
-                    Some(m) => match parse_transfer(&m) {
-                        Ok((path, mime, serial)) if path == self.session => {
-                            return ClipWork::Transfer { mime, serial };
-                        }
-                        Ok((path, ..)) => debug!(%path, "clipboard transfer for another session ignored"),
-                        Err(e) => warn!("unexpected Clipboard.SelectionTransfer signal: {e:#}"),
+                    Some(m) => match self.transfer_of(&m) {
+                        Ok(Some((mime, serial))) => return ClipWork::Transfer { mime, serial },
+                        Ok(None) => {}
+                        Err(e) => warn!("unexpected SelectionTransfer signal: {e:#}"),
                     },
                     None => return ClipWork::Ended("SelectionTransfer"),
                 },
@@ -113,17 +192,14 @@ impl PortalClip {
     }
 
     fn on_owner_changed(&mut self, m: &Message) {
-        let change = match parse_owner_changed(m) {
-            Ok(c) => c,
+        let change = match self.owner_change(m) {
+            Ok(Some(c)) => c,
+            Ok(None) => return,
             Err(e) => {
-                warn!("unexpected Clipboard.SelectionOwnerChanged signal: {e:#}");
+                warn!("unexpected SelectionOwnerChanged signal: {e:#}");
                 return;
             }
         };
-        if change.session != self.session {
-            debug!(path = %change.session, "clipboard owner change for another session ignored");
-            return;
-        }
         debug!(mime_types = ?change.mime_types, session_is_owner = ?change.session_is_owner, "clipboard owner changed");
         if change.session_is_owner == Some(true) {
             // What we set ourselves (from another machine): nothing to read.
@@ -145,10 +221,13 @@ impl PortalClip {
     /// portal call is awaited: the pipe is drained on a blocking thread so
     /// a slow source does not hold up injection.
     pub async fn read(&self, mime: &str, events: &EventTx) -> Result<()> {
-        let fd: ashpd::zbus::OwnedFd =
-            bounded("Clipboard.SelectionRead", self.proxy.call("SelectionRead", &(&self.session, mime)))
-                .await
-                .with_context(|| format!("reading the clipboard as {mime}"))?;
+        let fd: ashpd::zbus::OwnedFd = match &self.api {
+            Api::Portal { proxy, session } => {
+                bounded("Clipboard.SelectionRead", proxy.call("SelectionRead", &(session, mime))).await
+            }
+            Api::Mutter { proxy } => bounded("SelectionRead", proxy.call("SelectionRead", &(mime,))).await,
+        }
+        .with_context(|| format!("reading the clipboard as {mime}"))?;
         let fd = std::os::fd::OwnedFd::from(fd);
         let (mime, events) = (mime.to_string(), events.clone());
         tokio::task::spawn_blocking(move || {
@@ -183,8 +262,17 @@ impl PortalClip {
         self.owned = Some(c);
         // A newer offer of another application loses against this one.
         self.offer = None;
-        let opts = SetSelectionOptions::default().set_mime_types(&mimes);
-        bounded("Clipboard.SetSelection", self.proxy.call::<_, _, ()>("SetSelection", &(&self.session, opts))).await
+        match &self.api {
+            Api::Portal { proxy, session } => {
+                let opts = SetSelectionOptions::default().set_mime_types(&mimes);
+                bounded("Clipboard.SetSelection", proxy.call::<_, _, ()>("SetSelection", &(session, opts))).await
+            }
+            Api::Mutter { proxy } => {
+                // mutter reads the list as `as` under its own key name.
+                let opts = HashMap::from([("mime-types", Variant::from(mimes))]);
+                bounded("SetSelection", proxy.call::<_, _, ()>("SetSelection", &(opts,))).await
+            }
+        }
     }
 
     /// Answers a transfer: writes what this session owns as `mime`.
@@ -207,16 +295,27 @@ impl PortalClip {
                 false
             }
         };
-        let body = (&self.session, serial, ok);
-        let done = self.proxy.call::<_, _, ()>("SelectionWriteDone", &body);
-        if let Err(e) = bounded("Clipboard.SelectionWriteDone", done).await {
-            debug!("Clipboard.SelectionWriteDone failed: {e:#}");
+        let done = match &self.api {
+            Api::Portal { proxy, session } => {
+                bounded("SelectionWriteDone", proxy.call::<_, _, ()>("SelectionWriteDone", &(session, serial, ok)))
+                    .await
+            }
+            Api::Mutter { proxy } => {
+                bounded("SelectionWriteDone", proxy.call::<_, _, ()>("SelectionWriteDone", &(serial, ok))).await
+            }
+        };
+        if let Err(e) = done {
+            debug!("SelectionWriteDone failed: {e:#}");
         }
     }
 
     async fn write(&self, serial: u32, data: Vec<u8>) -> Result<()> {
-        let fd: ashpd::zbus::OwnedFd =
-            bounded("Clipboard.SelectionWrite", self.proxy.call("SelectionWrite", &(&self.session, serial))).await?;
+        let fd: ashpd::zbus::OwnedFd = match &self.api {
+            Api::Portal { proxy, session } => {
+                bounded("Clipboard.SelectionWrite", proxy.call("SelectionWrite", &(session, serial))).await?
+            }
+            Api::Mutter { proxy } => bounded("SelectionWrite", proxy.call("SelectionWrite", &(serial,))).await?,
+        };
         let fd = std::os::fd::OwnedFd::from(fd);
         // A reader that never drains the pipe must not park the caller:
         // stop waiting (the blocking write is abandoned).
@@ -247,6 +346,20 @@ pub struct OwnerChange {
 pub fn parse_owner_changed(m: &Message) -> Result<OwnerChange> {
     let (session, options): (OwnedObjectPath, HashMap<String, OwnedVariant>) =
         m.body().deserialize().context("body is not (oa{sv})")?;
+    Ok(owner_change(session, &options))
+}
+
+/// Parses mutter's `SelectionOwnerChanged (a{sv} options)`, emitted on the
+/// session's path; mutter 46 sends `mime-types` as `(as)` and
+/// `session-is-owner` (both only when there is an owner).
+pub fn parse_mutter_owner_changed(m: &Message) -> Result<OwnerChange> {
+    let (options,): (HashMap<String, OwnedVariant>,) = m.body().deserialize().context("body is not (a{sv})")?;
+    let path = m.header().path().map(|p| p.to_string()).unwrap_or_default();
+    let session = OwnedObjectPath::try_from(path).map_err(|e| anyhow!("signal without a path: {e}"))?;
+    Ok(owner_change(session, &options))
+}
+
+fn owner_change(session: OwnedObjectPath, options: &HashMap<String, OwnedVariant>) -> OwnerChange {
     let get = |a: &str, b: &str| options.get(a).or_else(|| options.get(b));
     let mut mime_types = Vec::new();
     if let Some(v) = get("mime_types", "mime-types") {
@@ -260,7 +373,7 @@ pub fn parse_owner_changed(m: &Message) -> Result<OwnerChange> {
         },
         _ => None,
     };
-    Ok(OwnerChange { session, mime_types, session_is_owner })
+    OwnerChange { session, mime_types, session_is_owner }
 }
 
 /// Every string in `v`, looking into arrays, structs and variants.
@@ -356,7 +469,31 @@ mod tests {
         assert_eq!(pick_mime(&c.mime_types), None);
     }
 
-    /// The root cause of the silent clipboard: ashpd's typed signal cannot
+    /// mutter 46 `generate_owner_changed_variant`: `{"mime-types": <(as)>,
+    /// "session-is-owner": <b>}` emitted on the session's path, or an empty
+    /// dict without an owner.
+    #[test]
+    fn mutter_owner_changed_takes_the_session_from_the_path() {
+        const PATH: &str = "/org/gnome/Mutter/RemoteDesktop/Session/u4";
+        let signal = |o: &HashMap<&str, Variant<'_>>| {
+            Message::signal(PATH, "org.gnome.Mutter.RemoteDesktop.Session", "SelectionOwnerChanged")
+                .build(&(o,))
+                .unwrap()
+        };
+        let mut o = HashMap::new();
+        o.insert("mime-types", gnome_mimes(&[UTF8, "STRING"]));
+        o.insert("session-is-owner", Variant::Bool(false));
+        let c = parse_mutter_owner_changed(&signal(&o)).unwrap();
+        assert_eq!(c.session.as_str(), PATH);
+        assert_eq!(c.mime_types, [UTF8, "STRING"]);
+        assert_eq!(c.session_is_owner, Some(false));
+        let c = parse_mutter_owner_changed(&signal(&HashMap::new())).unwrap();
+        assert!(c.mime_types.is_empty() && c.session_is_owner.is_none());
+        // The portal's shape is not mutter's.
+        assert!(parse_mutter_owner_changed(&owner_signal(SESSION_1, &opts(None, None))).is_err());
+    }
+
+    /// The root cause of the silent clipboard:ashpd's typed signal cannot
     /// read GNOME's `(as)` list. If this starts to pass, ashpd accepts it
     /// and its stream could be used again.
     #[test]
@@ -376,35 +513,7 @@ mod tests {
         assert_eq!(pick_mime(&s(&["text/html", "application/x-foo"])), None);
     }
 
-    /// A private session bus (`dbus-daemon`); None when it is not installed.
-    struct Bus {
-        daemon: std::process::Child,
-        addr: String,
-    }
-
-    impl Bus {
-        fn start() -> Option<Bus> {
-            let mut daemon = std::process::Command::new("dbus-daemon")
-                .args(["--session", "--nofork", "--print-address"])
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .ok()?;
-            let mut addr = String::new();
-            std::io::BufRead::read_line(&mut std::io::BufReader::new(daemon.stdout.take()?), &mut addr).ok()?;
-            Some(Bus { daemon, addr: addr.trim().to_string() })
-        }
-
-        async fn connect(&self) -> Connection {
-            ashpd::zbus::connection::Builder::address(self.addr.as_str()).build().await.unwrap()
-        }
-    }
-
-    impl Drop for Bus {
-        fn drop(&mut self) {
-            let _ = self.daemon.kill();
-            let _ = self.daemon.wait();
-        }
-    }
+    use crate::backend::linux::testbus::Bus;
 
     /// What the fake portal was asked.
     #[derive(Debug, Clone, PartialEq)]

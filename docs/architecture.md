@@ -23,6 +23,17 @@ hub เป็นคนจัดการ ส่วน input ไม่ผ่า�
 ถ้า hub ล่ม เครื่องที่เคยต่อกันแล้วยังคุมกันผ่าน P2P ได้ แต่ relay ใช้ไม่ได้
 ยกเว้นการคุมเครื่อง GNOME บน Wayland ซึ่งใช้ได้แค่ 10 วินาทีแรก เพราะ agent ปิด session Remote Desktop เมื่อไม่ได้ต่อ hub ดู [ติดตั้งบน Linux](install-linux.md#ไอคอน-มีคนควบคุมเครื่องนี้-บนแถบด้านบน)
 
+## GNOME (Wayland)
+
+GNOME ไม่ให้โปรแกรมทั่วไปจับหรือจำลอง input เอง agent จึงขอผ่าน mutter (ตัวจัดการหน้าต่างของ GNOME):
+
+- **Input Capture**: mutter วางเส้นกั้นที่ขอบจอ เมื่อเมาส์ชนเส้นกั้น mutter ส่ง input ทั้งหมดให้ agent ผ่าน socket ของ libei จนกว่า agent จะคืน
+- **Remote Desktop**: agent ส่ง input จากเครื่องอื่นผ่าน libei อีก socket หนึ่ง และใช้คลิปบอร์ดของ session นี้
+
+ค่าเริ่มต้นคือ **Mutter direct**: agent เรียก `org.gnome.Mutter.InputCapture` และ `org.gnome.Mutter.RemoteDesktop` บน D-Bus เอง ไม่มีหน้าต่างขอสิทธิ์
+ถ้าใช้ไม่ได้ หรือตั้ง `gnome_direct = "off"` agent ผ่าน xdg-desktop-portal ซึ่งเรียก mutter แบบเดียวกันหลังจากถามผู้ใช้
+ดู [สิทธิ์ของ GNOME](install-linux.md#สิทธิ์ของ-gnome-wayland)
+
 ## ความปลอดภัย
 
 ทุกอย่างวิ่งบน QUIC (`quinn`, TLS 1.3) ข้อมูลคีย์บอร์ดไม่เคยวิ่งแบบไม่เข้ารหัส

@@ -181,6 +181,9 @@ pub struct Snapshot {
     /// The compositor's capture session (GNOME/Wayland InputCapture);
     /// None on backends without one and from older agents.
     pub capture: Option<CaptureInfo>,
+    /// How the remote control session is made on GNOME/Wayland: `mutter
+    /// direct` or `portal`. None on other backends and from older agents.
+    pub remote_control_path: Option<String>,
 }
 
 /// State of the compositor's capture session: whether pointer barriers are
@@ -188,6 +191,9 @@ pub struct Snapshot {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CaptureInfo {
+    /// How the session is reached: `mutter direct` (no permission dialog)
+    /// or `portal`. None from older agents and without a session.
+    pub path: Option<String>,
     /// `enabled`, `no edges`, `opening` (waiting for the portal or its
     /// permission dialog), `re-creating`, `lost`, `refused`, `unavailable`,
     /// `not enabled`.

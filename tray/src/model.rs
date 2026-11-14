@@ -92,7 +92,11 @@ pub fn inject_label(s: &Snapshot) -> &'static str {
 /// barriers · last edge hit 3m ago"; None on other backends.
 pub fn capture_label(s: &Snapshot) -> Option<String> {
     let c = s.capture.as_ref()?;
-    let mut parts = vec![c.state.clone()];
+    let state = match c.path.as_deref() {
+        Some(p) => format!("{} ({p})", c.state),
+        None => c.state.clone(),
+    };
+    let mut parts = vec![state];
     if c.state == "enabled" {
         parts.push(format!("{} barrier{}", c.barriers, if c.barriers == 1 { "" } else { "s" }));
     }
@@ -536,5 +540,12 @@ mod tests {
         assert_eq!(capture_label(&s).as_deref(), Some("enabled · 2 barriers · last edge hit 3m ago"));
         s.capture = Some(flow_ipc::CaptureInfo { state: "re-creating".into(), ..Default::default() });
         assert_eq!(capture_label(&s).as_deref(), Some("re-creating · no edge hit yet"));
+        s.capture = Some(flow_ipc::CaptureInfo {
+            path: Some("mutter direct".into()),
+            state: "enabled".into(),
+            barriers: 1,
+            ..Default::default()
+        });
+        assert_eq!(capture_label(&s).as_deref(), Some("enabled (mutter direct) · 1 barrier · no edge hit yet"));
     }
 }

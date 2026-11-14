@@ -74,6 +74,11 @@ enum Cmd {
         #[arg(long)]
         state_dir: PathBuf,
     },
+    /// Internal: check GNOME's own InputCapture and RemoteDesktop
+    /// interfaces (the Mutter direct path) without the hub: creates one
+    /// session of each, prints zones, EI devices and clipboard, closes them.
+    #[command(hide = true)]
+    GnomeProbe,
     /// Print the monitors the backend detects.
     Monitors {
         #[arg(long)]
@@ -254,12 +259,29 @@ async fn main() -> Result<()> {
             } else {
                 println!("No stored portal permissions.");
             }
+            if cfg.gnome_direct.unwrap_or_default() == flow_agent::config::GnomeDirect::Auto {
+                println!(
+                    "On GNOME the agent normally talks to mutter directly (gnome_direct = \"auto\"), which stores"
+                );
+                println!("no permission and shows no dialog; this only matters when it falls back to the portals.");
+            }
             Ok(())
+        }
+        Cmd::GnomeProbe => {
+            #[cfg(target_os = "linux")]
+            {
+                if !flow_agent::backend::linux::gnomeprobe::run().await {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            #[cfg(not(target_os = "linux"))]
+            bail!("gnome-probe is for GNOME on Linux")
         }
         Cmd::Monitors { backend: b } => {
             let _log = init_logging(Some("warn"), None);
             let kind = backend::parse_kind(b.as_deref().or(cfg.backend.as_deref()))?;
-            let (be, _rx) = backend::create(kind, &BackendOptions { state_dir: cfg.state_dir() }).await?;
+            let (be, _rx) = backend::create(kind, &backend_options(&cfg)).await?;
             for m in be.monitors() {
                 println!(
                     "{:<20} {}x{} at {},{}{}",
@@ -302,9 +324,7 @@ async fn main() -> Result<()> {
             let launcher: flow_agent::update::GuardLauncher = Arc::new(flow_agent::update::guard::launch_process);
             let backend_name = format!("{kind:?}").to_lowercase();
             flow_agent::update::on_start(&cfg.state_dir(), &current, &backend_name, &launcher);
-            let (be, rx) = backend::create(kind, &BackendOptions { state_dir: cfg.state_dir() })
-                .await
-                .context("starting the input backend")?;
+            let (be, rx) = backend::create(kind, &backend_options(&cfg)).await.context("starting the input backend")?;
             flow_agent::update::on_backend_ready(&cfg.state_dir(), &current);
             if be.monitors().is_empty() {
                 bail!("the backend reported no monitors");
@@ -356,6 +376,10 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn backend_options(cfg: &AgentConfig) -> BackendOptions {
+    BackendOptions { state_dir: cfg.state_dir(), gnome_direct: cfg.gnome_direct.unwrap_or_default() }
 }
 
 /// Environment of a process started by [`restart_process`].
@@ -475,7 +499,8 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
         println!("peer:             {} ({state}, {path}{rtt})", p.name);
     }
     if let Some(c) = &s.capture {
-        let mut line = format!("{}, {} barrier{}", c.state, c.barriers, if c.barriers == 1 { "" } else { "s" });
+        let path = c.path.as_deref().map(|p| format!(" ({p})")).unwrap_or_default();
+        let mut line = format!("{}{path}, {} barrier{}", c.state, c.barriers, if c.barriers == 1 { "" } else { "s" });
         if c.barriers_refused > 0 {
             line.push_str(&format!(" ({} refused)", c.barriers_refused));
         }
@@ -492,6 +517,9 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
         if let (Some(what), Some(a)) = (&c.last_change, c.last_change_s) {
             println!("capture change:   {what} ({} ago)", ago(a));
         }
+    }
+    if let Some(p) = &s.remote_control_path {
+        println!("remote control:   {p}");
     }
     for p in &s.problems {
         println!("problem:          {p}");

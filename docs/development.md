@@ -67,7 +67,11 @@ docker run --rm -v "$PWD":/src flow-cursor-builder cargo clippy --target x86_64-
   เช็คว่าหน้าไม่เลื่อน และทุกช่องในแท็บ Settings มองเห็นที่ 1024x700, 1130x900, 1366x650 และ 1920x900 ภาพอยู่ใน `build/out/dash-check/`
   ไม่ต้อง build ก่อน แต่ครั้งแรกต้องมี network เพื่อโหลด `playwright-core`
 
-test ของคลิปบอร์ด GNOME (`agent/src/backend/linux/portalclip.rs`) ใช้ portal จำลองบน `dbus-daemon` ส่วนตัว ถ้าไม่มี `dbus-daemon` test จะข้ามไป
+test ของคลิปบอร์ด GNOME (`agent/src/backend/linux/portalclip.rs`) ใช้ portal จำลองบน `dbus-daemon` ส่วนตัว
+test ของ Mutter direct (`agent/src/backend/linux/mutter.rs`) ใช้ mutter จำลองบน `dbus-daemon` แบบเดียวกัน: session จับเมาส์, สร้าง session ใหม่หลังจอเปลี่ยน, Remote Desktop, คลิปบอร์ดทั้งสองทาง และการกลับไปใช้ portal
+ถ้าไม่มี `dbus-daemon` test เหล่านี้จะข้ามไป
+
+บนเครื่อง GNOME จริง `flow-agent gnome-probe` (คำสั่งซ่อน) เช็ค API ของ mutter โดยไม่ต้องต่อ hub
 
 ## วัด latency
 

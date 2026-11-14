@@ -71,6 +71,8 @@ pub enum LocalEvent {
 /// of this machine stops working, this says whether barriers are in place.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CaptureReport {
+    /// How the session is reached: `mutter direct` or `portal`.
+    pub path: String,
     /// `enabled`, `no edges`, `opening` (waiting for the portal or its
     /// permission dialog), `re-creating`, `lost`, `refused`, `not enabled`.
     pub state: String,
@@ -177,6 +179,11 @@ pub trait Backend: Send + Sync + 'static {
     fn capture_report(&self) -> Option<CaptureReport> {
         None
     }
+    /// How the remote control session is made, on backends that make one
+    /// in different ways (GNOME/Wayland: `mutter direct` or `portal`).
+    fn remote_control_path(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +237,8 @@ fn auto_kind() -> BackendKind {
 #[derive(Clone, Debug, Default)]
 pub struct BackendOptions {
     pub state_dir: std::path::PathBuf,
+    /// Wayland on GNOME: mutter's own interfaces or the portals.
+    pub gnome_direct: crate::config::GnomeDirect,
 }
 
 /// Creates the backend and the stream of local events.
