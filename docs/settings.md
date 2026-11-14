@@ -126,11 +126,22 @@ hub = "192.168.1.10"              # host หรือ host:port, ไม่ใส
 p2p_port = 7879                   # UDP สำหรับ P2P, 0 = สุ่ม
 # p2p_advertise = ["192.168.1.20:7879"]   # ที่อยู่ที่เครื่องอื่นใช้ติดต่อเครื่องนี้ (NAT, หลาย NIC)
 backend = "auto"                  # auto, wayland, x11, windows, sim
+# gnome_direct = "auto"           # GNOME: คุยกับ mutter ตรง ไม่มีหน้าต่างขอสิทธิ์, "off" = ใช้ portal เสมอ
 # emergency_hotkey = "Ctrl+Alt+Shift+Escape"
 # log_level = "info"
 # log_file = "/tmp/flow-agent.log"
 # state_dir = "/path"             # ค่าเริ่มต้น ~/.local/share/flowcursor
 ```
+
+### gnome_direct
+
+ใช้กับ GNOME บน Wayland เท่านั้น ระบบอื่นไม่สนใจค่านี้
+
+- `auto` (ค่าเริ่มต้น): จับเมาส์และเปิด session Remote Desktop ผ่าน D-Bus ของ mutter โดยตรง ไม่มีหน้าต่างขอสิทธิ์
+  ถ้า GNOME ไม่มี API นี้ หรือเรียกแล้วไม่สำเร็จ ใช้ portal แทนเอง
+- `off`: ใช้ portal เสมอ GNOME จะถามสิทธิ์ตามปกติ
+
+เปลี่ยนแล้วต้อง restart agent ดูรายละเอียดและข้อควรรู้ที่ [สิทธิ์ของ GNOME](install-linux.md#สิทธิ์ของ-gnome-wayland)
 
 ### ระดับ log ของ agent
 

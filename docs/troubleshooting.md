@@ -17,12 +17,13 @@
 | dashboard เตือน *overlap* หรือ *does not touch any other screen* | ลากเครื่องให้ขอบชิดกันโดยไม่ทับ แล้วกด Save layout ดู [เมื่อจอของเครื่องเปลี่ยน](settings.md#เมื่อจอของเครื่องเปลี่ยน) |
 | tray ขึ้น *No edges to other machines* | เครื่องนี้ไม่ชิดเครื่องไหนในผังจอ แก้ใน dashboard |
 | เสียบหรือถอดจอแล้ว dashboard ยังแสดงจอเก่า | agent ส่งจอใหม่เองภายในไม่กี่วินาที (ถ้า GNOME ไม่มี DisplayConfig ภายใน 10 วินาที) ถ้ายังไม่เปลี่ยน ดู log ของ agent ว่ามี `monitor configuration changed` ไหม |
-| GNOME ถาม Input Capture อีกหลังเสียบหรือถอดจอ | ปกติ: GNOME ปิด session จับเมาส์ทุกครั้งที่จอเปลี่ยน agent เปิด session ใหม่ครั้งเดียวต่อการเปลี่ยน กด Allow |
-| GNOME: เคยข้ามจอได้ แล้วชนขอบเฉยๆ | ดู `flow-agent status` บรรทัด `input capture` ถ้าเป็น `opening` ให้กด Allow ในหน้าต่างของ GNOME ที่ค้างอยู่ ดู [เปลี่ยนจอแล้วข้ามจอไม่ได้](install-linux.md#เปลี่ยนจอแล้วข้ามจอไม่ได้) |
+| GNOME ถาม Input Capture หรือ Remote Desktop | agent ใช้ทาง portal อยู่ ดู `flow-agent status` บรรทัด `input capture` และ `remote control` ถ้าเป็น `(portal)` ให้หาเหตุผลใน log บรรทัด `mutter's own ... interface is not usable` และเช็คว่าไม่ได้ตั้ง `gnome_direct = "off"` ดู [สิทธิ์ของ GNOME](install-linux.md#สิทธิ์ของ-gnome-wayland) |
+| GNOME ถาม Input Capture อีกหลังเสียบหรือถอดจอ (ทาง portal) | ปกติของทาง portal: GNOME ปิด session จับเมาส์ทุกครั้งที่จอเปลี่ยน agent เปิด session ใหม่ครั้งเดียวต่อการเปลี่ยน กด Allow ทาง Mutter direct ไม่ถาม |
+| GNOME: เคยข้ามจอได้ แล้วชนขอบเฉยๆ | ดู `flow-agent status` บรรทัด `input capture` ทาง portal ถ้าเป็น `opening` ให้กด Allow ในหน้าต่างของ GNOME ที่ค้างอยู่ ทาง Mutter direct ถ้าไม่เป็น `enabled` ภายในไม่กี่วินาที ดู log บรรทัด `input capture` ดู [เปลี่ยนจอแล้วข้ามจอไม่ได้](install-linux.md#เปลี่ยนจอแล้วข้ามจอไม่ได้) |
 | GNOME: copy แล้วเครื่องอื่นไม่ได้ | `flow-agent status` ต้องมี clipboard ถ้าไม่มี session Remote Desktop อาจปิดอยู่ (pause, away, ไม่ได้ต่อ hub) |
 | เมาส์ไม่ข้ามจอ | ขอบจอในผังต้องชิดกัน, เครื่องปลายทางต้อง online และเปิดใช้งาน, บน Wayland ต้องอนุญาต Input Capture, เครื่องปลายทาง GNOME ต้องเปิด session Remote Desktop เสร็จแล้ว (dashboard แสดง inject), ถ้าตั้งปุ่มข้ามจอต้องกดค้าง |
 | เครื่องเป็น `away` ทั้งที่อยู่บ้าน | เทียบ IP ใน dashboard กับวงที่อนุญาต ต้องใส่วงของเครื่อง ไม่ใช่วงของ server |
-| log `permission (... portal) was refused` | กดปฏิเสธหน้าต่างของ GNOME ไป ให้ `systemctl --user restart flow-agent` แล้วกด Allow |
+| log `permission (... portal) was refused` | ทาง portal: กดปฏิเสธหน้าต่างของ GNOME ไป ให้ `systemctl --user restart flow-agent` แล้วกด Allow |
 | ปุ่มค้าง | กด emergency hotkey เครื่องที่ถูกคุมจะปล่อยปุ่มเองใน 2.5 วินาทีถ้าต้นทางหายไป |
 | ไม่เห็นไอคอนบน GNOME | เปิด extension AppIndicator ดู [ติดตั้งบน Linux](install-linux.md#ไอคอนบนแถบด้านบน) |
 | ไอคอนหายไปทั้งที่ `flow-tray` ยังรัน | tray ลงทะเบียนใหม่เองภายใน 30 วินาที ถ้ายังไม่ขึ้นให้เปิด extension AppIndicator หรือรัน `flow-tray --quit` แล้วเปิดใหม่ |
@@ -37,8 +38,10 @@
 **GNOME (Wayland)**
 
 - การไปคุมเครื่องอื่นต้องใช้ GNOME 45 ขึ้นไป เก่ากว่านั้นใช้ session แบบ Xorg
-- หน้าต่าง Input Capture ถามทุกครั้งที่ agent เริ่มใหม่ อัปเดต เปลี่ยนผังจอ หรือเปลี่ยนจอ (เฉพาะเมื่อเครื่องนี้มีขอบไปเครื่องอื่น)
-  GNOME 46 ปิด session เดิมเมื่อจอเปลี่ยน และเปิดซ้ำไม่ได้ ถ้าไม่มีขอบ agent จะยังไม่เปิด session ใหม่
+- Mutter direct (ค่าเริ่มต้นบน GNOME) ใช้ API ภายในของ GNOME ไม่ใช่ API สาธารณะ โปรแกรมไหนใน session ของผู้ใช้ก็เรียกได้ จึงไม่มีหน้าต่างถาม
+  GNOME รุ่นหน้าอาจเปลี่ยน API นี้ ถ้าเรียกไม่ได้ agent ใช้ portal แทน และหน้าต่างขอสิทธิ์จะกลับมา
+- ทาง portal: หน้าต่าง Input Capture ถามทุกครั้งที่ agent เริ่มใหม่ อัปเดต เปลี่ยนผังจอ หรือเปลี่ยนจอ (เฉพาะเมื่อเครื่องนี้มีขอบไปเครื่องอื่น)
+  GNOME 46 ปิด session เดิมเมื่อจอเปลี่ยน และใช้ซ้ำไม่ได้ ถ้าไม่มีขอบ agent จะยังไม่เปิด session ใหม่
 - dashboard แสดงขนาดจอเป็น logical pixel เช่นจอ 1920x1200 ที่ scale 125% แสดงเป็น 1536x960 ซึ่งถูกต้องสำหรับผังจอ
   การแสดงความละเอียดจริงคู่กันต้องเพิ่ม field ใน protocol ซึ่งทำให้ทุก agent ต้องอัปเดตก่อนใช้งานได้ จึงยังไม่ได้ทำ
 - ปุ่มข้ามจอต้องกดหลังเมาส์ชนขอบแล้ว
@@ -63,6 +66,8 @@
 
 **ยังไม่เคยรันบนเครื่องจริง** (ผ่านแค่ test กับ agent จำลอง และ test ใน Docker)
 
+- Mutter direct ทั้งหมด: session จับเมาส์และ Remote Desktop ของ mutter, คลิปบอร์ดของ mutter, การสร้าง session ใหม่หลังจอเปลี่ยน ตื่นจาก sleep และ shortcut ยกเลิกของ GNOME, การกลับไปใช้ portal
+  (ทดสอบกับ mutter จำลองบน dbus-daemon เท่านั้น เช็คบนเครื่องจริงด้วย `flow-agent gnome-probe`)
 - การรู้ว่าจอเปลี่ยนบน GNOME (สัญญาณ DisplayConfig, ZonesChanged, เช็คทุก 10 วินาที) การเปิด session จับเมาส์ใหม่หลังจอเปลี่ยน และการเช็คตัวเองทุก 30 วินาที
 - การอ่านสัญญาณคลิปบอร์ดของ GNOME เอง (ทดสอบกับ portal จำลองบน dbus-daemon เท่านั้น)
 - การเช็คจอซ้ำหลัง `WM_DISPLAYCHANGE` บน Windows และ event RandR แบบ CRTC/output บน X11
