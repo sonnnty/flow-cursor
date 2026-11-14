@@ -74,5 +74,5 @@ GNOME จะขอสิทธิ์สองครั้ง (Remote Desktop ข
 
 ## สถานะ
 
-ตรรกะทั้งหมดผ่าน integration test ที่รัน hub จริงกับ agent จำลอง ใช้งานจริงบน Zorin OS 17 (GNOME 46, Wayland) กับ Windows 11 แล้ว
+ตรรกะทั้งหมดผ่าน integration test ที่รัน hub จริงกับ agent จำลอง ใช้งานจริงบน Zorin OS 18 (GNOME 46, Wayland) กับ Windows 11 แล้ว
 แต่บางส่วนยังไม่เคยรันบนเครื่องจริง เช่น การอัปเดตตัวเองบน Windows ดูรายการที่ [แก้ปัญหาและข้อจำกัด](docs/troubleshooting.md#ข้อจำกัด)

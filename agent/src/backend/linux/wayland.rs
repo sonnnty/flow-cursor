@@ -1,6 +1,6 @@
 //! Wayland backend through xdg-desktop-portal + libei (pure Rust: `ashpd`
 //! over `zbus`, `reis` for the EI protocol). Designed for GNOME ≥ 45
-//! (Zorin OS 17/18, Ubuntu 24.04+); also works on other compositors that
+//! (Zorin OS 18, Ubuntu 24.04+); also works on other compositors that
 //! implement these portals.
 //!
 //! **Mutter direct.** On GNOME both sessions are by default made with
