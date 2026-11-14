@@ -134,6 +134,9 @@ enum InjCmd {
     /// [`RdShared::want`] changed: open or close the session. Queued
     /// behind the injections before it, so releases happen first.
     Sync,
+    /// The screen was unlocked: a session that could not be re-created
+    /// while locked is tried again now (see [`DisplayTick::Unlocked`]).
+    Retry,
 }
 
 /// The on-demand RemoteDesktop session, shared by the backend and the
@@ -299,14 +302,19 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
     if inj.is_none() {
         rd.x11_fallback();
     }
-    if monitors.lock().expect("poisoned").is_empty() {
+    let mut current = monitors.lock().expect("poisoned");
+    if current.is_empty() {
         // No InputCapture zones: ask XWayland, else assume one 1920x1080 screen.
-        let m = x11_monitors().unwrap_or_else(|_| {
+        *current = x11_monitors().unwrap_or_else(|_| {
             vec![Monitor { name: "default".into(), rect: Rect::new(0, 0, 1920, 1080), primary: true }]
         });
-        *monitors.lock().expect("poisoned") = m;
-        watch_x11_monitors(monitors.clone(), tx.clone());
+        // A capture loop waiting for the unlock reports the zones itself
+        // once its session opens; two sources would overwrite each other.
+        if cap.is_none() {
+            watch_x11_monitors(monitors.clone(), tx.clone());
+        }
     }
+    drop(current);
     if inj.is_none() && cap.is_none() {
         return Err(anyhow!("neither the RemoteDesktop nor the InputCapture portal works in this session"));
     }
@@ -468,19 +476,60 @@ pub(super) enum DisplayTick {
     /// false), e.g. the lid was opened. Barriers that died meanwhile may
     /// have left no other trace.
     Resumed,
+    /// The screen was unlocked ([`UNLOCK_SETTLE`] ago). gnome-shell 46
+    /// inhibits remote access while its session mode forbids screencasts,
+    /// which includes the lock screen: mutter then closes every
+    /// InputCapture and RemoteDesktop session (also the portal's) and
+    /// refuses new ones ("Session creation inhibited") until unlock.
+    Unlocked,
+}
+
+/// After `ActiveChanged(false)`, how long gnome-shell gets to leave the
+/// lock screen's session mode (and lift the inhibition) before sessions are
+/// created again.
+const UNLOCK_SETTLE: Duration = Duration::from_secs(1);
+const SCREENSAVER: &str = "org.gnome.ScreenSaver";
+const SCREENSAVER_PATH: &str = "/org/gnome/ScreenSaver";
+
+/// gnome-shell's `org.gnome.ScreenSaver.ActiveChanged(false)`: the screen
+/// was unlocked; yields [`DisplayTick::Unlocked`] [`UNLOCK_SETTLE`] later.
+async fn unlock_watch() -> Result<LocalBoxStream<'static, DisplayTick>> {
+    use ashpd::zbus;
+    let conn = session_bus().await?;
+    let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(&conn)
+        .destination(SCREENSAVER)
+        .path(SCREENSAVER_PATH)
+        .interface(SCREENSAVER)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    let signals = proxy.receive_signal("ActiveChanged").await?;
+    Ok(signals
+        .filter_map(move |m| {
+            let _ = &proxy;
+            let active = m.body().deserialize::<bool>().unwrap_or(true);
+            std::future::ready((!active).then_some(DisplayTick::Unlocked))
+        })
+        .then(|t| async move {
+            tokio::time::sleep(UNLOCK_SETTLE).await;
+            t
+        })
+        .boxed_local())
 }
 
 /// Where monitor changes come from: GNOME's DisplayConfig signal, or a
 /// timer; plus wake-ups from suspend.
 async fn display_watch() -> LocalBoxStream<'static, DisplayTick> {
-    let monitors = monitor_watch().await;
+    let mut all = vec![monitor_watch().await];
     match resume_watch().await {
-        Ok(r) => futures_util::stream::select(monitors, r).boxed_local(),
-        Err(e) => {
-            debug!("not watching for resume from suspend: {e:#}");
-            monitors
-        }
+        Ok(r) => all.push(r),
+        Err(e) => debug!("not watching for resume from suspend: {e:#}"),
     }
+    match unlock_watch().await {
+        Ok(u) => all.push(u),
+        Err(e) => debug!("not watching for the screen unlock: {e:#}"),
+    }
+    futures_util::stream::select_all(all).boxed_local()
 }
 
 const LOGIN1: &str = "org.freedesktop.login1";
@@ -621,6 +670,7 @@ enum InjEnd {
 /// the portal and its dialog.
 async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>, direct: bool) -> Result<mpsc::UnboundedSender<InjCmd>> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    let unlocks = cmd_tx.downgrade();
     let ready = spawn_portal_thread("inject", move |ready| async move {
         let mutter = mutter_injection(direct, &MutterBus::Session).await;
         let portal = probe_remote_desktop().await;
@@ -639,7 +689,7 @@ async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>, direct: bool) -> 
         }
         let shared = rd.clone();
         let mut mutter_worked = false;
-        keep_injecting(
+        let injecting = keep_injecting(
             &rd,
             &mut cmd_rx,
             async || {
@@ -653,7 +703,8 @@ async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>, direct: bool) -> 
                             }
                             return Ok(((RdSession::Mutter(session), clip, Some(eis)), has_clip));
                         }
-                        Err(e) if !mutter_worked && portal_ok => {
+                        // A locked screen refuses the portal's sessions too.
+                        Err(e) if !mutter_worked && portal_ok && !super::mutter::is_inhibited(&e) => {
                             warn!("mutter's RemoteDesktop session failed ({e:#}); using the RemoteDesktop portal from now on");
                             shared.direct.store(false, Ordering::SeqCst);
                         }
@@ -667,7 +718,8 @@ async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>, direct: bool) -> 
                 }
                 Ok((parts, clip))
             },
-            async |(session, clipboard, eis): InjParts, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| match (eis, session) {
+            async |(session, clipboard, eis): InjParts, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| match (eis, session)
+            {
                 (Some((ctx, conn, events)), session) => {
                     run_ei_sender(ctx, conn, events, cmds, &shared, session, clipboard).await
                 }
@@ -678,11 +730,29 @@ async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>, direct: bool) -> 
                     InjEnd::Lost
                 }
             },
-        )
-        .await
+        );
+        tokio::select! {
+            _ = injecting => {}
+            _ = forward_unlocks(unlocks) => {}
+        }
     });
     ready.await.map_err(|_| anyhow!("portal thread died"))??;
     Ok(cmd_tx)
+}
+
+/// Sends [`InjCmd::Retry`] on every unlock while the backend exists; never
+/// returns (a missing ScreenSaver interface just means no early retries).
+async fn forward_unlocks(cmds: mpsc::WeakUnboundedSender<InjCmd>) {
+    match unlock_watch().await {
+        Ok(mut s) => {
+            while s.next().await.is_some() {
+                let Some(tx) = cmds.upgrade() else { break };
+                let _ = tx.send(InjCmd::Retry);
+            }
+        }
+        Err(e) => debug!("not watching for the screen unlock: {e:#}"),
+    }
+    std::future::pending().await
 }
 
 /// Whether remote control sessions are tried through mutter first: with
@@ -752,6 +822,10 @@ async fn keep_injecting<S>(
                 crate::problems::set(PROBLEM_RD, RD_REFUSED);
                 return;
             }
+            Err(e) if super::mutter::is_inhibited(&e) => {
+                info!("GNOME allows no remote control while the screen is locked; trying again after unlock");
+                InjEnd::Lost
+            }
             Err(e) => {
                 warn!("opening the remote control session failed: {e:#}");
                 InjEnd::Lost
@@ -782,6 +856,10 @@ async fn keep_injecting<S>(
                     None => return,
                     // No longer wanted: wait for the next request instead.
                     Some(_) if !rd.wanted() => break,
+                    Some(InjCmd::Retry) => {
+                        backoff.reset();
+                        break;
+                    }
                     Some(_) => {}
                 },
             }
@@ -1009,6 +1087,7 @@ async fn run_ei_sender(
             },
             cmd = cmds.recv() => match cmd {
                 None => break InjEnd::Quit,
+                Some(InjCmd::Retry) => {}
                 Some(InjCmd::Sync) => if !rd.wanted() {
                     let _ = ctx.flush();
                     tokio::time::sleep(CLOSE_SETTLE).await;
@@ -1129,7 +1208,7 @@ async fn run_dbus_injector(
                 let _ = bounded("Session.Close", session.close()).await;
                 return InjEnd::Closed;
             }
-            InjCmd::Sync => Ok(()),
+            InjCmd::Sync | InjCmd::Retry => Ok(()),
             InjCmd::Inject(Action::Entered { x, y }) => {
                 last = Some((x, y));
                 Ok(())
@@ -1302,10 +1381,15 @@ async fn start_capture(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let ready = spawn_portal_thread("capture", move |ready| async move {
         if let Some((mutter, m)) = mutter_capture(direct, &MutterBus::Session).await {
-            *monitors.lock().expect("poisoned") = m;
+            // Without monitors (screen locked) `create` reads XWayland's;
+            // the zones replace them once a session opens.
+            let opened = m.is_some();
+            if let Some(m) = m {
+                *monitors.lock().expect("poisoned") = m;
+            }
             let _ = ready.send(Ok(()));
             let display = display_watch().await;
-            run_capture(mutter, cmd_rx, tx, monitors, display, report).await;
+            run_capture(mutter, cmd_rx, tx, monitors, display, report, opened).await;
             return;
         }
         let mut portal = PortalCapture::default();
@@ -1314,7 +1398,7 @@ async fn start_capture(
                 *monitors.lock().expect("poisoned") = m;
                 let _ = ready.send(Ok(()));
                 let display = display_watch().await;
-                run_capture(portal, cmd_rx, tx, monitors, display, report).await;
+                run_capture(portal, cmd_rx, tx, monitors, display, report, true).await;
             }
             Err(e) => {
                 let _ = ready.send(Err(e));
@@ -1326,8 +1410,11 @@ async fn start_capture(
 }
 
 /// The Mutter direct capture session to use, if `direct` and mutter's
-/// InputCapture works on `bus`; else the portal is used.
-pub(super) async fn mutter_capture(direct: bool, bus: &MutterBus) -> Option<(MutterCapture, Vec<Monitor>)> {
+/// InputCapture works on `bus`, with its monitors; else the portal is used.
+/// While the screen is locked mutter refuses sessions (the portal could not
+/// make one either): mutter is used all the same, without monitors and
+/// without a session until unlock.
+pub(super) async fn mutter_capture(direct: bool, bus: &MutterBus) -> Option<(MutterCapture, Option<Vec<Monitor>>)> {
     if !direct {
         return None;
     }
@@ -1338,7 +1425,14 @@ pub(super) async fn mutter_capture(direct: bool, bus: &MutterBus) -> Option<(Mut
                 "input capture through mutter directly ({}): no permission dialog, re-created silently",
                 super::mutter::IC_NAME
             );
-            Some((mutter, m))
+            Some((mutter, Some(m)))
+        }
+        Err(e) if super::mutter::is_inhibited(&e) => {
+            info!(
+                "input capture through mutter directly ({}); the screen is locked, the session opens after unlock",
+                super::mutter::IC_NAME
+            );
+            Some((mutter, None))
         }
         Err(e) => {
             info!("mutter's own InputCapture interface is not usable ({e:#}); using the portal");
@@ -1647,6 +1741,9 @@ struct Capture<P> {
     stale: bool,
     /// The dialog was refused: nothing is re-created until a restart.
     refused: bool,
+    /// The last attempt to open a session failed because the screen is
+    /// locked (remote access inhibited).
+    locked: bool,
     /// (activation id, side, cursor position) while captured.
     active: Option<(Option<u32>, Side, (f64, f64))>,
     released_by_us: bool,
@@ -1675,6 +1772,10 @@ struct Capture<P> {
 /// an open session. When the session dies (EI stream closed, portal gone)
 /// an active capture ends with [`LocalEvent::CaptureEnded`] and the session
 /// is re-created with backoff; commands keep being processed meanwhile.
+///
+/// `opened` is false when the first session could not be opened because the
+/// screen is locked: the loop then starts without one and opens it after
+/// unlock (or the next retry).
 pub(super) async fn run_capture<P: CapturePortal>(
     portal: P,
     cmds: mpsc::UnboundedReceiver<CapCmd>,
@@ -1682,6 +1783,7 @@ pub(super) async fn run_capture<P: CapturePortal>(
     monitors: Arc<Mutex<Vec<Monitor>>>,
     display: LocalBoxStream<'static, DisplayTick>,
     report: Arc<Mutex<CaptureShared>>,
+    opened: bool,
 ) {
     let mut c = Capture {
         portal,
@@ -1692,17 +1794,18 @@ pub(super) async fn run_capture<P: CapturePortal>(
         armed: Vec::new(),
         barriers: BarrierSet::default(),
         applied: None,
-        open: true,
+        open: opened,
         enabled: false,
         stale: false,
         refused: false,
+        locked: !opened,
         active: None,
         released_by_us: false,
         backoff: Backoff::default(),
-        retry_at: None,
+        retry_at: (!opened).then(|| Instant::now() + RETRY_MIN),
         sync_at: None,
         next_check: Instant::now() + HEALTH_CHECK,
-        sessions: 1,
+        sessions: opened as u32,
         opened_at: Instant::now(),
         last_activation: None,
         last_change: None,
@@ -1773,6 +1876,8 @@ impl<P: CapturePortal> Capture<P> {
     fn publish(&self) {
         let state = if self.refused {
             "refused"
+        } else if !self.open && self.locked {
+            "screen locked"
         } else if !self.open {
             "lost"
         } else if self.edges.is_empty() {
@@ -1892,6 +1997,7 @@ impl<P: CapturePortal> Capture<P> {
     /// A new session is open; returns whether its zones are new monitors.
     fn session_opened(&mut self, m: Vec<Monitor>) -> bool {
         self.open = true;
+        self.locked = false;
         self.enabled = false;
         self.stale = false;
         self.applied = None;
@@ -1933,9 +2039,21 @@ impl<P: CapturePortal> Capture<P> {
         debug!(?t, "monitor change hint");
         match t {
             DisplayTick::Changed => self.display_due = Some(Instant::now() + DISPLAY_SETTLE),
-            DisplayTick::Resumed => {
-                info!("the machine woke up from suspend");
-                self.changed("resumed from suspend");
+            DisplayTick::Unlocked if !self.open && !self.refused => {
+                // The lock closed the session and new ones were refused
+                // meanwhile: try again now instead of after the backoff.
+                info!("the screen was unlocked; opening the input capture session again");
+                self.backoff.reset();
+                self.retry_at = Some(Instant::now());
+            }
+            DisplayTick::Resumed | DisplayTick::Unlocked => {
+                if t == DisplayTick::Resumed {
+                    info!("the machine woke up from suspend");
+                    self.changed("resumed from suspend");
+                } else {
+                    info!("the screen was unlocked");
+                    self.changed("screen unlocked");
+                }
                 if !self.portal.asks_permission() && self.enabled {
                     // Free without a dialog: rather a new session than
                     // barriers that may have died unnoticed.
@@ -2179,6 +2297,13 @@ impl<P: CapturePortal> Capture<P> {
             crate::problems::set(PROBLEM_IC, IC_REFUSED);
             self.refused = true;
             self.changed("permission refused");
+        } else if super::mutter::is_inhibited(&e) {
+            info!("GNOME allows no input capture while the screen is locked; trying again after unlock");
+            if !self.locked {
+                self.changed("screen locked");
+            }
+            self.locked = true;
+            self.schedule_retry();
         } else {
             warn!("{what}: {e:#}");
             self.changed(format!("{what}: {e:#}"));
@@ -2380,7 +2505,7 @@ mod tests {
             .boxed_local();
             let report = Arc::new(Mutex::new(CaptureShared::default()));
             let monitors = Arc::new(Mutex::new(monitor()));
-            tokio::task::spawn_local(run_capture(portal, cmds_rx, tx, monitors, ticks, report.clone()));
+            tokio::task::spawn_local(run_capture(portal, cmds_rx, tx, monitors, ticks, report.clone(), true));
             (Rig { cmds, sessions, events, log, zones, zone_set, zone_reads, display, report }, first)
         }
 
@@ -2504,7 +2629,7 @@ mod tests {
                             }
                             Some(InjCmd::Inject(Action::Left)) => return InjEnd::Lost,
                             Some(InjCmd::Inject(a)) => inj.lock().unwrap().push((id, a)),
-                            Some(InjCmd::Sync | InjCmd::SetClipboard(_)) => {}
+                            Some(InjCmd::Sync | InjCmd::SetClipboard(_) | InjCmd::Retry) => {}
                         }
                     }
                 },
@@ -2840,6 +2965,70 @@ mod tests {
             rig.cmds.send(CapCmd::Release(Some((10, 10)))).unwrap();
             rig.settle().await;
             assert_eq!(rig.take_log(), ["release"]);
+        })
+        .await
+    }
+
+    /// GNOME closes the sessions when the screen locks and refuses new ones
+    /// until unlock: the unlock brings the session back at once, whatever
+    /// the backoff says.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_closed_by_the_lock_screen_comes_back_right_after_unlock() {
+        local(async {
+            let (rig, first) = Rig::start_with(false);
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            rig.take_log();
+            drop(first);
+            for _ in 0..3 {
+                rig.sessions
+                    .send(Err(anyhow!("mutter InputCapture.CreateSession: Session creation inhibited")))
+                    .unwrap();
+            }
+            // Attempts after 1, 3 and 7 s; the next one would be 8 s later.
+            tokio::time::sleep(RETRY_MIN * 7 + Duration::from_millis(100)).await;
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["close", "open", "open", "open"]);
+            assert_eq!(rig.report.lock().unwrap().report().state, "screen locked");
+            let _second = rig.new_session();
+            rig.display.send(DisplayTick::Unlocked).unwrap();
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+            assert_eq!(rig.report.lock().unwrap().report().state, "enabled");
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unlock_retries_a_remote_control_session_refused_while_locked() {
+        local(async {
+            let rig = start_injecting();
+            rig.want(true);
+            rig.outcomes.send(Ok(1)).unwrap();
+            settle().await;
+            // The lock closes the session (EI disconnect)...
+            rig.cmds.send(InjCmd::Inject(Action::Left)).unwrap();
+            settle().await;
+            // ...and refuses new ones.
+            for _ in 0..2 {
+                rig.outcomes.send(Err(anyhow!("Session creation inhibited"))).unwrap();
+            }
+            tokio::time::sleep(RETRY_MIN * 3 + Duration::from_millis(100)).await;
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 3);
+            assert!(!rig.rd.injecting());
+            assert!(crate::problems::list().iter().all(|p| p != RD_REFUSED), "a lock is no refusal");
+            // Unlocked: tried at once instead of 4 s later.
+            rig.outcomes.send(Ok(2)).unwrap();
+            rig.cmds.send(InjCmd::Retry).unwrap();
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 4);
+            assert!(rig.rd.injecting());
+            // An open session ignores it.
+            rig.cmds.send(InjCmd::Retry).unwrap();
+            settle().await;
+            assert_eq!(*rig.setups.lock().unwrap(), 4);
+            assert!(rig.rd.injecting());
         })
         .await
     }

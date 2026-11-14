@@ -92,6 +92,11 @@ agent รู้จาก ZonesChanged หรือสัญญาณ `MonitorsCh
 
 นอกจากนี้ agent เช็คทุก 30 วินาที และทุกครั้งที่ hub ส่งผังจอเดิมซ้ำ ว่าขอบจอยังเป็นของชุดจอปัจจุบัน ถ้าไม่ใช่ก็สร้างใหม่
 
+ตอนล็อกจอ (รวมถึงพับฝา laptop ที่ล็อกจอเอง) GNOME 46 ปิด session จับเมาส์และ Remote Desktop ทุกตัว ไม่ว่าทางไหน และไม่ให้สร้างใหม่จนกว่าจะปลดล็อก
+ระหว่างนั้น `flow-agent status` แสดง `screen locked` เครื่องนี้ไปคุมเครื่องอื่นและถูกคุมไม่ได้
+หลังปลดล็อก agent เปิด session ใหม่ภายในประมาณ 1 วินาที ทาง Mutter direct ไม่มีหน้าต่างถาม ทาง portal GNOME จะถาม Input Capture อีกครั้ง
+agent ที่เริ่มตอนจอล็อกอยู่ (เช่น หลังอัปเดตตัวเอง) ก็ใช้ Mutter direct ตามปกติ และเปิด session หลังปลดล็อก
+
 ดูสถานะได้จาก `flow-agent status` บรรทัด `input capture`, `last edge hit` และ `capture change`
 หรือแถว Edge capture ในหน้าต่างสถานะ เช่น `enabled (mutter direct), 1 barrier, zone set 7, session 3`
 ทาง portal ถ้าค้างที่ `opening` แปลว่ารอหน้าต่างขอสิทธิ์ของ GNOME อยู่

@@ -93,6 +93,13 @@ impl MutterBus {
     }
 }
 
+/// True when mutter refused a session because remote access is inhibited
+/// (gnome-shell does that while the screen is locked); the portal's
+/// sessions are refused the same way, so this is no reason to switch.
+pub fn is_inhibited(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.to_string().contains("Session creation inhibited"))
+}
+
 /// Whether `name` has an owner on the bus of `conn`.
 pub async fn on_bus(conn: &Connection, name: &str) -> Result<bool> {
     let dbus = zbus::fdo::DBusProxy::new(conn).await?;
@@ -465,8 +472,8 @@ mod tests {
         zones: Vec<(u32, u32, i32, i32)>,
         ic: HashMap<String, IcSession>,
         next: u32,
-        /// CreateSession fails (e.g. remote access inhibited).
-        refuse: bool,
+        /// CreateSession fails with this error (name, message).
+        refuse: Option<(&'static str, &'static str)>,
         /// Another application's clipboard: MIME types and content.
         clip: Option<(Vec<String>, Vec<u8>)>,
     }
@@ -568,11 +575,8 @@ mod tests {
         };
         if member == "CreateSession" {
             let refuse = st.lock().unwrap().refuse;
-            if refuse {
-                return c
-                    .reply_error(hdr, "org.freedesktop.DBus.Error.Failed", &"Session creation inhibited")
-                    .await
-                    .unwrap();
+            if let Some((name, msg)) = refuse {
+                return c.reply_error(hdr, name, &msg).await.unwrap();
             }
             let n = {
                 let mut st = st.lock().unwrap();
@@ -754,6 +758,7 @@ mod tests {
     /// Starts the capture loop on mutter's session like `start_capture`.
     async fn start_capture(bus: &Bus) -> (mpsc::UnboundedSender<CapCmd>, EventRx, Arc<Mutex<CaptureShared>>) {
         let (cap, mons) = mutter_capture(true, &MutterBus::Address(bus.addr.clone())).await.expect("mutter direct");
+        let mons = mons.expect("a session");
         assert_eq!(mons, rects_to_monitors([Rect::new(0, 0, 1920, 1080)].into_iter()));
         let (cmds, cmds_rx) = mpsc::unbounded_channel();
         let (tx, events) = mpsc::unbounded_channel();
@@ -761,7 +766,7 @@ mod tests {
         // No monitor hints but the compositor's own ZonesChanged.
         let display = futures_util::stream::pending::<DisplayTick>().boxed_local();
         let monitors = Arc::new(Mutex::new(mons));
-        tokio::task::spawn_local(run_capture(cap, cmds_rx, tx, monitors, display, report.clone()));
+        tokio::task::spawn_local(run_capture(cap, cmds_rx, tx, monitors, display, report.clone(), true));
         (cmds, events, report)
     }
 
@@ -810,7 +815,9 @@ mod tests {
             );
             let r = report.lock().unwrap().report();
             assert_eq!((r.path.as_str(), r.state.as_str(), r.barriers, r.sessions), ("mutter direct", "enabled", 1, 2));
-            assert!(events.try_recv().is_err(), "nothing was captured: nothing to end");
+            if let Ok(ev) = events.try_recv() {
+                panic!("nothing was captured, nothing to end: {ev:?}");
+            }
 
             // mutter's cancel shortcut: deactivated without a release of
             // ours. Capture ends at once, the session is rebuilt.
@@ -837,6 +844,85 @@ mod tests {
             fake.wait_for("u1 Enable").await;
             // E.g. remote access turned off in GNOME's settings.
             fake.emit("u1", IC_SESSION, "Closed", &()).await;
+            let log = fake.wait_for("u2 Enable").await;
+            assert!(log.contains(&"ic create u2".to_string()), "{log:?}");
+        })
+        .await
+    }
+
+    impl FakeMutter {
+        /// gnome-shell locks the screen (or unlocks it): mutter closes
+        /// every session and refuses new ones until uninhibited.
+        async fn inhibit(&self, on: bool) {
+            let closed: Vec<String> = {
+                let mut st = self.state.lock().unwrap();
+                st.refuse = on.then_some(("org.freedesktop.DBus.Error.Failed", "Session creation inhibited"));
+                if on {
+                    st.ic.drain().map(|(p, _)| p).collect()
+                } else {
+                    Vec::new()
+                }
+            };
+            for p in closed {
+                self.emit(&short(&p), IC_SESSION, "Closed", &()).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_lock_screen_closes_capture_and_the_unlock_brings_it_back() {
+        let Some(bus) = Bus::start() else {
+            eprintln!("dbus-daemon not available, skipping");
+            return;
+        };
+        local(async {
+            let fake = FakeMutter::start(&bus).await;
+            let addr = MutterBus::Address(bus.addr.clone());
+            // The agent starts while the screen is locked (e.g. right after
+            // an update): mutter all the same, no session and no monitors.
+            fake.inhibit(true).await;
+            let (cap, mons) = mutter_capture(true, &addr).await.expect("mutter direct while locked");
+            assert!(mons.is_none());
+            assert!(is_inhibited(&open_remote_desktop(&addr).await.err().unwrap()));
+            let (cmds, cmds_rx) = mpsc::unbounded_channel();
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let report = Arc::new(Mutex::new(CaptureShared::default()));
+            let (display, display_rx) = mpsc::unbounded_channel();
+            let ticks = futures_util::stream::unfold(display_rx, |mut r| async move { Some((r.recv().await?, r)) })
+                .boxed_local();
+            // What `create` falls back to without zones.
+            let xwayland =
+                vec![Monitor { name: "xwayland-0".into(), rect: Rect::new(0, 0, 1920, 1080), primary: true }];
+            let monitors = Arc::new(Mutex::new(xwayland));
+            tokio::task::spawn_local(run_capture(cap, cmds_rx, tx, monitors, ticks, report.clone(), false));
+            cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert_eq!(report.lock().unwrap().report().state, "screen locked");
+
+            // Unlocked: the session opens, the zones replace XWayland's
+            // monitors, and the barriers follow.
+            fake.inhibit(false).await;
+            display.send(DisplayTick::Unlocked).unwrap();
+            assert_eq!(
+                next(&mut events).await,
+                LocalEvent::MonitorsChanged(rects_to_monitors([Rect::new(0, 0, 1920, 1080)].into_iter()))
+            );
+            cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            let log = fake.wait_for("u1 Enable").await;
+            assert!(log.contains(&"ic create u1".to_string()), "{log:?}");
+            assert_eq!(report.lock().unwrap().report().state, "enabled");
+
+            // Locked again: the session is closed, nothing can be made.
+            fake.inhibit(true).await;
+            for _ in 0..100 {
+                if report.lock().unwrap().report().state == "screen locked" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(report.lock().unwrap().report().state, "screen locked");
+            fake.inhibit(false).await;
+            display.send(DisplayTick::Unlocked).unwrap();
             let log = fake.wait_for("u2 Enable").await;
             assert!(log.contains(&"ic create u2".to_string()), "{log:?}");
         })
@@ -903,7 +989,10 @@ mod tests {
             assert!(mutter_injection(true, &addr).await);
             assert!(fake.take_log().is_empty());
             // CreateSession fails: the portal again.
-            fake.state.lock().unwrap().refuse = true;
+            fake.state.lock().unwrap().refuse = Some((
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "Type of message, '(u)', does not match expected type '()'",
+            ));
             assert!(mutter_capture(true, &addr).await.is_none());
             assert!(open_remote_desktop(&addr).await.is_err());
             assert!(fake.take_log().is_empty());
