@@ -248,7 +248,7 @@ impl RdShared {
     }
 }
 
-enum CapCmd {
+pub(super) enum CapCmd {
     SetEdges(Vec<Edge>),
     Release(Option<(i32, i32)>),
 }
@@ -459,7 +459,7 @@ const DISPLAY_CONFIG_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
 
 /// Something may have changed the monitors.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum DisplayTick {
+pub(super) enum DisplayTick {
     /// The compositor said so (DisplayConfig or the portal's ZonesChanged).
     Changed,
     /// Periodic check, without a hint.
@@ -622,16 +622,7 @@ enum InjEnd {
 async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>, direct: bool) -> Result<mpsc::UnboundedSender<InjCmd>> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     let ready = spawn_portal_thread("inject", move |ready| async move {
-        let mutter = match direct {
-            true => match super::mutter::remote_desktop_available(&MutterBus::Session).await {
-                Ok(()) => true,
-                Err(e) => {
-                    info!("mutter's own RemoteDesktop interface is not usable ({e:#}); using the portal");
-                    false
-                }
-            },
-            false => false,
-        };
+        let mutter = mutter_injection(direct, &MutterBus::Session).await;
         let portal = probe_remote_desktop().await;
         let portal_ok = portal.is_ok();
         if let (true, Err(e)) = (mutter, &portal) {
@@ -692,6 +683,21 @@ async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>, direct: bool) -> 
     });
     ready.await.map_err(|_| anyhow!("portal thread died"))??;
     Ok(cmd_tx)
+}
+
+/// Whether remote control sessions are tried through mutter first: with
+/// `direct`, when mutter's RemoteDesktop is on `bus`.
+pub(super) async fn mutter_injection(direct: bool, bus: &MutterBus) -> bool {
+    if !direct {
+        return false;
+    }
+    match super::mutter::remote_desktop_available(bus).await {
+        Ok(()) => true,
+        Err(e) => {
+            info!("mutter's own RemoteDesktop interface is not usable ({e:#}); using the portal");
+            false
+        }
+    }
 }
 
 /// The RemoteDesktop portal answers (without creating a session, which
@@ -1295,22 +1301,12 @@ async fn start_capture(
 ) -> Result<mpsc::UnboundedSender<CapCmd>> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let ready = spawn_portal_thread("capture", move |ready| async move {
-        if direct {
-            let mut mutter = MutterCapture::new(MutterBus::Session);
-            match mutter.open().await {
-                Ok(m) => {
-                    info!(
-                        "input capture through mutter directly ({}): no permission dialog, re-created silently",
-                        super::mutter::IC_NAME
-                    );
-                    *monitors.lock().expect("poisoned") = m;
-                    let _ = ready.send(Ok(()));
-                    let display = display_watch().await;
-                    run_capture(mutter, cmd_rx, tx, monitors, display, report).await;
-                    return;
-                }
-                Err(e) => info!("mutter's own InputCapture interface is not usable ({e:#}); using the portal"),
-            }
+        if let Some((mutter, m)) = mutter_capture(direct, &MutterBus::Session).await {
+            *monitors.lock().expect("poisoned") = m;
+            let _ = ready.send(Ok(()));
+            let display = display_watch().await;
+            run_capture(mutter, cmd_rx, tx, monitors, display, report).await;
+            return;
         }
         let mut portal = PortalCapture::default();
         match portal.open().await {
@@ -1327,6 +1323,28 @@ async fn start_capture(
     });
     ready.await.map_err(|_| anyhow!("portal thread died"))??;
     Ok(cmd_tx)
+}
+
+/// The Mutter direct capture session to use, if `direct` and mutter's
+/// InputCapture works on `bus`; else the portal is used.
+pub(super) async fn mutter_capture(direct: bool, bus: &MutterBus) -> Option<(MutterCapture, Vec<Monitor>)> {
+    if !direct {
+        return None;
+    }
+    let mut mutter = MutterCapture::new(bus.clone());
+    match mutter.open().await {
+        Ok(m) => {
+            info!(
+                "input capture through mutter directly ({}): no permission dialog, re-created silently",
+                super::mutter::IC_NAME
+            );
+            Some((mutter, m))
+        }
+        Err(e) => {
+            info!("mutter's own InputCapture interface is not usable ({e:#}); using the portal");
+            None
+        }
+    }
 }
 
 /// Portal objects of one live InputCapture session.
@@ -1566,7 +1584,7 @@ const HEALTH_CHECK: Duration = Duration::from_secs(30);
 /// What the capture loop shares for [`Backend::capture_report`]: times as
 /// instants, turned into ages when the report is asked for.
 #[derive(Clone, Debug, Default)]
-struct CaptureShared {
+pub(super) struct CaptureShared {
     /// [`CapturePortal::label`] of the session in use.
     path: &'static str,
     state: String,
@@ -1580,7 +1598,7 @@ struct CaptureShared {
 }
 
 impl CaptureShared {
-    fn report(&self) -> CaptureReport {
+    pub(super) fn report(&self) -> CaptureReport {
         CaptureReport {
             path: self.path.to_string(),
             state: self.state.clone(),
@@ -1657,7 +1675,7 @@ struct Capture<P> {
 /// an open session. When the session dies (EI stream closed, portal gone)
 /// an active capture ends with [`LocalEvent::CaptureEnded`] and the session
 /// is re-created with backoff; commands keep being processed meanwhile.
-async fn run_capture<P: CapturePortal>(
+pub(super) async fn run_capture<P: CapturePortal>(
     portal: P,
     cmds: mpsc::UnboundedReceiver<CapCmd>,
     tx: EventTx,

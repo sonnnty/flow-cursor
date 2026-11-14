@@ -55,6 +55,43 @@ pub fn evdev_to_button(code: u32) -> Option<Button> {
 pub const TEXT_MIMES: &[&str] = &["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"];
 pub const PNG_MIME: &str = "image/png";
 
+/// A private session bus for tests that talk D-Bus to fake services.
+#[cfg(test)]
+pub(crate) mod testbus {
+    use ashpd::zbus::Connection;
+
+    /// A `dbus-daemon` of its own; None when it is not installed (tests
+    /// then skip).
+    pub struct Bus {
+        daemon: std::process::Child,
+        pub addr: String,
+    }
+
+    impl Bus {
+        pub fn start() -> Option<Bus> {
+            let mut daemon = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .ok()?;
+            let mut addr = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(daemon.stdout.take()?), &mut addr).ok()?;
+            Some(Bus { daemon, addr: addr.trim().to_string() })
+        }
+
+        pub async fn connect(&self) -> Connection {
+            ashpd::zbus::connection::Builder::address(self.addr.as_str()).build().await.unwrap()
+        }
+    }
+
+    impl Drop for Bus {
+        fn drop(&mut self) {
+            let _ = self.daemon.kill();
+            let _ = self.daemon.wait();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

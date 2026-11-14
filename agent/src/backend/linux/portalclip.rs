@@ -513,35 +513,7 @@ mod tests {
         assert_eq!(pick_mime(&s(&["text/html", "application/x-foo"])), None);
     }
 
-    /// A private session bus (`dbus-daemon`); None when it is not installed.
-    struct Bus {
-        daemon: std::process::Child,
-        addr: String,
-    }
-
-    impl Bus {
-        fn start() -> Option<Bus> {
-            let mut daemon = std::process::Command::new("dbus-daemon")
-                .args(["--session", "--nofork", "--print-address"])
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .ok()?;
-            let mut addr = String::new();
-            std::io::BufRead::read_line(&mut std::io::BufReader::new(daemon.stdout.take()?), &mut addr).ok()?;
-            Some(Bus { daemon, addr: addr.trim().to_string() })
-        }
-
-        async fn connect(&self) -> Connection {
-            ashpd::zbus::connection::Builder::address(self.addr.as_str()).build().await.unwrap()
-        }
-    }
-
-    impl Drop for Bus {
-        fn drop(&mut self) {
-            let _ = self.daemon.kill();
-            let _ = self.daemon.wait();
-        }
-    }
+    use crate::backend::linux::testbus::Bus;
 
     /// What the fake portal was asked.
     #[derive(Debug, Clone, PartialEq)]

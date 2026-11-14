@@ -397,3 +397,517 @@ pub async fn open_remote_desktop(bus: &MutterBus) -> Result<(MutterRd, Option<Po
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::linux::portalclip::ClipWork;
+    use crate::backend::linux::testbus::Bus;
+    use crate::backend::linux::wayland::{
+        mutter_capture, mutter_injection, run_capture, CapCmd, CaptureShared, DisplayTick,
+    };
+    use crate::backend::linux::TEXT_MIMES;
+    use crate::backend::{EventRx, LocalEvent};
+    use ashpd::zbus::{MessageStream, OwnedVariant, Structure};
+    use flow_layout::Side;
+    use flow_proto::{ClipContent, NodeId};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    const UTF8: &str = "text/plain;charset=utf-8";
+    const ZONE: (u32, u32, i32, i32) = (1920, 1080, 0, 0);
+
+    /// mutter's EIS for one client: the server side of the handshake, then
+    /// reading until the client goes away (no seat or devices: the tests
+    /// below are about the D-Bus side).
+    fn fake_eis(sock: UnixStream) {
+        std::thread::spawn(move || {
+            let Ok(ctx) = reis::eis::Context::new(sock) else { return };
+            let mut handshake = Some(reis::handshake::EisHandshaker::new(&ctx, 0));
+            loop {
+                match ctx.read() {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+                while let Some(r) = ctx.pending_request() {
+                    let reis::PendingRequestResult::Request(r) = r else { return };
+                    if let Some(h) = handshake.as_mut() {
+                        match h.handle_request(r) {
+                            Ok(Some(_)) => {
+                                handshake = None;
+                                let _ = ctx.flush();
+                            }
+                            Ok(None) => {}
+                            Err(_) => return,
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[derive(Default)]
+    struct IcSession {
+        owner: String,
+        enabled: bool,
+        barriers: u32,
+    }
+
+    #[derive(Default)]
+    struct State {
+        /// Every call on a session, as "<session> <Method> [details]", and
+        /// "ic create <session>" / "rd create <session>".
+        log: Vec<String>,
+        serial: u32,
+        zones: Vec<(u32, u32, i32, i32)>,
+        ic: HashMap<String, IcSession>,
+        next: u32,
+        /// CreateSession fails (e.g. remote access inhibited).
+        refuse: bool,
+        /// Another application's clipboard: MIME types and content.
+        clip: Option<(Vec<String>, Vec<u8>)>,
+    }
+
+    /// mutter 46's InputCapture and RemoteDesktop on the private bus, as
+    /// far as the agent uses them: sessions belong to their creator's
+    /// connection, barriers need the current zone serial and a session that
+    /// is not enabled, a monitor change bumps the serial, disables every
+    /// session and emits ZonesChanged, EnableClipboard announces the
+    /// current owner with `mime-types` as `(as)`.
+    struct FakeMutter {
+        conn: Connection,
+        state: Arc<Mutex<State>>,
+        written: mpsc::UnboundedReceiver<Vec<u8>>,
+    }
+
+    fn short(path: &str) -> String {
+        path.rsplit('/').next().unwrap_or_default().to_string()
+    }
+
+    fn eis_fd() -> zbus::Fd<'static> {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        fake_eis(ours);
+        zbus::Fd::from(std::os::fd::OwnedFd::from(theirs))
+    }
+
+    impl FakeMutter {
+        async fn start(bus: &Bus) -> FakeMutter {
+            let conn = bus.connect().await;
+            conn.request_name(IC_NAME).await.unwrap();
+            conn.request_name(RD_NAME).await.unwrap();
+            let state = Arc::new(Mutex::new(State { serial: 1, zones: vec![ZONE], ..Default::default() }));
+            let (written_tx, written) = mpsc::unbounded_channel();
+            let (c, st) = (conn.clone(), state.clone());
+            tokio::task::spawn_local(async move {
+                let mut incoming = MessageStream::from(&c);
+                while let Some(Ok(m)) = incoming.next().await {
+                    if m.message_type() != zbus::message::Type::MethodCall {
+                        continue;
+                    }
+                    serve(&c, &st, &written_tx, &m).await;
+                }
+            });
+            FakeMutter { conn, state, written }
+        }
+
+        fn take_log(&self) -> Vec<String> {
+            std::mem::take(&mut self.state.lock().unwrap().log)
+        }
+
+        /// Waits until `entry` was logged; returns the log up to it.
+        async fn wait_for(&self, entry: &str) -> Vec<String> {
+            for _ in 0..1000 {
+                if self.state.lock().unwrap().log.iter().any(|l| l == entry) {
+                    return self.take_log();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("{entry:?} never happened; log: {:?}", self.state.lock().unwrap().log);
+        }
+
+        async fn emit(
+            &self,
+            session: &str,
+            iface: &str,
+            member: &str,
+            body: &(impl serde::Serialize + zbus::DynamicType),
+        ) {
+            let path = format!("{}/Session/{session}", if iface == IC_SESSION { IC_PATH } else { RD_PATH });
+            self.conn.emit_signal(None::<&str>, path.as_str(), iface, member, body).await.unwrap();
+        }
+
+        /// A monitor change, as mutter's `on_monitors_changed`.
+        async fn change_monitors(&self, zones: Vec<(u32, u32, i32, i32)>) {
+            let paths: Vec<String> = {
+                let mut st = self.state.lock().unwrap();
+                st.serial += 1;
+                st.zones = zones;
+                st.ic.iter_mut().for_each(|(_, s)| s.enabled = false);
+                st.ic.keys().cloned().collect()
+            };
+            for p in paths {
+                self.emit(&short(&p), IC_SESSION, "ZonesChanged", &()).await;
+            }
+        }
+    }
+
+    /// Answers one method call.
+    async fn serve(c: &Connection, st: &Mutex<State>, written: &mpsc::UnboundedSender<Vec<u8>>, m: &Message) {
+        let hdr = m.header();
+        let path = hdr.path().map(|p| p.to_string()).unwrap_or_default();
+        let member = hdr.member().map(|m| m.to_string()).unwrap_or_default();
+        let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
+        let s = short(&path);
+        let note = |l: String| st.lock().unwrap().log.push(l);
+        let hdr = &hdr;
+        let deny = |msg: &'static str| async move {
+            c.reply_error(hdr, "org.freedesktop.DBus.Error.AccessDenied", &msg).await.unwrap();
+        };
+        if member == "CreateSession" {
+            let refuse = st.lock().unwrap().refuse;
+            if refuse {
+                return c
+                    .reply_error(hdr, "org.freedesktop.DBus.Error.Failed", &"Session creation inhibited")
+                    .await
+                    .unwrap();
+            }
+            let n = {
+                let mut st = st.lock().unwrap();
+                st.next += 1;
+                st.next
+            };
+            let (kind, base) = if path == IC_PATH { ("ic", IC_PATH) } else { ("rd", RD_PATH) };
+            let new = format!("{base}/Session/u{n}");
+            if kind == "ic" {
+                st.lock().unwrap().ic.insert(new.clone(), IcSession { owner: sender, ..Default::default() });
+            }
+            note(format!("{kind} create u{n}"));
+            return c.reply(hdr, &OwnedObjectPath::try_from(new).unwrap()).await.unwrap();
+        }
+        if path.starts_with(IC_PATH) {
+            if st.lock().unwrap().ic.get(&path).map(|i| i.owner != sender).unwrap_or(true) {
+                return deny("Permission denied").await;
+            }
+            note(format!("{s} {member}"));
+            let r = match member.as_str() {
+                "GetZones" => {
+                    let body = {
+                        let st = st.lock().unwrap();
+                        (st.serial, st.zones.clone())
+                    };
+                    c.reply(hdr, &body).await
+                }
+                "ClearBarriers" => {
+                    st.lock().unwrap().ic.get_mut(&path).unwrap().barriers = 0;
+                    c.reply(hdr, &()).await
+                }
+                "AddBarrier" => {
+                    let (serial, pos): (u32, (i32, i32, i32, i32)) = m.body().deserialize().unwrap();
+                    st.lock().unwrap().log.last_mut().unwrap().push_str(&format!(" {pos:?}"));
+                    // Err: out of date (true) or enabled (false).
+                    let id = {
+                        let mut g = st.lock().unwrap();
+                        let current = g.serial;
+                        let sess = g.ic.get_mut(&path).unwrap();
+                        if serial != current {
+                            Err(true)
+                        } else if sess.enabled {
+                            Err(false)
+                        } else {
+                            sess.barriers += 1;
+                            Ok(sess.barriers)
+                        }
+                    };
+                    match id {
+                        Ok(id) => c.reply(hdr, &id).await,
+                        Err(true) => {
+                            c.reply_error(hdr, "org.freedesktop.DBus.Error.BadAddress", &"State out of date").await
+                        }
+                        Err(false) => return deny("Session already enabled").await,
+                    }
+                }
+                "Enable" => {
+                    st.lock().unwrap().ic.get_mut(&path).unwrap().enabled = true;
+                    c.reply(hdr, &()).await
+                }
+                "Disable" => {
+                    let was = std::mem::replace(&mut st.lock().unwrap().ic.get_mut(&path).unwrap().enabled, false);
+                    if was {
+                        c.reply(hdr, &()).await
+                    } else {
+                        c.reply_error(hdr, "org.freedesktop.DBus.Error.Failed", &"Session not enabled").await
+                    }
+                }
+                "Release" => {
+                    let (opts,): (HashMap<String, OwnedVariant>,) = m.body().deserialize().unwrap();
+                    let pos = opts.get("cursor_position").and_then(|v| <(f64, f64)>::try_from(&**v).ok());
+                    st.lock().unwrap().log.last_mut().unwrap().push_str(&format!(" {pos:?}"));
+                    c.reply(hdr, &()).await
+                }
+                "ConnectToEIS" => c.reply(hdr, &eis_fd()).await,
+                "Close" => {
+                    st.lock().unwrap().ic.remove(&path);
+                    c.reply(hdr, &()).await.unwrap();
+                    c.emit_signal(None::<&str>, path.as_str(), IC_SESSION, "Closed", &()).await
+                }
+                _ => c.reply_error(hdr, "org.freedesktop.DBus.Error.UnknownMethod", &member).await,
+            };
+            return r.unwrap();
+        }
+        note(format!("{s} {member}"));
+        let r = match member.as_str() {
+            "Start" | "SelectionWriteDone" => {
+                if member == "SelectionWriteDone" {
+                    let (serial, ok): (u32, bool) = m.body().deserialize().unwrap();
+                    st.lock().unwrap().log.last_mut().unwrap().push_str(&format!(" {serial} {ok}"));
+                }
+                c.reply(hdr, &()).await
+            }
+            "Stop" => {
+                c.reply(hdr, &()).await.unwrap();
+                c.emit_signal(None::<&str>, path.as_str(), RD_SESSION, "Closed", &()).await
+            }
+            "EnableClipboard" => {
+                // mutter announces the current owner during the call.
+                let clip = st.lock().unwrap().clip.clone();
+                if let Some((mimes, _)) = clip {
+                    let opts = HashMap::from([
+                        ("mime-types", Variant::Structure(Structure::from((mimes,)))),
+                        ("session-is-owner", Variant::Bool(false)),
+                    ]);
+                    c.emit_signal(None::<&str>, path.as_str(), RD_SESSION, "SelectionOwnerChanged", &(opts,))
+                        .await
+                        .unwrap();
+                }
+                c.reply(hdr, &()).await
+            }
+            "SetSelection" => {
+                let (opts,): (HashMap<String, OwnedVariant>,) = m.body().deserialize().unwrap();
+                // mutter wants a plain `as`.
+                let mimes: Option<Vec<String>> = match opts.get("mime-types").map(|v| &**v) {
+                    Some(Variant::Array(a)) => Some(
+                        a.inner()
+                            .iter()
+                            .filter_map(|v| match v {
+                                Variant::Str(s) => Some(s.to_string()),
+                                _ => None,
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+                st.lock().unwrap().log.last_mut().unwrap().push_str(&format!(" {mimes:?}"));
+                c.reply(hdr, &()).await.unwrap();
+                let opts = HashMap::from([
+                    ("mime-types", Variant::Structure(Structure::from((mimes.unwrap_or_default(),)))),
+                    ("session-is-owner", Variant::Bool(true)),
+                ]);
+                c.emit_signal(None::<&str>, path.as_str(), RD_SESSION, "SelectionOwnerChanged", &(opts,)).await
+            }
+            "SelectionRead" => {
+                let (mime,): (String,) = m.body().deserialize().unwrap();
+                st.lock().unwrap().log.last_mut().unwrap().push_str(&format!(" {mime}"));
+                let data = st.lock().unwrap().clip.clone().map(|c| c.1).unwrap_or_default();
+                let (rd, mut wr) = std::io::pipe().unwrap();
+                std::io::Write::write_all(&mut wr, &data).unwrap();
+                drop(wr);
+                c.reply(hdr, &zbus::Fd::from(std::os::fd::OwnedFd::from(rd))).await
+            }
+            "SelectionWrite" => {
+                let (serial,): (u32,) = m.body().deserialize().unwrap();
+                st.lock().unwrap().log.last_mut().unwrap().push_str(&format!(" {serial}"));
+                let (rd, wr) = std::io::pipe().unwrap();
+                let tx = written.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = std::io::Read::read_to_end(&mut { rd }, &mut buf);
+                    let _ = tx.send(buf);
+                });
+                c.reply(hdr, &zbus::Fd::from(std::os::fd::OwnedFd::from(wr))).await
+            }
+            "ConnectToEIS" => {
+                let (opts,): (HashMap<String, OwnedVariant>,) = m.body().deserialize().unwrap();
+                let types = opts.get("device-types").and_then(|v| u32::try_from(&**v).ok());
+                st.lock().unwrap().log.last_mut().unwrap().push_str(&format!(" {types:?}"));
+                c.reply(hdr, &eis_fd()).await
+            }
+            _ => c.reply_error(hdr, "org.freedesktop.DBus.Error.UnknownMethod", &member).await,
+        };
+        r.unwrap();
+    }
+
+    async fn local<F: Future<Output = ()>>(f: F) {
+        tokio::task::LocalSet::new().run_until(f).await
+    }
+
+    async fn next(events: &mut EventRx) -> LocalEvent {
+        tokio::time::timeout(Duration::from_secs(10), events.recv()).await.expect("no event").unwrap()
+    }
+
+    fn right_edge() -> Vec<Edge> {
+        vec![Edge { side: Side::Right, pos: 1920, start: 0, end: 1080, to: NodeId(2) }]
+    }
+
+    /// Starts the capture loop on mutter's session like `start_capture`.
+    async fn start_capture(bus: &Bus) -> (mpsc::UnboundedSender<CapCmd>, EventRx, Arc<Mutex<CaptureShared>>) {
+        let (cap, mons) = mutter_capture(true, &MutterBus::Address(bus.addr.clone())).await.expect("mutter direct");
+        assert_eq!(mons, rects_to_monitors([Rect::new(0, 0, 1920, 1080)].into_iter()));
+        let (cmds, cmds_rx) = mpsc::unbounded_channel();
+        let (tx, events) = mpsc::unbounded_channel();
+        let report = Arc::new(Mutex::new(CaptureShared::default()));
+        // No monitor hints but the compositor's own ZonesChanged.
+        let display = futures_util::stream::pending::<DisplayTick>().boxed_local();
+        let monitors = Arc::new(Mutex::new(mons));
+        tokio::task::spawn_local(run_capture(cap, cmds_rx, tx, monitors, display, report.clone()));
+        (cmds, events, report)
+    }
+
+    const BARRIER: &str = " (1920, 0, 1920, 1079)";
+
+    #[tokio::test]
+    async fn capture_is_rebuilt_without_any_dialog_after_a_monitor_change() {
+        let Some(bus) = Bus::start() else {
+            eprintln!("dbus-daemon not available, skipping");
+            return;
+        };
+        local(async {
+            let fake = FakeMutter::start(&bus).await;
+            let (cmds, mut events, report) = start_capture(&bus).await;
+            assert_eq!(fake.take_log(), ["ic create u1", "u1 ConnectToEIS", "u1 GetZones"]);
+            cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            let log = fake.wait_for("u1 Enable").await;
+            assert_eq!(log, ["u1 GetZones", "u1 ClearBarriers", &format!("u1 AddBarrier{BARRIER}"), "u1 Enable"]);
+
+            // A barrier hit, and the release that enters where the
+            // pointer comes back.
+            fake.emit("u1", IC_SESSION, "Activated", &(1u32, 1u32, (1920.0f64, 500.0f64))).await;
+            assert_eq!(next(&mut events).await, LocalEvent::EdgeHit { side: Side::Right, x: 1920, y: 500 });
+            cmds.send(CapCmd::Release(Some((1900, 500)))).unwrap();
+            assert_eq!(fake.wait_for("u1 Release Some((1900.0, 500.0))").await.len(), 1);
+            fake.emit("u1", IC_SESSION, "Deactivated", &(1u32,)).await;
+
+            // mutter disables the session with a monitor change: a new
+            // session with the same barriers, nothing else.
+            fake.change_monitors(vec![ZONE]).await;
+            let log = fake.wait_for("u2 Enable").await;
+            assert_eq!(
+                log,
+                [
+                    "u1 GetZones",
+                    "u1 Disable",
+                    "u1 Close",
+                    "ic create u2",
+                    "u2 ConnectToEIS",
+                    "u2 GetZones",
+                    "u2 GetZones",
+                    "u2 ClearBarriers",
+                    &format!("u2 AddBarrier{BARRIER}"),
+                    "u2 Enable",
+                ]
+            );
+            let r = report.lock().unwrap().report();
+            assert_eq!((r.path.as_str(), r.state.as_str(), r.barriers, r.sessions), ("mutter direct", "enabled", 1, 2));
+            assert!(events.try_recv().is_err(), "nothing was captured: nothing to end");
+
+            // mutter's cancel shortcut: deactivated without a release of
+            // ours. Capture ends at once, the session is rebuilt.
+            fake.emit("u2", IC_SESSION, "Activated", &(1u32, 2u32, (1920.0f64, 10.0f64))).await;
+            assert!(matches!(next(&mut events).await, LocalEvent::EdgeHit { .. }));
+            fake.emit("u2", IC_SESSION, "Deactivated", &(2u32,)).await;
+            assert_eq!(next(&mut events).await, LocalEvent::CaptureEnded);
+            let log = fake.wait_for("u3 Enable").await;
+            assert!(log.contains(&"u2 Close".to_string()) && log.contains(&"ic create u3".to_string()), "{log:?}");
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_is_replaced() {
+        let Some(bus) = Bus::start() else {
+            eprintln!("dbus-daemon not available, skipping");
+            return;
+        };
+        local(async {
+            let fake = FakeMutter::start(&bus).await;
+            let (cmds, _events, _report) = start_capture(&bus).await;
+            cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            fake.wait_for("u1 Enable").await;
+            // E.g. remote access turned off in GNOME's settings.
+            fake.emit("u1", IC_SESSION, "Closed", &()).await;
+            let log = fake.wait_for("u2 Enable").await;
+            assert!(log.contains(&"ic create u2".to_string()), "{log:?}");
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn remote_desktop_session_and_clipboard_both_ways() {
+        let Some(bus) = Bus::start() else {
+            eprintln!("dbus-daemon not available, skipping");
+            return;
+        };
+        local(async {
+            let mut fake = FakeMutter::start(&bus).await;
+            fake.state.lock().unwrap().clip = Some((vec![UTF8.into(), "text/plain".into()], b"from gnome".to_vec()));
+            let (rd, clip, _eis) = open_remote_desktop(&MutterBus::Address(bus.addr.clone())).await.unwrap();
+            assert_eq!(fake.take_log(), ["rd create u1", "u1 Start", "u1 EnableClipboard", "u1 ConnectToEIS Some(3)"]);
+            let mut clip = clip.expect("clipboard enabled");
+            let (ev_tx, mut events) = mpsc::unbounded_channel();
+
+            // GNOME → other machines: the owner EnableClipboard announced.
+            let w = tokio::time::timeout(Duration::from_secs(5), clip.next()).await.unwrap();
+            assert_eq!(w, ClipWork::Read(UTF8.into()));
+            clip.read(UTF8, &ev_tx).await.unwrap();
+            assert_eq!(next(&mut events).await, LocalEvent::Clipboard(ClipContent::Text("from gnome".into())));
+            assert_eq!(fake.take_log(), [format!("u1 SelectionRead {UTF8}")]);
+
+            // Other machines → GNOME: offered, then pasted. mutter's echo
+            // of our own offer is not read back.
+            clip.set(ClipContent::Text("from windows".into())).await.unwrap();
+            let mimes: Vec<String> = TEXT_MIMES.iter().map(|s| s.to_string()).collect();
+            assert_eq!(fake.take_log(), [format!("u1 SetSelection Some({mimes:?})")]);
+            fake.emit("u1", RD_SESSION, "SelectionTransfer", &(UTF8, 7u32)).await;
+            let w = tokio::time::timeout(Duration::from_secs(5), clip.next()).await.unwrap();
+            assert_eq!(w, ClipWork::Transfer { mime: UTF8.into(), serial: 7 });
+            clip.transfer(UTF8, 7).await;
+            assert_eq!(fake.written.recv().await.unwrap(), b"from windows");
+            assert_eq!(fake.take_log(), ["u1 SelectionWrite 7", "u1 SelectionWriteDone 7 true"]);
+
+            rd.close().await;
+            assert_eq!(fake.take_log(), ["u1 Stop"]);
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_portal_is_used_without_mutter_when_it_fails_or_when_turned_off() {
+        let Some(bus) = Bus::start() else {
+            eprintln!("dbus-daemon not available, skipping");
+            return;
+        };
+        local(async {
+            let addr = MutterBus::Address(bus.addr.clone());
+            // KDE and others: mutter's names are not on the bus.
+            assert!(mutter_capture(true, &addr).await.is_none());
+            assert!(!mutter_injection(true, &addr).await);
+            assert!(open_remote_desktop(&addr).await.is_err());
+
+            let fake = FakeMutter::start(&bus).await;
+            // gnome_direct = "off": not even tried.
+            assert!(mutter_capture(false, &addr).await.is_none());
+            assert!(!mutter_injection(false, &addr).await);
+            // Checking for RemoteDesktop opens no session (and no indicator).
+            assert!(mutter_injection(true, &addr).await);
+            assert!(fake.take_log().is_empty());
+            // CreateSession fails: the portal again.
+            fake.state.lock().unwrap().refuse = true;
+            assert!(mutter_capture(true, &addr).await.is_none());
+            assert!(open_remote_desktop(&addr).await.is_err());
+            assert!(fake.take_log().is_empty());
+        })
+        .await
+    }
+}
