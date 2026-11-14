@@ -12,6 +12,7 @@
 //!   no special permissions (unlike evdev/uinput, which need the `input`
 //!   group or udev rules).
 
+pub mod mutter;
 pub mod portalclip;
 pub mod wayland;
 pub mod x11;

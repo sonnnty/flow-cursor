@@ -71,6 +71,8 @@ pub enum LocalEvent {
 /// of this machine stops working, this says whether barriers are in place.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CaptureReport {
+    /// How the session is reached: `mutter direct` or `portal`.
+    pub path: String,
     /// `enabled`, `no edges`, `opening` (waiting for the portal or its
     /// permission dialog), `re-creating`, `lost`, `refused`, `not enabled`.
     pub state: String,

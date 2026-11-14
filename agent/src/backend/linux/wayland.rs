@@ -3,6 +3,16 @@
 //! (Zorin OS 17/18, Ubuntu 24.04+); also works on other compositors that
 //! implement these portals.
 //!
+//! **Mutter direct.** On GNOME both sessions are by default made with
+//! mutter's own D-Bus interfaces instead of the portals (see
+//! [`super::mutter`]): the same sessions the portal backend would make, but
+//! without its permission dialogs. Capture and remote control behave as
+//! described below for the portals, except that nothing ever asks, so a
+//! capture session is also re-created where barriers may have died without
+//! certainty (an unexpected `Deactivated`, a resume from suspend). Without
+//! mutter's interfaces, when they fail, or with `gnome_direct = "off"`, the
+//! portals are used as described here.
+//!
 //! **Capture** – `org.freedesktop.portal.InputCapture`: we place pointer
 //! barriers on the screen edges that lead to other machines. When the
 //! pointer hits one, the compositor *activates* the capture: the local
@@ -81,6 +91,7 @@
 //! XWayland is used from then on (mutter syncs it with the Wayland
 //! clipboard), which needs XWayland to be running.
 
+use super::mutter::{MutterBus, MutterCapture};
 use super::portalclip::{self, ClipWork, PortalClip};
 use super::x11clip::{self, X11Clipboard};
 use super::{button_to_evdev, evdev_to_button};
@@ -249,7 +260,11 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
         }
     };
     let capture_report = Arc::new(Mutex::new(CaptureShared::default()));
-    let cap = match start_capture(tx.clone(), monitors.clone(), capture_report.clone()).await {
+    let direct = opts.gnome_direct == crate::config::GnomeDirect::Auto;
+    if !direct {
+        info!("gnome_direct = \"off\": using the portals only");
+    }
+    let cap = match start_capture(tx.clone(), monitors.clone(), capture_report.clone(), direct).await {
         Ok(s) => Some(s),
         Err(e) if is_refusal(&e) => {
             warn!("{IC_REFUSED}");
@@ -429,11 +444,50 @@ enum DisplayTick {
     Changed,
     /// Periodic check, without a hint.
     Poll,
+    /// The machine woke up from suspend (logind's `PrepareForSleep`
+    /// false), e.g. the lid was opened. Barriers that died meanwhile may
+    /// have left no other trace.
+    Resumed,
 }
 
 /// Where monitor changes come from: GNOME's DisplayConfig signal, or a
-/// timer.
+/// timer; plus wake-ups from suspend.
 async fn display_watch() -> LocalBoxStream<'static, DisplayTick> {
+    let monitors = monitor_watch().await;
+    match resume_watch().await {
+        Ok(r) => futures_util::stream::select(monitors, r).boxed_local(),
+        Err(e) => {
+            debug!("not watching for resume from suspend: {e:#}");
+            monitors
+        }
+    }
+}
+
+const LOGIN1: &str = "org.freedesktop.login1";
+const LOGIN1_PATH: &str = "/org/freedesktop/login1";
+
+/// logind's `PrepareForSleep(false)` on the system bus: the machine woke up.
+async fn resume_watch() -> Result<LocalBoxStream<'static, DisplayTick>> {
+    use ashpd::zbus;
+    let conn = zbus::Connection::system().await.context("connecting to the D-Bus system bus")?;
+    let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(&conn)
+        .destination(LOGIN1)
+        .path(LOGIN1_PATH)
+        .interface("org.freedesktop.login1.Manager")
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    let signals = proxy.receive_signal("PrepareForSleep").await?;
+    Ok(signals
+        .filter_map(move |m| {
+            let _ = &proxy;
+            let start = m.body().deserialize::<bool>().unwrap_or(true);
+            std::future::ready((!start).then_some(DisplayTick::Resumed))
+        })
+        .boxed_local())
+}
+
+async fn monitor_watch() -> LocalBoxStream<'static, DisplayTick> {
     let watch = match session_bus().await {
         Ok(conn) => mutter_monitors_changed(&conn).await,
         Err(e) => Err(e),
@@ -1090,7 +1144,7 @@ fn is_refusal(e: &anyhow::Error) -> bool {
 
 /// What happened on an open capture session.
 #[derive(Debug)]
-enum CapEvent {
+pub(super) enum CapEvent {
     /// A pointer barrier fired; capture is active until released.
     Activated {
         activation_id: Option<u32>,
@@ -1110,16 +1164,26 @@ enum CapEvent {
 
 /// Barriers the compositor accepted, by our barrier id.
 #[derive(Debug, Default)]
-struct BarrierSet {
-    ids: HashMap<u32, Side>,
-    refused: usize,
+pub(super) struct BarrierSet {
+    pub(super) ids: HashMap<u32, Side>,
+    pub(super) refused: usize,
     /// The zone set they were set for.
-    zone_set: u32,
+    pub(super) zone_set: u32,
 }
 
 /// The InputCapture operations the capture loop needs. [`PortalCapture`]
-/// talks to the real portal; tests drive [`run_capture`] with a fake.
-trait CapturePortal {
+/// talks to the portal, [`super::mutter::MutterCapture`] to mutter's own
+/// interface; tests drive [`run_capture`] with a fake.
+pub(super) trait CapturePortal {
+    /// Whether opening a session may show a permission dialog (the
+    /// portal). Without one (mutter direct) a new session costs nothing,
+    /// so the loop also re-creates it where barriers may be gone without
+    /// any certainty (see [`Capture::on_event`], [`DisplayTick::Resumed`]).
+    fn asks_permission(&self) -> bool {
+        true
+    }
+    /// Which path this is, for logs and `flow-agent status`.
+    fn label(&self) -> &'static str;
     /// Creates a new session (asks for permission when the portal wants to)
     /// and connects its EI stream; returns the zones as monitors. Closes the
     /// previous session first, if any.
@@ -1144,9 +1208,27 @@ async fn start_capture(
     tx: EventTx,
     monitors: Arc<Mutex<Vec<Monitor>>>,
     report: Arc<Mutex<CaptureShared>>,
+    direct: bool,
 ) -> Result<mpsc::UnboundedSender<CapCmd>> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let ready = spawn_portal_thread("portal-capture", move |ready| async move {
+    let ready = spawn_portal_thread("capture", move |ready| async move {
+        if direct {
+            let mut mutter = MutterCapture::new(MutterBus::Session);
+            match mutter.open().await {
+                Ok(m) => {
+                    info!(
+                        "input capture through mutter directly ({}): no permission dialog, re-created silently",
+                        super::mutter::IC_NAME
+                    );
+                    *monitors.lock().expect("poisoned") = m;
+                    let _ = ready.send(Ok(()));
+                    let display = display_watch().await;
+                    run_capture(mutter, cmd_rx, tx, monitors, display, report).await;
+                    return;
+                }
+                Err(e) => info!("mutter's own InputCapture interface is not usable ({e:#}); using the portal"),
+            }
+        }
         let mut portal = PortalCapture::default();
         match portal.open().await {
             Ok(m) => {
@@ -1209,6 +1291,10 @@ impl PortalCapture {
 }
 
 impl CapturePortal for PortalCapture {
+    fn label(&self) -> &'static str {
+        "portal"
+    }
+
     async fn open(&mut self) -> Result<Vec<Monitor>> {
         self.close().await;
         // A new connection per session, see `session_bus`.
@@ -1318,42 +1404,56 @@ impl CapturePortal for PortalCapture {
                 d = l.deactivated.next() => { d?; return Some(CapEvent::Deactivated); }
                 d = l.disabled.next() => { d?; return Some(CapEvent::Disabled); }
                 z = l.zones_changed.next() => { z?; return Some(CapEvent::ZonesChanged); }
-                ev = l.events.next() => match ev? {
-                    Ok(EiEvent::SeatAdded(s)) => {
-                        s.seat.bind_capabilities(
-                            DeviceCapability::Pointer | DeviceCapability::PointerAbsolute | DeviceCapability::Keyboard
-                                | DeviceCapability::Scroll | DeviceCapability::Button,
-                        );
-                        let _ = l.ctx.flush();
-                    }
-                    Ok(ev) => {
-                        if let Some(le) = ei_to_local(&ev, &mut self.scroll_acc) {
-                            return Some(CapEvent::Input(le));
-                        }
-                    }
-                    Err(e) => {
-                        warn!("EI capture stream error: {e:?}");
-                        return None;
-                    }
+                ev = l.events.next() => match capture_ei_event(ev, &l.ctx, &mut self.scroll_acc) {
+                    Ok(Some(ev)) => return Some(ev),
+                    Ok(None) => {}
+                    Err(()) => return None,
                 },
             }
         }
     }
 }
 
-fn zones_to_monitors(z: &Zones) -> Vec<Monitor> {
-    z.regions()
-        .iter()
-        .enumerate()
-        .map(|(i, r)| Monitor {
-            name: format!("zone-{i}"),
-            rect: Rect::new(r.x_offset(), r.y_offset(), r.width() as i32, r.height() as i32),
-            primary: i == 0,
-        })
-        .collect()
+/// One item of a capture session's EI stream (the receiver context): the
+/// seat is bound, input converted. `Ok(None)`: nothing to report;
+/// `Err(())`: the stream is gone.
+pub(super) fn capture_ei_event(
+    ev: Option<Result<EiEvent, reis::Error>>,
+    ctx: &ei::Context,
+    scroll_acc: &mut (f32, f32),
+) -> Result<Option<CapEvent>, ()> {
+    match ev.ok_or(())? {
+        Ok(EiEvent::SeatAdded(s)) => {
+            s.seat.bind_capabilities(
+                DeviceCapability::Pointer
+                    | DeviceCapability::PointerAbsolute
+                    | DeviceCapability::Keyboard
+                    | DeviceCapability::Scroll
+                    | DeviceCapability::Button,
+            );
+            let _ = ctx.flush();
+            Ok(None)
+        }
+        Ok(ev) => Ok(ei_to_local(&ev, scroll_acc).map(CapEvent::Input)),
+        Err(e) => {
+            warn!("EI capture stream error: {e:?}");
+            Err(())
+        }
+    }
 }
 
-fn barrier_for(e: &Edge) -> BarrierPosition {
+fn zones_to_monitors(z: &Zones) -> Vec<Monitor> {
+    rects_to_monitors(
+        z.regions().iter().map(|r| Rect::new(r.x_offset(), r.y_offset(), r.width() as i32, r.height() as i32)),
+    )
+}
+
+/// Capture zones as this machine's monitors (the first one is primary).
+pub(super) fn rects_to_monitors(rects: impl Iterator<Item = Rect>) -> Vec<Monitor> {
+    rects.enumerate().map(|(i, rect)| Monitor { name: format!("zone-{i}"), rect, primary: i == 0 }).collect()
+}
+
+pub(super) fn barrier_for(e: &Edge) -> BarrierPosition {
     let (a, b) = (e.start, e.end - 1);
     match e.side {
         Side::Left | Side::Right => BarrierPosition::new(e.pos, a, e.pos, b),
@@ -1384,6 +1484,8 @@ const HEALTH_CHECK: Duration = Duration::from_secs(30);
 /// instants, turned into ages when the report is asked for.
 #[derive(Clone, Debug, Default)]
 struct CaptureShared {
+    /// [`CapturePortal::label`] of the session in use.
+    path: &'static str,
     state: String,
     barriers: usize,
     barriers_refused: usize,
@@ -1397,6 +1499,7 @@ struct CaptureShared {
 impl CaptureShared {
     fn report(&self) -> CaptureReport {
         CaptureReport {
+            path: self.path.to_string(),
             state: self.state.clone(),
             barriers: self.barriers,
             barriers_refused: self.barriers_refused,
@@ -1585,6 +1688,7 @@ impl<P: CapturePortal> Capture<P> {
 
     fn publish_state(&self, state: &str) {
         *self.report.lock().expect("poisoned") = CaptureShared {
+            path: self.portal.label(),
             state: state.into(),
             barriers: if self.enabled { self.barriers.ids.len() } else { 0 },
             barriers_refused: self.barriers.refused,
@@ -1663,7 +1767,11 @@ impl<P: CapturePortal> Capture<P> {
     async fn recreate(&mut self, why: &str) -> Option<bool> {
         // Closing the old session ends a capture in progress.
         self.end_active();
-        info!("re-creating the input capture session ({why}); GNOME may ask for permission again");
+        if self.portal.asks_permission() {
+            info!("re-creating the input capture session ({why}); GNOME may ask for permission again");
+        } else {
+            info!(path = self.portal.label(), "re-creating the input capture session ({why}); no dialog on this path");
+        }
         self.publish_state("opening");
         match self.portal.open().await {
             Ok(m) => Some(self.session_opened(m)),
@@ -1724,6 +1832,16 @@ impl<P: CapturePortal> Capture<P> {
         debug!(?t, "monitor change hint");
         match t {
             DisplayTick::Changed => self.display_due = Some(Instant::now() + DISPLAY_SETTLE),
+            DisplayTick::Resumed => {
+                info!("the machine woke up from suspend");
+                self.changed("resumed from suspend");
+                if !self.portal.asks_permission() && self.enabled {
+                    // Free without a dialog: rather a new session than
+                    // barriers that may have died unnoticed.
+                    self.went_stale();
+                }
+                self.display_due = Some(Instant::now() + DISPLAY_SETTLE);
+            }
             // A poll does not cut a pending settle time short.
             DisplayTick::Poll => {
                 self.display_due.get_or_insert_with(Instant::now);
@@ -1856,6 +1974,15 @@ impl<P: CapturePortal> Capture<P> {
             CapEvent::Deactivated => {
                 if self.active.take().is_some() && !self.released_by_us {
                     let _ = self.tx.send(LocalEvent::CaptureEnded);
+                    if !self.portal.asks_permission() && self.enabled {
+                        // mutter 46 deactivates on its own only while it
+                        // disables the session (its cancel shortcut, a
+                        // monitor change): the barriers are gone. A new
+                        // session asks nothing on this path.
+                        info!("the compositor ended the capture by itself; re-creating the session");
+                        self.changed("capture ended by the compositor");
+                        self.went_stale();
+                    }
                 }
             }
             CapEvent::Disabled => {
@@ -1974,7 +2101,7 @@ impl<P: CapturePortal> Capture<P> {
     }
 }
 
-fn ei_to_local(ev: &EiEvent, scroll_acc: &mut (f32, f32)) -> Option<LocalEvent> {
+pub(super) fn ei_to_local(ev: &EiEvent, scroll_acc: &mut (f32, f32)) -> Option<LocalEvent> {
     Some(match ev {
         EiEvent::PointerMotion(m) => LocalEvent::Motion { dx: m.dx as f64, dy: m.dy as f64 },
         EiEvent::Button(b) => {
@@ -2032,6 +2159,8 @@ mod tests {
         /// GetZones calls (kept out of the log, which shows what happens to
         /// sessions and barriers).
         zone_reads: Arc<AtomicUsize>,
+        /// Like the portal (true) or mutter direct (false).
+        asks: bool,
     }
 
     fn monitor() -> Vec<Monitor> {
@@ -2051,6 +2180,12 @@ mod tests {
     }
 
     impl CapturePortal for FakePortal {
+        fn asks_permission(&self) -> bool {
+            self.asks
+        }
+        fn label(&self) -> &'static str {
+            "fake"
+        }
         async fn open(&mut self) -> Result<Vec<Monitor>> {
             self.current = None;
             self.note("open");
@@ -2112,6 +2247,12 @@ mod tests {
         /// Starts [`run_capture`] on an open session; returns the session's
         /// event sender.
         fn start() -> (Rig, mpsc::UnboundedSender<CapEvent>) {
+            Self::start_with(true)
+        }
+
+        /// `asks`: whether a new session shows a dialog (portal) or not
+        /// (mutter direct).
+        fn start_with(asks: bool) -> (Rig, mpsc::UnboundedSender<CapEvent>) {
             let (sessions, sessions_rx) = mpsc::unbounded_channel();
             let (first, first_rx) = mpsc::unbounded_channel();
             let log = Arc::new(Mutex::new(Vec::new()));
@@ -2126,6 +2267,7 @@ mod tests {
                 zone_set: zone_set.clone(),
                 seen: 1,
                 zone_reads: zone_reads.clone(),
+                asks,
             };
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
             let (tx, events) = mpsc::unbounded_channel();
@@ -2663,6 +2805,69 @@ mod tests {
             rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
             rig.settle().await;
             assert_eq!(rig.take_log(), ["open", "barriers 1", "enable"]);
+        })
+        .await
+    }
+
+    /// mutter deactivates by itself only while disabling the session (its
+    /// cancel shortcut): without a dialog to fear, the session is replaced
+    /// at once; through the portal nothing is asked until a change says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_capture_ended_by_the_compositor_is_rebuilt_silently_on_the_direct_path() {
+        local(async {
+            for asks in [false, true] {
+                let (mut rig, first) = Rig::start_with(asks);
+                rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+                rig.settle().await;
+                first.send(activated()).unwrap();
+                assert!(matches!(rig.next().await, LocalEvent::EdgeHit { .. }));
+                rig.take_log();
+                let _second = rig.new_session();
+                first.send(CapEvent::Deactivated).unwrap();
+                assert_eq!(rig.next().await, LocalEvent::CaptureEnded);
+                tokio::time::sleep(ZONES_SETTLE).await;
+                rig.settle().await;
+                let expected: &[&str] = if asks { &[] } else { &["open", "barriers 1", "enable"] };
+                assert_eq!(rig.take_log(), expected, "asks permission: {asks}");
+                rig.no_event();
+            }
+            // A release of ours is not the compositor's doing.
+            let (mut rig, first) = Rig::start_with(false);
+            rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+            rig.settle().await;
+            first.send(activated()).unwrap();
+            assert!(matches!(rig.next().await, LocalEvent::EdgeHit { .. }));
+            rig.cmds.send(CapCmd::Release(None)).unwrap();
+            rig.settle().await;
+            first.send(CapEvent::Deactivated).unwrap();
+            tokio::time::sleep(ZONES_SETTLE).await;
+            rig.settle().await;
+            assert_eq!(rig.take_log(), ["barriers 1", "enable", "release"]);
+            rig.no_event();
+        })
+        .await
+    }
+
+    /// After a resume from suspend the direct path replaces an enabled
+    /// session without being asked; the portal path only reads the zones.
+    #[tokio::test(start_paused = true)]
+    async fn resume_from_suspend_rebuilds_only_where_it_is_free() {
+        local(async {
+            for asks in [false, true] {
+                let (mut rig, _first) = Rig::start_with(asks);
+                rig.cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
+                rig.settle().await;
+                rig.take_log();
+                rig.take_zone_reads();
+                let _second = rig.new_session();
+                rig.hint(DisplayTick::Resumed).await;
+                tokio::time::sleep(ZONES_SETTLE).await;
+                rig.settle().await;
+                let expected: &[&str] = if asks { &[] } else { &["open", "barriers 1", "enable"] };
+                assert_eq!(rig.take_log(), expected, "asks permission: {asks}");
+                assert!(rig.take_zone_reads() >= 1, "the zones are read after a resume");
+                rig.no_event();
+            }
         })
         .await
     }
