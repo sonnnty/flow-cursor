@@ -145,6 +145,8 @@ struct RdShared {
     ready: AtomicBool,
     /// The open session has the portal clipboard.
     clip: AtomicBool,
+    /// Sessions are made through mutter directly, not the portal.
+    direct: AtomicBool,
     /// X11 clipboard through XWayland, when the portal clipboard is missing.
     x11clip: OnceLock<X11Clipboard>,
     x11_tried: AtomicBool,
@@ -161,6 +163,7 @@ impl RdShared {
             want: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             clip: AtomicBool::new(false),
+            direct: AtomicBool::new(false),
             x11clip: OnceLock::new(),
             x11_tried: AtomicBool::new(false),
             remote_clip: Mutex::new(None),
@@ -175,6 +178,19 @@ impl RdShared {
     /// Ready to inject: open, and not on its way to closing.
     fn injecting(&self) -> bool {
         self.ready.load(Ordering::SeqCst) && self.wanted()
+    }
+
+    fn direct(&self) -> bool {
+        self.direct.load(Ordering::SeqCst)
+    }
+
+    /// How sessions are made, for logs and `flow-agent status`.
+    fn path(&self) -> &'static str {
+        if self.direct() {
+            "mutter direct"
+        } else {
+            "portal"
+        }
     }
 
     fn portal_clip(&self) -> bool {
@@ -251,19 +267,19 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
 
     // The two portal sessions are independent: refusing or losing one
     // leaves the other working.
-    let rd = Arc::new(RdShared::new(tx.clone()));
-    let inj = match start_injector(opts.state_dir.clone(), rd.clone()).await {
-        Ok(s) => Some(s),
-        Err(e) => {
-            warn!("RemoteDesktop portal unavailable, this machine cannot be controlled: {e:#}");
-            None
-        }
-    };
-    let capture_report = Arc::new(Mutex::new(CaptureShared::default()));
     let direct = opts.gnome_direct == crate::config::GnomeDirect::Auto;
     if !direct {
         info!("gnome_direct = \"off\": using the portals only");
     }
+    let rd = Arc::new(RdShared::new(tx.clone()));
+    let inj = match start_injector(opts.state_dir.clone(), rd.clone(), direct).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("RemoteDesktop unavailable (portal and mutter), this machine cannot be controlled: {e:#}");
+            None
+        }
+    };
+    let capture_report = Arc::new(Mutex::new(CaptureShared::default()));
     let cap = match start_capture(tx.clone(), monitors.clone(), capture_report.clone(), direct).await {
         Ok(s) => Some(s),
         Err(e) if is_refusal(&e) => {
@@ -297,8 +313,9 @@ pub async fn create(opts: &BackendOptions) -> Result<(Arc<dyn Backend>, EventRx)
     let b = WaylandBackend { monitors, inj, rd, cap, capture_report };
     info!(
         caps = ?b.caps(),
-        remote_desktop = b.inj.is_some(),
-        "Wayland portal backend ready (the remote control session opens while connected to the hub)"
+        remote_desktop = b.inj.is_some().then(|| b.rd.path()),
+        input_capture = b.capture_report.lock().expect("poisoned").path,
+        "Wayland backend ready (the remote control session opens while connected to the hub)"
     );
     Ok((Arc::new(b), rx))
 }
@@ -590,34 +607,82 @@ enum InjEnd {
     Closed,
 }
 
-/// Starts the injector thread. It only checks that the RemoteDesktop
-/// portal is there; sessions are opened when the core asks for them.
-async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>) -> Result<mpsc::UnboundedSender<InjCmd>> {
+/// Starts the injector thread. It only checks that mutter's RemoteDesktop
+/// interface (with `direct`) or the RemoteDesktop portal is there; sessions
+/// are opened when the core asks for them.
+///
+/// Mutter direct is used while it works: when its first session fails to
+/// open, the portal (if there) takes over until the agent restarts. Once a
+/// mutter session has worked, later failures are retried with backoff like
+/// any lost session (e.g. gnome-shell restarting) instead of switching to
+/// the portal and its dialog.
+async fn start_injector(state_dir: PathBuf, rd: Arc<RdShared>, direct: bool) -> Result<mpsc::UnboundedSender<InjCmd>> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-    let ready = spawn_portal_thread("portal-inject", move |ready| async move {
-        let probe = probe_remote_desktop().await;
-        let ok = probe.is_ok();
-        let _ = ready.send(probe);
+    let ready = spawn_portal_thread("inject", move |ready| async move {
+        let mutter = match direct {
+            true => match super::mutter::remote_desktop_available(&MutterBus::Session).await {
+                Ok(()) => true,
+                Err(e) => {
+                    info!("mutter's own RemoteDesktop interface is not usable ({e:#}); using the portal");
+                    false
+                }
+            },
+            false => false,
+        };
+        let portal = probe_remote_desktop().await;
+        let portal_ok = portal.is_ok();
+        if let (true, Err(e)) = (mutter, &portal) {
+            debug!("RemoteDesktop portal unavailable (not needed while mutter works): {e:#}");
+        }
+        rd.direct.store(mutter, Ordering::SeqCst);
+        if mutter {
+            info!("remote control through mutter directly ({}): no permission dialog", super::mutter::RD_NAME);
+        }
+        let ok = mutter || portal_ok;
+        let _ = ready.send(if mutter { Ok(()) } else { portal });
         if !ok {
             return;
         }
         let shared = rd.clone();
+        let mut mutter_worked = false;
         keep_injecting(
             &rd,
             &mut cmd_rx,
             async || {
+                if shared.direct() {
+                    match super::mutter::open_remote_desktop(&MutterBus::Session).await {
+                        Ok((session, clip, eis)) => {
+                            mutter_worked = true;
+                            let has_clip = clip.is_some();
+                            if !has_clip {
+                                shared.x11_fallback();
+                            }
+                            return Ok(((RdSession::Mutter(session), clip, Some(eis)), has_clip));
+                        }
+                        Err(e) if !mutter_worked && portal_ok => {
+                            warn!("mutter's RemoteDesktop session failed ({e:#}); using the RemoteDesktop portal from now on");
+                            shared.direct.store(false, Ordering::SeqCst);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 let parts = setup_injector(&state_dir).await?;
-                let clip = parts.2.is_some();
+                let clip = parts.1.is_some();
                 if !clip {
                     shared.x11_fallback();
                 }
                 Ok((parts, clip))
             },
-            async |(portal, session, clipboard, eis): InjParts, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| match eis {
-                Some((ctx, conn, events)) => {
-                    run_ei_sender(ctx, conn, events, cmds, &shared, portal, session, clipboard).await
+            async |(session, clipboard, eis): InjParts, cmds: &mut mpsc::UnboundedReceiver<InjCmd>| match (eis, session) {
+                (Some((ctx, conn, events)), session) => {
+                    run_ei_sender(ctx, conn, events, cmds, &shared, session, clipboard).await
                 }
-                None => run_dbus_injector(&shared, portal, session, cmds).await,
+                (None, RdSession::Portal(portal, session)) => run_dbus_injector(&shared, portal, session, cmds).await,
+                (None, RdSession::Mutter(session)) => {
+                    // Not made: a mutter session always has EIS.
+                    session.close().await;
+                    InjEnd::Lost
+                }
             },
         )
         .await
@@ -665,7 +730,7 @@ async fn keep_injecting<S>(
                 }
                 crate::problems::clear(PROBLEM_RD);
                 if rd.wanted() {
-                    info!(portal_clipboard = clip, "remote control session open");
+                    info!(path = rd.path(), clipboard = clip, "remote control session open");
                     rd.set_ready(true, clip);
                 }
                 // Closes at once if it is no longer wanted.
@@ -736,8 +801,25 @@ const IC_REFUSED: &str = "input capture permission (InputCapture portal) was ref
                           machine cannot control other machines until flow-agent is restarted; it can still be \
                           controlled";
 
-type EiParts = (ei::Context, reis::event::Connection, reis::tokio::EiConvertEventStream);
-type InjParts = (RemoteDesktop, Session<RemoteDesktop>, Option<PortalClip>, Option<EiParts>);
+type EiParts = super::mutter::EiSender;
+type InjParts = (RdSession, Option<PortalClip>, Option<EiParts>);
+
+/// An open remote control session, whichever way it was made.
+enum RdSession {
+    Portal(RemoteDesktop, Session<RemoteDesktop>),
+    Mutter(super::mutter::MutterRd),
+}
+
+impl RdSession {
+    async fn close(self) {
+        match self {
+            RdSession::Portal(_, s) => {
+                let _ = bounded("Session.Close", s.close()).await;
+            }
+            RdSession::Mutter(s) => s.close().await,
+        }
+    }
+}
 
 async fn setup_injector(state_dir: &std::path::Path) -> Result<InjParts> {
     let bus = session_bus().await?;
@@ -817,7 +899,7 @@ async fn setup_injector(state_dir: &std::path::Path) -> Result<InjParts> {
             None
         }
     };
-    Ok((rd, session, clipboard, eis))
+    Ok((RdSession::Portal(rd, session), clipboard, eis))
 }
 
 #[derive(Default)]
@@ -847,20 +929,18 @@ impl EiDevices {
 /// (a different channel), so the releases are applied first.
 const CLOSE_SETTLE: Duration = Duration::from_millis(100);
 
-#[allow(clippy::too_many_arguments)]
 async fn run_ei_sender(
     ctx: ei::Context,
     conn: reis::event::Connection,
     mut events: reis::tokio::EiConvertEventStream,
     cmds: &mut mpsc::UnboundedReceiver<InjCmd>,
     rd: &RdShared,
-    _portal: RemoteDesktop,
-    session: Session<RemoteDesktop>,
+    session: RdSession,
     mut clip: Option<PortalClip>,
 ) -> InjEnd {
     let tx = rd.events.clone();
     if !rd.wanted() {
-        let _ = bounded("Session.Close", session.close()).await;
+        session.close().await;
         return InjEnd::Closed;
     }
     let mut devs = EiDevices::default();
@@ -951,14 +1031,14 @@ async fn run_ei_sender(
                     }
                 }
                 ClipWork::Ended(what) => {
-                    warn!("the portal clipboard signal {what} ended; no clipboard until the session is reopened");
+                    warn!("the clipboard signal {what} ended; no clipboard until the session is reopened");
                     clip = None;
                     rd.lose_clip();
                 }
             },
         }
     };
-    let _ = bounded("Session.Close", session.close()).await;
+    session.close().await;
     end
 }
 

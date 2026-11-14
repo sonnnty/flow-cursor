@@ -37,6 +37,7 @@
 //! (`add_logical_monitor_viewports`), updated on monitor changes: absolute
 //! motion is as accurate as through the portal. `Stop` closes the session.
 
+use super::portalclip::PortalClip;
 use super::wayland::{barrier_for, capture_ei_event, rects_to_monitors, BarrierSet, CapEvent, CapturePortal};
 use anyhow::{anyhow, bail, Context, Result};
 use ashpd::zbus::{self, Connection, Message, OwnedObjectPath, Proxy, Variant};
@@ -304,6 +305,95 @@ impl CapturePortal for MutterCapture {
                     Err(()) => return None,
                 },
             }
+        }
+    }
+}
+
+/// Whether mutter's RemoteDesktop interface is on the session bus (checked
+/// without creating a session, which would show GNOME's indicator).
+pub async fn remote_desktop_available(bus: &MutterBus) -> Result<()> {
+    let conn = bus.connect().await?;
+    if !on_bus(&conn, RD_NAME).await? {
+        bail!("{RD_NAME} is not on the session bus");
+    }
+    Ok(())
+}
+
+/// One open mutter RemoteDesktop session.
+pub struct MutterRd {
+    /// Its own connection: dropping it closes the session in any case.
+    _conn: Connection,
+    session: Proxy<'static>,
+}
+
+impl MutterRd {
+    /// `Stop` closes the session (and its EIS); the connection goes too.
+    pub async fn close(self) {
+        if let Err(e) = call("RemoteDesktop.Session.Stop", self.session.call::<_, _, ()>("Stop", &())).await {
+            debug!("{e:#}");
+        }
+    }
+}
+
+/// EI sender context, connection and event stream of a session.
+pub type EiSender = (ei::Context, reis::event::Connection, reis::tokio::EiConvertEventStream);
+
+/// Opens a RemoteDesktop session the way xdg-desktop-portal-gnome 46 does
+/// after its dialog: `CreateSession`, `Start`, `EnableClipboard`,
+/// `ConnectToEIS` with the device types. The clipboard is subscribed
+/// before `EnableClipboard`, which announces the current owner at once; it
+/// is None when mutter refuses it.
+pub async fn open_remote_desktop(bus: &MutterBus) -> Result<(MutterRd, Option<PortalClip>, EiSender)> {
+    let conn = bus.connect().await?;
+    if !on_bus(&conn, RD_NAME).await? {
+        bail!("{RD_NAME} is not on the session bus");
+    }
+    let rd = proxy(&conn, RD_NAME, RD_PATH, RD_NAME).await?;
+    let path: OwnedObjectPath = call("RemoteDesktop.CreateSession", rd.call("CreateSession", &())).await?;
+    let session = proxy(&conn, RD_NAME, path.as_str(), RD_SESSION).await?;
+    let s = MutterRd { _conn: conn, session: session.clone() };
+    let clip = match PortalClip::mutter(session.clone()).await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!("mutter clipboard signals unavailable: {e:#}");
+            None
+        }
+    };
+    // A failed Start closes the session on mutter's side.
+    call("RemoteDesktop.Session.Start", session.call::<_, _, ()>("Start", &())).await?;
+    let clip = match clip {
+        Some(c) => {
+            let opts: HashMap<&str, Variant> = HashMap::new();
+            match call("RemoteDesktop.Session.EnableClipboard", session.call::<_, _, ()>("EnableClipboard", &(opts,)))
+                .await
+            {
+                Ok(()) => Some(c),
+                Err(e) => {
+                    info!("mutter did not enable the clipboard for this session: {e:#}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let eis = async {
+        let opts = HashMap::from([("device-types", Variant::from(RD_DEVICES))]);
+        let fd = call("RemoteDesktop.Session.ConnectToEIS", session.call("ConnectToEIS", &(opts,))).await?;
+        let ctx = ei_context(fd)?;
+        let (conn, events) = ctx
+            .handshake_tokio("flowcursor-inject", ei::handshake::ContextType::Sender)
+            .await
+            .map_err(|e| anyhow!("EI handshake: {e:?}"))?;
+        anyhow::Ok((ctx, conn, events))
+    };
+    match eis.await {
+        Ok(eis) => {
+            info!(session = %session.path(), clipboard = clip.is_some(), "mutter remote desktop session open");
+            Ok((s, clip, eis))
+        }
+        Err(e) => {
+            s.close().await;
+            Err(e)
         }
     }
 }
