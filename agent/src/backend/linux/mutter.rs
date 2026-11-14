@@ -772,6 +772,19 @@ mod tests {
 
     const BARRIER: &str = " (1920, 0, 1920, 1079)";
 
+    /// Waits until the loop published `state` (the fake logs a call when it
+    /// arrives, before the loop has handled the reply).
+    async fn wait_state(report: &Mutex<CaptureShared>, state: &str) -> crate::backend::CaptureReport {
+        for _ in 0..500 {
+            let r = report.lock().unwrap().report();
+            if r.state == state {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("capture never reached {state:?}: {:?}", report.lock().unwrap().report());
+    }
+
     #[tokio::test]
     async fn capture_is_rebuilt_without_any_dialog_after_a_monitor_change() {
         let Some(bus) = Bus::start() else {
@@ -813,8 +826,8 @@ mod tests {
                     "u2 Enable",
                 ]
             );
-            let r = report.lock().unwrap().report();
-            assert_eq!((r.path.as_str(), r.state.as_str(), r.barriers, r.sessions), ("mutter direct", "enabled", 1, 2));
+            let r = wait_state(&report, "enabled").await;
+            assert_eq!((r.path.as_str(), r.barriers, r.sessions), ("mutter direct", 1, 2));
             if let Ok(ev) = events.try_recv() {
                 panic!("nothing was captured, nothing to end: {ev:?}");
             }
@@ -896,8 +909,7 @@ mod tests {
             let monitors = Arc::new(Mutex::new(xwayland));
             tokio::task::spawn_local(run_capture(cap, cmds_rx, tx, monitors, ticks, report.clone(), false));
             cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            assert_eq!(report.lock().unwrap().report().state, "screen locked");
+            wait_state(&report, "screen locked").await;
 
             // Unlocked: the session opens, the zones replace XWayland's
             // monitors, and the barriers follow.
@@ -910,17 +922,11 @@ mod tests {
             cmds.send(CapCmd::SetEdges(right_edge())).unwrap();
             let log = fake.wait_for("u1 Enable").await;
             assert!(log.contains(&"ic create u1".to_string()), "{log:?}");
-            assert_eq!(report.lock().unwrap().report().state, "enabled");
+            wait_state(&report, "enabled").await;
 
             // Locked again: the session is closed, nothing can be made.
             fake.inhibit(true).await;
-            for _ in 0..100 {
-                if report.lock().unwrap().report().state == "screen locked" {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            assert_eq!(report.lock().unwrap().report().state, "screen locked");
+            wait_state(&report, "screen locked").await;
             fake.inhibit(false).await;
             display.send(DisplayTick::Unlocked).unwrap();
             let log = fake.wait_for("u2 Enable").await;
