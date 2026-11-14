@@ -74,6 +74,11 @@ enum Cmd {
         #[arg(long)]
         state_dir: PathBuf,
     },
+    /// Internal: check GNOME's own InputCapture and RemoteDesktop
+    /// interfaces (the Mutter direct path) without the hub: creates one
+    /// session of each, prints zones, EI devices and clipboard, closes them.
+    #[command(hide = true)]
+    GnomeProbe,
     /// Print the monitors the backend detects.
     Monitors {
         #[arg(long)]
@@ -261,6 +266,17 @@ async fn main() -> Result<()> {
                 println!("no permission and shows no dialog; this only matters when it falls back to the portals.");
             }
             Ok(())
+        }
+        Cmd::GnomeProbe => {
+            #[cfg(target_os = "linux")]
+            {
+                if !flow_agent::backend::linux::gnomeprobe::run().await {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            #[cfg(not(target_os = "linux"))]
+            bail!("gnome-probe is for GNOME on Linux")
         }
         Cmd::Monitors { backend: b } => {
             let _log = init_logging(Some("warn"), None);
