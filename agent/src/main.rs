@@ -302,9 +302,7 @@ async fn main() -> Result<()> {
             let launcher: flow_agent::update::GuardLauncher = Arc::new(flow_agent::update::guard::launch_process);
             let backend_name = format!("{kind:?}").to_lowercase();
             flow_agent::update::on_start(&cfg.state_dir(), &current, &backend_name, &launcher);
-            let (be, rx) = backend::create(kind, &backend_options(&cfg))
-                .await
-                .context("starting the input backend")?;
+            let (be, rx) = backend::create(kind, &backend_options(&cfg)).await.context("starting the input backend")?;
             flow_agent::update::on_backend_ready(&cfg.state_dir(), &current);
             if be.monitors().is_empty() {
                 bail!("the backend reported no monitors");
