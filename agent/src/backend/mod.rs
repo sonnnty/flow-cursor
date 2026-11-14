@@ -230,6 +230,8 @@ fn auto_kind() -> BackendKind {
 #[derive(Clone, Debug, Default)]
 pub struct BackendOptions {
     pub state_dir: std::path::PathBuf,
+    /// Wayland on GNOME: mutter's own interfaces or the portals.
+    pub gnome_direct: crate::config::GnomeDirect,
 }
 
 /// Creates the backend and the stream of local events.

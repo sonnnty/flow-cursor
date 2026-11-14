@@ -24,6 +24,10 @@ pub struct AgentConfig {
     pub p2p_advertise: Vec<SocketAddr>,
     /// auto | wayland | x11 | windows | sim
     pub backend: Option<String>,
+    /// GNOME on Wayland: talk to mutter's own D-Bus interfaces instead of
+    /// the portals, which shows no permission dialogs (see
+    /// `backend::linux::mutter`). Ignored elsewhere.
+    pub gnome_direct: Option<GnomeDirect>,
     /// Local override of the emergency hotkey (works even without the hub).
     pub emergency_hotkey: Option<String>,
     /// Local override of the log filter.
@@ -33,6 +37,18 @@ pub struct AgentConfig {
     /// Write logs to this file instead of stderr (Windows autostart
     /// defaults to `<state_dir>/agent.log`).
     pub log_file: Option<PathBuf>,
+}
+
+/// `gnome_direct` in agent.toml.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GnomeDirect {
+    /// Use mutter's interfaces when they are on the session bus and work,
+    /// else the portals.
+    #[default]
+    Auto,
+    /// Always the portals.
+    Off,
 }
 
 impl AgentConfig {
@@ -177,6 +193,10 @@ mod tests {
         assert_eq!(c.hub.as_deref(), Some("10.0.0.2"));
         assert_eq!(c.p2p_port, Some(9000));
         assert!(toml::from_str::<AgentConfig>("hubb = 1").is_err());
+        assert_eq!(c.gnome_direct, None);
+        let off: AgentConfig = toml::from_str("gnome_direct = \"off\"").unwrap();
+        assert_eq!(off.gnome_direct, Some(GnomeDirect::Off));
+        assert!(toml::from_str::<AgentConfig>("gnome_direct = \"maybe\"").is_err());
         let dir = std::env::temp_dir().join(format!("flow-agent-cfg-{}", rand::random::<u64>()));
         let p = dir.join("agent.toml");
         c.save(&p).unwrap();

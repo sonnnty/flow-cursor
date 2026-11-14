@@ -259,7 +259,7 @@ async fn main() -> Result<()> {
         Cmd::Monitors { backend: b } => {
             let _log = init_logging(Some("warn"), None);
             let kind = backend::parse_kind(b.as_deref().or(cfg.backend.as_deref()))?;
-            let (be, _rx) = backend::create(kind, &BackendOptions { state_dir: cfg.state_dir() }).await?;
+            let (be, _rx) = backend::create(kind, &backend_options(&cfg)).await?;
             for m in be.monitors() {
                 println!(
                     "{:<20} {}x{} at {},{}{}",
@@ -302,7 +302,7 @@ async fn main() -> Result<()> {
             let launcher: flow_agent::update::GuardLauncher = Arc::new(flow_agent::update::guard::launch_process);
             let backend_name = format!("{kind:?}").to_lowercase();
             flow_agent::update::on_start(&cfg.state_dir(), &current, &backend_name, &launcher);
-            let (be, rx) = backend::create(kind, &BackendOptions { state_dir: cfg.state_dir() })
+            let (be, rx) = backend::create(kind, &backend_options(&cfg))
                 .await
                 .context("starting the input backend")?;
             flow_agent::update::on_backend_ready(&cfg.state_dir(), &current);
@@ -356,6 +356,10 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn backend_options(cfg: &AgentConfig) -> BackendOptions {
+    BackendOptions { state_dir: cfg.state_dir(), gnome_direct: cfg.gnome_direct.unwrap_or_default() }
 }
 
 /// Environment of a process started by [`restart_process`].
