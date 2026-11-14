@@ -179,6 +179,11 @@ pub trait Backend: Send + Sync + 'static {
     fn capture_report(&self) -> Option<CaptureReport> {
         None
     }
+    /// How the remote control session is made, on backends that make one
+    /// in different ways (GNOME/Wayland: `mutter direct` or `portal`).
+    fn remote_control_path(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

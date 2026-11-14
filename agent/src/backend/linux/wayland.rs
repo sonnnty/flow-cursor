@@ -427,6 +427,9 @@ impl Backend for WaylandBackend {
         }
         Some(self.capture_report.lock().expect("poisoned").report())
     }
+    fn remote_control_path(&self) -> Option<&'static str> {
+        self.inj.is_some().then(|| self.rd.path())
+    }
     fn set_clipboard(&self, content: &ClipContent) {
         if self.rd.portal_clip() {
             self.rd.keep_remote_clip(None);

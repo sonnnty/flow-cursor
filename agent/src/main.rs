@@ -254,6 +254,12 @@ async fn main() -> Result<()> {
             } else {
                 println!("No stored portal permissions.");
             }
+            if cfg.gnome_direct.unwrap_or_default() == flow_agent::config::GnomeDirect::Auto {
+                println!(
+                    "On GNOME the agent normally talks to mutter directly (gnome_direct = \"auto\"), which stores"
+                );
+                println!("no permission and shows no dialog; this only matters when it falls back to the portals.");
+            }
             Ok(())
         }
         Cmd::Monitors { backend: b } => {
@@ -477,7 +483,8 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
         println!("peer:             {} ({state}, {path}{rtt})", p.name);
     }
     if let Some(c) = &s.capture {
-        let mut line = format!("{}, {} barrier{}", c.state, c.barriers, if c.barriers == 1 { "" } else { "s" });
+        let path = c.path.as_deref().map(|p| format!(" ({p})")).unwrap_or_default();
+        let mut line = format!("{}{path}, {} barrier{}", c.state, c.barriers, if c.barriers == 1 { "" } else { "s" });
         if c.barriers_refused > 0 {
             line.push_str(&format!(" ({} refused)", c.barriers_refused));
         }
@@ -494,6 +501,9 @@ fn print_live_status(s: &flow_ipc::Snapshot) {
         if let (Some(what), Some(a)) = (&c.last_change, c.last_change_s) {
             println!("capture change:   {what} ({} ago)", ago(a));
         }
+    }
+    if let Some(p) = &s.remote_control_path {
+        println!("remote control:   {p}");
     }
     for p in &s.problems {
         println!("problem:          {p}");

@@ -196,6 +196,7 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
         warnings,
         update: update_info(&ctx.agent.updater.status()),
         capture: backend.capture_report().map(|r| capture_info(&r)),
+        remote_control_path: backend.remote_control_path().map(str::to_string),
     }
 }
 
@@ -203,6 +204,7 @@ pub fn snapshot(ctx: &IpcContext) -> Snapshot {
 pub fn capture_info(r: &crate::backend::CaptureReport) -> flow_ipc::CaptureInfo {
     let secs = |d: Option<std::time::Duration>| d.map(|d| d.as_secs());
     flow_ipc::CaptureInfo {
+        path: (!r.path.is_empty()).then(|| r.path.clone()),
         state: r.state.clone(),
         barriers: r.barriers as u32,
         barriers_refused: r.barriers_refused as u32,
