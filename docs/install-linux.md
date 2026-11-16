@@ -32,6 +32,12 @@ busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/
 
 agent ที่ติดตั้งด้วย `install.sh` อัปเดตตัวเองจาก hub ได้
 
+ถ้าเปิด `ufw` ไว้ ต้องเปิด UDP 7879 ให้เครื่องอื่นต่อ P2P เข้ามาได้ ไม่อย่างนั้นทางจากเครื่องอื่นมาเครื่องนี้จะเป็น `relay` ตลอด:
+
+```bash
+sudo ufw allow from 10.10.15.0/24 to any port 7879 proto udp   # เปลี่ยนเป็นวงของบ้านคุณ
+```
+
 ถ้าใช้ `.deb` แทน:
 
 ```bash

@@ -13,7 +13,7 @@
 | *last update failed* | ดูเหตุผลใน dashboard หรือ `flow-agent status` แก้แล้วกด Update now |
 | dashboard ขึ้น *no agent builds in this hub* | hub สร้างด้วย `compose --build` ให้ใช้ image จาก `build/build.sh` |
 | `this agent was removed from the hub` | เครื่องถูกยกเลิกสิทธิ์ใน dashboard ต้อง join ใหม่ |
-| เส้นทางเป็น `relay` ตลอด | firewall บล็อก UDP 7879 ระหว่างเครื่อง หรือที่อยู่ที่ประกาศผิด ตั้ง `p2p_advertise` |
+| เส้นทางเป็น `relay` ตลอด | firewall บล็อก UDP 7879 ระหว่างเครื่อง หรือที่อยู่ที่ประกาศผิด ตั้ง `p2p_advertise` ถ้าเป็นทางเดียว (เข้าเครื่อง Linux เป็น relay แต่ออกเป็น p2p) มักเป็น `ufw` ดู [ติดตั้งบน Linux](install-linux.md#ติดตั้ง) |
 | dashboard เตือน *overlap* หรือ *does not touch any other screen* | ลากเครื่องให้ขอบชิดกันโดยไม่ทับ แล้วกด Save layout ดู [เมื่อจอของเครื่องเปลี่ยน](settings.md#เมื่อจอของเครื่องเปลี่ยน) |
 | tray ขึ้น *No edges to other machines* | เครื่องนี้ไม่ชิดเครื่องไหนในผังจอ แก้ใน dashboard |
 | เสียบหรือถอดจอแล้ว dashboard ยังแสดงจอเก่า | agent ส่งจอใหม่เองภายในไม่กี่วินาที (ถ้า GNOME ไม่มี DisplayConfig ภายใน 10 วินาที) ถ้ายังไม่เปลี่ยน ดู log ของ agent ว่ามี `monitor configuration changed` ไหม |
