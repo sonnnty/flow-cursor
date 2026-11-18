@@ -67,12 +67,8 @@
 
 **ยังไม่เคยรันบนเครื่องจริง** (ผ่านแค่ test กับ agent จำลอง และ test ใน Docker)
 
-- Mutter direct ทั้งหมด: session จับเมาส์และ Remote Desktop ของ mutter, คลิปบอร์ดของ mutter, การสร้าง session ใหม่หลังจอเปลี่ยน ตื่นจาก sleep ปลดล็อกจอ และ shortcut ยกเลิกของ GNOME, การกลับไปใช้ portal
-  (ทดสอบกับ mutter จำลองบน dbus-daemon เท่านั้น เช็คบนเครื่องจริงด้วย `flow-agent gnome-probe`)
-- การรู้ว่าจอเปลี่ยนบน GNOME (สัญญาณ DisplayConfig, ZonesChanged, เช็คทุก 10 วินาที) การเปิด session จับเมาส์ใหม่หลังจอเปลี่ยน และการเช็คตัวเองทุก 30 วินาที
-- การอ่านสัญญาณคลิปบอร์ดของ GNOME เอง (ทดสอบกับ portal จำลองบน dbus-daemon เท่านั้น)
+- Mutter direct: shortcut ยกเลิกของ GNOME และการกลับไปใช้ portal เมื่อไม่มี API ของ mutter
+  (ส่วนอื่นใช้บน Zorin OS 18 จริงแล้ว: จับเมาส์, Remote Desktop, คลิปบอร์ดทั้งสองทาง, พับจอแล้วเปิดและปลดล็อกจอโดยไม่มีหน้าต่างขอสิทธิ์)
+- การเช็คตัวเองทุก 30 วินาทีของ session จับเมาส์บน GNOME
 - การเช็คจอซ้ำหลัง `WM_DISPLAYCHANGE` บน Windows และ event RandR แบบ CRTC/output บน X11
-
-- การอัปเดตตัวเองบน Windows และการ restart ผ่าน systemd จริง
 - การย้ายและซ่อนเคอร์เซอร์บน Windows และ X11
-- ตัวติดตั้งและหน้าต่างบน Windows
