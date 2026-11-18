@@ -39,7 +39,7 @@ ashpd = { version = "0.14", default-features = false, features = ["tokio", "inpu
 reis = { version = "0.7", features = ["tokio"] }
 x11rb = { version = "0.14", features = ["xtest", "xinput", "randr", "xfixes"] }
 futures-util = "0.3"
-rustix = { version = "1", features = ["time", "process"] }
+rustix = { version = "1", features = ["time", "process", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

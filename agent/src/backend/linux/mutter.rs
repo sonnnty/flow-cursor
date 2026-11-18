@@ -715,10 +715,16 @@ mod tests {
                 let (mime,): (String,) = m.body().deserialize().unwrap();
                 st.lock().unwrap().log.last_mut().unwrap().push_str(&format!(" {mime}"));
                 let data = st.lock().unwrap().clip.clone().map(|c| c.1).unwrap_or_default();
+                // Like mutter: a non-blocking pipe, filled after the reply.
                 let (rd, mut wr) = std::io::pipe().unwrap();
-                std::io::Write::write_all(&mut wr, &data).unwrap();
-                drop(wr);
-                c.reply(hdr, &zbus::Fd::from(std::os::fd::OwnedFd::from(rd))).await
+                let rd = std::os::fd::OwnedFd::from(rd);
+                let fl = rustix::fs::fcntl_getfl(&rd).unwrap();
+                rustix::fs::fcntl_setfl(&rd, fl | rustix::fs::OFlags::NONBLOCK).unwrap();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let _ = std::io::Write::write_all(&mut wr, &data);
+                });
+                c.reply(hdr, &zbus::Fd::from(rd)).await
             }
             "SelectionWrite" => {
                 let (serial,): (u32,) = m.body().deserialize().unwrap();

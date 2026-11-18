@@ -141,6 +141,20 @@ pub fn clamp_to_screens(n: &NodeLayout, x: f64, y: f64) -> (f64, f64) {
         .unwrap_or((x, y))
 }
 
+/// Clamps a node-local point that left the node's screens onto the monitor
+/// the cursor was on before the move (`from`), so a fast move past a
+/// bottom or top edge slides along it instead of jumping to whichever
+/// monitor happens to be nearest to the overshoot (with monitors of
+/// different heights side by side, that is often the neighbouring one).
+/// Falls back to [`clamp_to_screens`] when `from` is on no monitor.
+pub fn clamp_from(n: &NodeLayout, from: (f64, f64), x: f64, y: f64) -> (f64, f64) {
+    let on = |r: &Rect| clamp_into(r, from.0, from.1) == from;
+    match n.monitors.iter().map(|m| m.rect).find(|r| on(r)) {
+        Some(r) => clamp_into(&r, x, y),
+        None => clamp_to_screens(n, x, y),
+    }
+}
+
 fn dist_to_rect(r: &Rect, x: f64, y: f64) -> f64 {
     let (cx, cy) = clamp_into(r, x, y);
     (cx - x).abs() + (cy - y).abs()

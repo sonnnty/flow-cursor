@@ -19,7 +19,7 @@ use crate::park::{self, Park};
 use crate::update::{RestartRequest, UpdateOptions, UpdaterHandle};
 use anyhow::{Context, Result};
 use flow_keymap::{parse_combo, Combo};
-use flow_layout::{clamp_to_screens, LayoutExt, Move, Side};
+use flow_layout::{clamp_from, LayoutExt, Move, Side};
 use flow_net::endpoint::{bind, server_config, TransportOpts};
 use flow_net::link::p2p::LinkReceiver;
 use flow_net::link::{serve_p2p, spawn_link, Action, LinkConfig, LinkStatus, PeerDirectory, PeerTarget};
@@ -1370,10 +1370,11 @@ impl Core {
                     self.release_target();
                     self.enter(to, nx, ny);
                 } else {
-                    // Stay at the edge (sliding along it), like a screen
-                    // border without a neighbour.
+                    // Stay at the edge of the monitor the cursor is on
+                    // (sliding along it), like a screen border without a
+                    // neighbour.
                     let (cx, cy) =
-                        self.layout.node(target).map(|n| clamp_to_screens(n, x + sdx, y + sdy)).unwrap_or((x, y));
+                        self.layout.node(target).map(|n| clamp_from(n, (x, y), x + sdx, y + sdy)).unwrap_or((x, y));
                     self.mode = Mode::Remote { target, x: cx, y: cy };
                     if let Some(l) = self.link(target) {
                         l.send_motion(cx.round() as i32, cy.round() as i32, 0, 0);

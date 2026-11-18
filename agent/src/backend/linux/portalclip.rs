@@ -228,7 +228,7 @@ impl PortalClip {
             Api::Mutter { proxy } => bounded("SelectionRead", proxy.call("SelectionRead", &(mime,))).await,
         }
         .with_context(|| format!("reading the clipboard as {mime}"))?;
-        let fd = std::os::fd::OwnedFd::from(fd);
+        let fd = blocking(std::os::fd::OwnedFd::from(fd));
         let (mime, events) = (mime.to_string(), events.clone());
         tokio::task::spawn_blocking(move || {
             use std::io::Read;
@@ -316,7 +316,7 @@ impl PortalClip {
             }
             Api::Mutter { proxy } => bounded("SelectionWrite", proxy.call("SelectionWrite", &(serial,))).await?,
         };
-        let fd = std::os::fd::OwnedFd::from(fd);
+        let fd = blocking(std::os::fd::OwnedFd::from(fd));
         // A reader that never drains the pipe must not park the caller:
         // stop waiting (the blocking write is abandoned).
         bounded(
@@ -329,6 +329,21 @@ impl PortalClip {
         .await??;
         Ok(())
     }
+}
+
+/// Clears `O_NONBLOCK` on a clipboard pipe. mutter hands out its pipes
+/// non-blocking and fills them later, so a blocking-thread read of one
+/// would stop at once with `EAGAIN` (os error 11) and lose the content.
+fn blocking(fd: std::os::fd::OwnedFd) -> std::os::fd::OwnedFd {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+    if let Ok(flags) = fcntl_getfl(&fd) {
+        if flags.contains(OFlags::NONBLOCK) {
+            if let Err(e) = fcntl_setfl(&fd, flags.difference(OFlags::NONBLOCK)) {
+                debug!("making the clipboard pipe blocking failed: {e}");
+            }
+        }
+    }
+    fd
 }
 
 /// A parsed `SelectionOwnerChanged`.
@@ -562,10 +577,17 @@ mod tests {
                         "SelectionRead" => {
                             let (session, mime): (OwnedObjectPath, String) = m.body().deserialize().unwrap();
                             note(Call::Read { session: session.to_string(), mime });
+                            // Like mutter: a non-blocking pipe, filled after the reply.
                             let (rd, mut wr) = std::io::pipe().unwrap();
-                            std::io::Write::write_all(&mut wr, &content2.lock().unwrap()).unwrap();
-                            drop(wr);
-                            c.reply(&hdr, &ashpd::zbus::Fd::from(std::os::fd::OwnedFd::from(rd))).await
+                            let rd = std::os::fd::OwnedFd::from(rd);
+                            let fl = rustix::fs::fcntl_getfl(&rd).unwrap();
+                            rustix::fs::fcntl_setfl(&rd, fl | rustix::fs::OFlags::NONBLOCK).unwrap();
+                            let data = content2.lock().unwrap().clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                                let _ = std::io::Write::write_all(&mut wr, &data);
+                            });
+                            c.reply(&hdr, &ashpd::zbus::Fd::from(rd)).await
                         }
                         "SetSelection" => {
                             let (session, _): (OwnedObjectPath, HashMap<String, OwnedVariant>) =

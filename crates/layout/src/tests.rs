@@ -338,6 +338,21 @@ fn clamp_to_screens_keeps_the_cursor_at_the_edge() {
     assert_eq!(clamp_to_screens(&empty, 7.0, 8.0), (7.0, 8.0));
 }
 
+#[test]
+fn clamp_from_stays_on_the_monitor_the_cursor_was_on() {
+    // The owner's PC: 1920x1080 landscape with a 1080x1920 portrait to its right.
+    let n = node(2, 0, 0, vec![mon(1920, 0, 1080, 1920), mon(0, 0, 1920, 1080)]);
+    // A fast move down past the landscape's bottom, near its right side:
+    // the portrait is nearer to the overshoot, but the cursor stays put.
+    assert_eq!(clamp_to_screens(&n, 1700.0, 1400.0), (1920.0, 1400.0));
+    assert_eq!(clamp_from(&n, (1700.0, 1079.0), 1700.0, 1400.0), (1700.0, 1079.0));
+    assert_eq!(clamp_from(&n, (1700.0, 1000.0), 1750.0, 1400.0), (1750.0, 1079.0));
+    // Past the portrait's bottom it stays on the portrait.
+    assert_eq!(clamp_from(&n, (2000.0, 1919.0), 1900.0, 1950.0), (1920.0, 1919.0));
+    // A start on no monitor falls back to the nearest one.
+    assert_eq!(clamp_from(&n, (-50.0, -50.0), -5.0, 1200.0), (0.0, 1079.0));
+}
+
 // ---------------------------------------------------------------------------
 // re-layout when a node's monitors change
 // ---------------------------------------------------------------------------
