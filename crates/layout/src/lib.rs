@@ -19,8 +19,11 @@
 //!
 //! For a crossing from node A (side S) to node B, let `seg_A` be the part
 //! of A's edge that belongs to B and `seg_B` the part of B's opposite edge
-//! that belongs to A. A side with a single neighbour owns its whole extent
-//! (bounding box of all monitors); a side shared by several neighbours is
+//! that belongs to A. A side with a single neighbour owns its whole facing
+//! extent: the span of the monitors that form that outer edge, not the
+//! bounding box of all monitors (a taller monitor set back from the edge,
+//! such as a portrait screen to the right of a landscape one, is not part
+//! of a left edge); a side shared by several neighbours is
 //! split by the geometric overlap. The crossing point is mapped
 //! proportionally from `seg_A` onto `seg_B`. With one neighbour on each
 //! side this maps "50 % down A's right edge" to "50 % down B's left edge"
@@ -112,6 +115,23 @@ fn perp_extent(r: &Rect, side: Side) -> Interval {
     } else {
         Interval { a: r.x as f64, b: r.right() as f64 }
     }
+}
+
+/// Span along `face` of the monitors of `n` that form that outer edge of
+/// its bounding box (global coordinates). A monitor set back from the edge
+/// does not count, so the span can be shorter than the bounding box.
+fn facing_extent(n: &NodeLayout, face: Side) -> Option<Interval> {
+    let b = bbox(n)?;
+    let on_edge = |m: &Rect| match face {
+        Side::Right => m.right() == b.right(),
+        Side::Left => m.x == b.x,
+        Side::Bottom => m.bottom() == b.bottom(),
+        Side::Top => m.y == b.y,
+    };
+    global_monitors(n)
+        .filter(on_edge)
+        .map(|m| perp_extent(&m, face))
+        .reduce(|a, c| Interval { a: a.a.min(c.a), b: a.b.max(c.b) })
 }
 
 /// Global rectangles of a node's monitors.
@@ -206,14 +226,12 @@ impl LayoutExt for Layout {
     /// target's *local* coordinates.
     fn crossing(&self, from: NodeId, gx: f64, gy: f64, side: Side) -> Option<(NodeId, f64, f64)> {
         let a_node = self.node(from)?;
-        let a = bbox(a_node)?;
         let p = if side.is_horizontal() { gy } else { gx };
         let neigh = self.neighbors(from, side);
         for bid in &neigh {
             let b_node = self.node(*bid)?;
-            let b = bbox(b_node)?;
-            let ea = perp_extent(&a, side);
-            let eb = perp_extent(&b, side);
+            let ea = facing_extent(a_node, side)?;
+            let eb = facing_extent(b_node, side.opposite())?;
             let overlap = ea.intersect(&eb)?;
             let seg_a = if neigh.len() == 1 { ea } else { overlap };
             if seg_a.len() <= 0.0 {
@@ -278,8 +296,7 @@ impl LayoutExt for Layout {
                     cuts.push(f.b);
                 }
                 for bid in self.neighbors(id, side) {
-                    if let Some(b) = self.node(bid).and_then(bbox) {
-                        let e = perp_extent(&b, side);
+                    if let Some(e) = self.node(bid).and_then(|b| facing_extent(b, side.opposite())) {
                         let off = if side.is_horizontal() { n.y as f64 } else { n.x as f64 };
                         cuts.push(e.a - off);
                         cuts.push(e.b - off);

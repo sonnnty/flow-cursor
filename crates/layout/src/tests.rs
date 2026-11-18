@@ -260,18 +260,13 @@ fn l_shaped_dual_monitors_boundary_and_sliding() {
         other => panic!("expected crossing to B, got {other:?}"),
     }
 
-    // Edges of A leading to B:
-    // Mon 1 free right edge is pos=1920 (y: 0..300).
-    // Shared border (y: 300..1080) between Mon 1 and Mon 2 is skipped.
-    // Mon 2 right edge is pos=3000 (y: 300..2220).
+    // Edges of A leading to B: only Mon 2's right edge (pos=3000, y: 300..2220),
+    // the one that faces B. Mon 1's free right edge (pos=1920, y: 0..300) is
+    // set back from B by Mon 2's width, so it leads nowhere; the shared border
+    // (y: 300..1080) between Mon 1 and Mon 2 is skipped.
     let edges = l.edges_of(A);
-    assert_eq!(
-        edges,
-        vec![
-            Edge { side: Side::Right, pos: 1920, start: 0, end: 300, to: B },
-            Edge { side: Side::Right, pos: 3000, start: 300, end: 2220, to: B },
-        ]
-    );
+    assert_eq!(edges, vec![Edge { side: Side::Right, pos: 3000, start: 300, end: 2220, to: B }]);
+    assert!(l.crossing_local(A, 1919.0, 100.0, Side::Right).is_none());
 }
 
 #[test]
@@ -336,6 +331,32 @@ fn clamp_to_screens_keeps_the_cursor_at_the_edge() {
     assert_eq!(clamp_to_screens(&n, 2500.0, 1050.0), (2500.0, 1023.0));
     let empty = node(2, 0, 0, vec![]);
     assert_eq!(clamp_to_screens(&empty, 7.0, 8.0), (7.0, 8.0));
+}
+
+#[test]
+fn crossing_maps_onto_the_facing_monitors_only() {
+    // The owner's setup: laptop 1536x960 (1920x1200 at 125 %) left of the
+    // PC, whose 1920x1080 landscape faces the laptop and whose 1080x1920
+    // portrait sits to the landscape's right.
+    let l = Layout {
+        nodes: vec![
+            node(1, 146, 13, vec![mon(0, 0, 1536, 960)]),
+            node(2, 1682, 13, vec![mon(1920, 0, 1080, 1920), mon(0, 0, 1920, 1080)]),
+        ],
+    };
+    // Every point of the laptop's right edge lands on the landscape, never
+    // on the portrait (with the PC's bounding box, 1920 high, the lower half
+    // of the laptop's edge mapped below 1080 and so onto the portrait).
+    for y in [0.0, 480.0, 700.0, 900.0, 959.0] {
+        let (to, x, y2) = l.crossing_local(A, 1535.0, y, Side::Right).expect("laptop -> PC");
+        assert_eq!(to, B);
+        assert_eq!(x, 0.0, "y={y} entered at x={x}, y={y2}");
+        assert!(y2 < 1080.0, "y={y} entered at y={y2}");
+    }
+    // And back: the whole left edge of the landscape returns to the laptop.
+    let (to, x, y) = l.crossing_local(B, 0.0, 1079.0, Side::Left).expect("PC -> laptop");
+    assert_eq!((to, x), (A, 1535.0));
+    assert!(y <= 959.0);
 }
 
 #[test]
